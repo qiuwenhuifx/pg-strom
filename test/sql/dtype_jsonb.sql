@@ -1,6 +1,7 @@
 ---
 --- Micro test cases for jsonb operators
 ---
+SET pg_strom.regression_test_mode = on;
 SET client_min_messages = error;
 DROP SCHEMA IF EXISTS regtest_dtype_jsonb_temp CASCADE;
 CREATE SCHEMA regtest_dtype_jsonb_temp;
@@ -19,7 +20,7 @@ CREATE TABLE rt_jsonb_c (
   id  int,
   v   jsonb
 );
-SELECT setseed(0.20190623);
+SELECT pgstrom.random_setseed(20190623);
 
 INSERT INTO rt_jsonb_a (
   SELECT x, ('[ ' || case when i is null then 'null' else i::text end

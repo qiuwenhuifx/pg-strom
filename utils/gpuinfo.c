@@ -17,8 +17,8 @@
  * So, we launch gpuinfo command as a separated command to avoid to call
  * cuInit() by postmaster process.
  * ----
- * Copyright 2011-2018 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2018 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -29,6 +29,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
+#include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -50,21 +52,29 @@ static int	detailed_output = 0;
 
 #define lengthof(array)		(sizeof (array) / sizeof ((array)[0]))
 
-#define cuda_elog(errcode,fmt,...)					\
-	do {											\
-		const char *__err_name;						\
-													\
-		cuGetErrorName(errcode, &__err_name);		\
-		fprintf(stderr, "%s:%d  " fmt "\n",			\
-				__FILE__, __LINE__, ##__VA_ARGS__);	\
-		exit(1);									\
+#define cuda_elog(errcode,fmt,...)							\
+	do {													\
+		const char *__cmd_name = strrchr(__FILE__, '/');	\
+		const char *__err_name;								\
+															\
+		if (!__cmd_name)									\
+			__cmd_name = __FILE__;							\
+		cuGetErrorName(errcode, &__err_name);				\
+		fprintf(stderr, "%s:%d [%s]  " fmt "\n",			\
+				__cmd_name, __LINE__, __err_name,			\
+				##__VA_ARGS__);								\
+		exit(1);											\
 	} while(0)
 
-#define sys_elog(fmt,...)							\
-	do {											\
-		fprintf(stderr, "%s:%d  " fmt "\n",			\
-				__FILE__, __LINE__, ##__VA_ARGS__);	\
-		exit(1);									\
+#define sys_elog(fmt,...)									\
+	do {													\
+		const char *__cmd_name = strrchr(__FILE__, '/');	\
+															\
+		if (!__cmd_name)									\
+			__cmd_name = __FILE__;							\
+		fprintf(stderr, "%s:%d  " fmt "\n",					\
+				__cmd_name, __LINE__, ##__VA_ARGS__);			\
+		exit(1);											\
 	} while(0)
 
 /*
@@ -105,12 +115,16 @@ retry_open:
 	{
 		int		errcode = errno;
 
-		if (errno == ENOENT &&
-			retry_done == 0 &&
-			system("/usr/bin/nvme_strom-modprobe") == 0)
+		if (errno == ENOENT)
 		{
-			retry_done = 1;
-			goto retry_open;
+			if (retry_done == 0 &&
+				system("/usr/bin/nvme_strom-modprobe") == 0)
+			{
+				retry_done = 1;
+				goto retry_open;
+			}
+			fprintf(stderr, "nvme_strom kernel module is not installed.\n");
+			return NULL;
 		}
 		sys_elog("failed on open('%s'): %m\n", NVME_STROM_IOCTL_PATHNAME);
 	}
@@ -244,7 +258,7 @@ static int check_device(CUdevice device, StromCmd__LicenseInfo *li)
 	return 0;
 }
 
-static void output_device(CUdevice device, int dev_id)
+static void output_device(CUdevice device, int dindex, int dev_id)
 {
 	char		dev_name[1024];
 	CUuuid		dev_uuid;
@@ -258,7 +272,7 @@ static void output_device(CUdevice device, int dev_id)
 	if (!machine_format)
 		printf("--------\nDevice Identifier: %d\n", dev_id);
 	else
-		printf("DEVICE%d:DEVICE_ID=%d\n", dev_id, dev_id);
+		printf("DEVICE%d:DEVICE_ID=%d\n", dindex, dev_id);
 
 	/* device name */
 	rc = cuDeviceGetName(dev_name, sizeof(dev_name), device);
@@ -267,7 +281,7 @@ static void output_device(CUdevice device, int dev_id)
 	if (!machine_format)
 		printf("Device Name: %s\n", dev_name);
 	else
-		printf("DEVICE%d:DEVICE_NAME=%s\n", dev_id, dev_name);
+		printf("DEVICE%d:DEVICE_NAME=%s\n", dindex, dev_name);
 
 	/* device uuid */
 	rc = cuDeviceGetUuid(&dev_uuid, device);
@@ -294,7 +308,7 @@ static void output_device(CUdevice device, int dev_id)
 	if (!machine_format)
 		printf("Device UUID: %s\n", uuid);
 	else
-		printf("DEVICE%d:DEVICE_UUID=%s\n", dev_id, uuid);
+		printf("DEVICE%d:DEVICE_UUID=%s\n", dindex, uuid);
 
 	/* device RAM size */
 	rc = cuDeviceTotalMem(&dev_memsz, device);
@@ -303,7 +317,7 @@ static void output_device(CUdevice device, int dev_id)
 	if (!machine_format)
 		printf("Global memory size: %zuMB\n", dev_memsz >> 20);
 	else
-		printf("DEVICE%d:GLOBAL_MEMORY_SIZE=%zu\n", dev_id, dev_memsz);
+		printf("DEVICE%d:GLOBAL_MEMORY_SIZE=%zu\n", dindex, dev_memsz);
 
 	for (i=0; i < lengthof(attribute_catalog); i++)
 	{
@@ -319,10 +333,14 @@ static void output_device(CUdevice device, int dev_id)
 
 		rc = cuDeviceGetAttribute(&dev_prop, attcode, device);
 		if (rc != CUDA_SUCCESS)
+		{
+			if (rc == CUDA_ERROR_INVALID_VALUE)
+				continue;	/* likely, not supported at this runtime */
 			cuda_elog(rc, "failed on cuDeviceGetAttribute");
+		}
 
 		if (machine_format)
-			printf("DEVICE%d:%s=%d\n", dev_id, attname_m, dev_prop);
+			printf("DEVICE%d:%s=%d\n", dindex, attname_m, dev_prop);
 		else
 		{
 			switch (attclass)
@@ -408,7 +426,7 @@ int main(int argc, char *argv[])
 	CUdevice	device;
 	CUresult	rc;
 	int			version;
-	int			i, count;
+	int			i, j, count;
 	int			nr_gpus = 1;
 	int			opt;
 	FILE	   *filp;
@@ -515,15 +533,16 @@ int main(int argc, char *argv[])
 	else
 		printf("PLATFORM:NUMBER_OF_DEVICES=%d\n", nr_gpus);
 
-	for (i=0; i < count; i++)
+	for (i=0, j=0; i < count; i++)
 	{
 		rc = cuDeviceGet(&device, i);
 		if (rc != CUDA_SUCCESS)
 			cuda_elog(rc, "failed on cuDeviceGet");
 		if (!li || check_device(device, li))
-			output_device(device, i);
+			output_device(device, j++, i);
 		if (!li)
 			break;
 	}
+	assert(j <= nr_gpus);
 	return 0;
 }

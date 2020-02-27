@@ -4,8 +4,8 @@
  * miscellaneous and uncategorized routines but usefull for multiple subsystems
  * of PG-Strom.
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -48,86 +48,53 @@ make_flat_ands_explicit(List *andclauses)
 	return make_andclause(args);
 }
 
-#if PG_VERSION_NUM < 100000
 /*
- * compute_parallel_worker at optimizer/path/allpaths.c
- * was newly added at PG10.x
- *
- * Compute the number of parallel workers that should be used to scan a
- * relation.  We compute the parallel workers based on the size of the heap to
- * be scanned and the size of the index to be scanned, then choose a minimum
- * of those.
- *
- * "heap_pages" is the number of pages from the table that we expect to scan,
- *  or -1 if we don't expect to scan any.
- *
- * "index_pages" is the number of pages from the index that we expect to scan,
- *  or -1 if we don't expect to scan any.
+ * __find_appinfos_by_relids - almost equivalent to find_appinfos_by_relids
+ * that is added at PG11, but ignores relations that are not partition leafs.
  */
-int
-__compute_parallel_worker(RelOptInfo *rel,
-						  double heap_pages,
-						  double index_pages)
+AppendRelInfo **
+__find_appinfos_by_relids(PlannerInfo *root, Relids relids, int *nappinfos)
 {
-	int			parallel_workers = 0;
+	AppendRelInfo **appinfos;
+	ListCell   *lc;
+	int			nrooms = bms_num_members(relids);
+	int			nitems = 0;
 
-	/*
-	 * If the user has set the parallel_workers reloption, use that; otherwise
-	 * select a default number of workers.
-	 */
-	if (rel->rel_parallel_workers != -1)
-		parallel_workers = rel->rel_parallel_workers;
-	else
+	appinfos = palloc0(sizeof(AppendRelInfo *) * nrooms);
+	foreach (lc, root->append_rel_list)
 	{
-		/*
-		 * If the number of pages being scanned is insufficient to justify a
-		 * parallel scan, just return zero ... unless it's an inheritance
-		 * child. In that case, we want to generate a parallel path here
-		 * anyway.  It might not be worthwhile just for this relation, but
-		 * when combined with all of its inheritance siblings it may well pay
-		 * off.
-		 */
-		if (rel->reloptkind == RELOPT_BASEREL &&
-			(heap_pages >= 0 && heap_pages < min_parallel_relation_size))
-			return 0;
+		AppendRelInfo *apinfo = lfirst(lc);
 
-		if (heap_pages >= 0)
-		{
-			int			heap_parallel_threshold;
-			int			heap_parallel_workers = 1;
-
-			/*
-			 * Select the number of workers based on the log of the size of
-			 * the relation.  This probably needs to be a good deal more
-			 * sophisticated, but we need something here for now.  Note that
-			 * the upper limit of the min_parallel_relation_size GUC is
-			 * chosen to prevent overflow here.
-			 */
-			heap_parallel_threshold = Max(min_parallel_relation_size, 1);
-			while (heap_pages >= (BlockNumber) (heap_parallel_threshold * 3))
-			{
-				heap_parallel_workers++;
-				heap_parallel_threshold *= 3;
-				if (heap_parallel_threshold > INT_MAX / 3)
-					break;		/* avoid overflow */
-			}
-
-			parallel_workers = heap_parallel_workers;
-		}
-		/*
-		 * NOTE: PG9.6 does not pay attention for # of index pages
-		 * for decision of parallel execution.
-		 */
+		if (bms_is_member(apinfo->child_relid, relids))
+			appinfos[nitems++] = apinfo;
 	}
+	Assert(nitems <= nrooms);
+	*nappinfos = nitems;
 
-	/*
-	 * In no case use more than max_parallel_workers_per_gather workers.
-	 */
-	parallel_workers = Min(parallel_workers, max_parallel_workers_per_gather);
-
-	return parallel_workers;
+	return appinfos;
 }
-#endif		/* < PG10 */
+
+/*
+ * get_parallel_divisor - Estimate the fraction of the work that each worker
+ * will do given the number of workers budgeted for the path.
+ */
+double
+get_parallel_divisor(Path *path)
+{
+	double		parallel_divisor = path->parallel_workers;
+
+#if PG_VERSION_NUM >= 110000
+	if (parallel_leader_participation)
+#endif
+	{
+		double	leader_contribution;
+
+		leader_contribution = 1.0 - (0.3 * path->parallel_workers);
+		if (leader_contribution > 0)
+			parallel_divisor += leader_contribution;
+	}
+	return parallel_divisor;
+}
 
 /*
  * Usefulll wrapper routines like lsyscache.c
@@ -182,21 +149,501 @@ get_relnatts(Oid relid)
 }
 
 /*
+ * get_function_oid
+ */
+Oid
+get_function_oid(const char *func_name,
+				 oidvector *func_args,
+				 Oid namespace_oid,
+				 bool missing_ok)
+{
+	Oid		func_oid;
+
+	func_oid = GetSysCacheOid3(PROCNAMEARGSNSP,
+#if PG_VERSION_NUM >= 120000
+							   Anum_pg_proc_oid,
+#endif
+							   CStringGetDatum(func_name),
+							   PointerGetDatum(func_args),
+							   ObjectIdGetDatum(namespace_oid));
+	if (!missing_ok && !OidIsValid(func_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("function %s is not defined",
+						funcname_signature_string(func_name,
+												  func_args->dim1,
+												  NIL,
+												  func_args->values))));
+	return func_oid;
+}
+
+/*
+ * get_type_oid
+ */
+Oid
+get_type_oid(const char *type_name,
+			 Oid namespace_oid,
+			 bool missing_ok)
+{
+	Oid		type_oid;
+
+	type_oid = GetSysCacheOid2(TYPENAMENSP,
+#if PG_VERSION_NUM >= 120000
+							   Anum_pg_type_oid,
+#endif
+							   CStringGetDatum(type_name),
+							   ObjectIdGetDatum(namespace_oid));
+	if (!missing_ok && !OidIsValid(type_oid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("type %s is not defined", type_name)));
+
+	return type_oid;
+}
+
+/*
  * bms_to_cstring - human readable Bitmapset
  */
 char *
-bms_to_cstring(Bitmapset *x)
+bms_to_cstring(Bitmapset *bms)
 {
 	StringInfoData buf;
-	int			i;
+	int			bit = -1;
 
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "{");
-	for (i=0; i < x->nwords; i++)
-		appendStringInfo(&buf, "%s %08x", i==0 ? "" : ",", x->words[i]);
+	while ((bit = bms_next_member(bms, bit)) >= 0)
+		appendStringInfo(&buf, " %d", bit);
 	appendStringInfo(&buf, " }");
 
 	return buf.data;
+}
+
+/*
+ * pathnode_tree_walker
+ */
+static bool
+pathnode_tree_walker(Path *node,
+					 bool (*walker)(),
+					 void *context)
+{
+	ListCell   *lc;
+
+	if (!node)
+		return false;
+
+	check_stack_depth();
+	switch (nodeTag(node))
+	{
+		case T_Path:
+		case T_IndexPath:
+		case T_BitmapHeapPath:
+		case T_BitmapAndPath:
+		case T_BitmapOrPath:
+		case T_TidPath:
+#if PG_VERSION_NUM < 120000
+		case T_ResultPath:
+#else
+		case T_GroupResultPath:
+#endif
+		case T_MinMaxAggPath:
+			/* primitive path nodes */
+			break;
+		case T_SubqueryScanPath:
+			if (walker(((SubqueryScanPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_ForeignPath:
+			if (walker(((ForeignPath *)node)->fdw_outerpath, context))
+				return true;
+			break;
+		case T_CustomPath:
+			foreach (lc, ((CustomPath *)node)->custom_paths)
+			{
+				if (walker((Path *)lfirst(lc), context))
+					return true;
+			}
+			break;
+		case T_NestPath:
+		case T_MergePath:
+		case T_HashPath:
+			if (walker(((JoinPath *)node)->outerjoinpath, context))
+				return true;
+			if (walker(((JoinPath *)node)->innerjoinpath, context))
+				return true;
+			break;
+		case T_AppendPath:
+			foreach (lc, ((AppendPath *)node)->subpaths)
+			{
+				if (walker((Path *)lfirst(lc), context))
+					return true;
+			}
+			break;
+		case T_MergeAppendPath:
+			foreach (lc, ((MergeAppendPath *)node)->subpaths)
+			{
+				if (walker((Path *)lfirst(lc), context))
+					return true;
+			}
+			break;
+		case T_MaterialPath:
+			if (walker(((MaterialPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_UniquePath:
+			if (walker(((UniquePath *)node)->subpath, context))
+				return true;
+			break;
+		case T_GatherPath:
+			if (walker(((GatherPath *)node)->subpath, context))
+				return true;
+			break;
+#if PG_VERSION_NUM >= 100000
+		case T_GatherMergePath:
+			if (walker(((GatherMergePath *)node)->subpath, context))
+				return true;
+			break;
+#endif		/* >= PG10 */
+		case T_ProjectionPath:
+			if (walker(((ProjectionPath *)node)->subpath, context))
+				return true;
+			break;
+#if PG_VERSION_NUM >= 100000
+		case T_ProjectSetPath:
+			if (walker(((ProjectSetPath *)node)->subpath, context))
+				return true;
+			break;
+#endif		/* >= PG10 */
+		case T_SortPath:
+			if (walker(((SortPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_GroupPath:
+			if (walker(((GroupPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_UpperUniquePath:
+			if (walker(((UpperUniquePath *)node)->subpath, context))
+				return true;
+			break;
+		case T_AggPath:
+			if (walker(((AggPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_GroupingSetsPath:
+			if (walker(((GroupingSetsPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_WindowAggPath:
+			if (walker(((WindowAggPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_SetOpPath:
+			if (walker(((SetOpPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_RecursiveUnionPath:
+			if (walker(((RecursiveUnionPath *)node)->leftpath, context))
+				return true;
+			if (walker(((RecursiveUnionPath *)node)->rightpath, context))
+				return true;
+			break;
+		case T_LockRowsPath:
+			if (walker(((LockRowsPath *)node)->subpath, context))
+				return true;
+			break;
+		case T_ModifyTablePath:
+			foreach (lc, ((ModifyTablePath *)node)->subpaths)
+			{
+				if (walker((Path *)lfirst(lc), context))
+					return true;
+			}
+			break;
+		case T_LimitPath:
+			if (walker(((LimitPath *)node)->subpath, context))
+				return true;
+			break;
+		default:
+			elog(ERROR, "unrecognized path-node type: %d",
+				 (int) nodeTag(node));
+			break;
+	}
+	return false;
+}
+
+static bool
+__pathtree_has_gpupath(Path *node, void *context)
+{
+	if (!node)
+		return false;
+	if (pgstrom_path_is_gpuscan(node) ||
+		pgstrom_path_is_gpujoin(node) ||
+		pgstrom_path_is_gpupreagg(node))
+		return true;
+	return pathnode_tree_walker(node, __pathtree_has_gpupath, context);
+}
+
+bool
+pathtree_has_gpupath(Path *node)
+{
+	return __pathtree_has_gpupath(node, NULL);
+}
+
+/*
+ * pgstrom_copy_pathnode
+ *
+ * add_path() / add_partial_path() may reject path-nodes that are already
+ * registered and referenced by upper path nodes, like GpuJoin.
+ * To avoid the problem, we use copy of path-nodes that are (potentially)
+ * released by another ones. However, it is not a full-copy. add_path() will
+ * never release fields of individual path-nodes, so this function tries
+ * to make a copy of path-node itself and child path-nodes only.
+ */
+Path *
+pgstrom_copy_pathnode(const Path *pathnode)
+{
+	if (!pathnode)
+		return NULL;
+
+	switch (nodeTag(pathnode))
+	{
+		case T_Path:
+			return pmemdup(pathnode, sizeof(Path));
+		case T_IndexPath:
+			return pmemdup(pathnode, sizeof(IndexPath));
+		case T_BitmapHeapPath:
+			return pmemdup(pathnode, sizeof(BitmapHeapPath));
+		case T_BitmapAndPath:
+			return pmemdup(pathnode, sizeof(BitmapAndPath));
+		case T_BitmapOrPath:
+			return pmemdup(pathnode, sizeof(BitmapOrPath));
+		case T_TidPath:
+			return pmemdup(pathnode, sizeof(TidPath));
+		case T_SubqueryScanPath:
+			{
+				SubqueryScanPath *a = (SubqueryScanPath *)pathnode;
+				SubqueryScanPath *b = pmemdup(a, sizeof(SubqueryScanPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_ForeignPath:
+			{
+				ForeignPath	   *a = (ForeignPath *)pathnode;
+				ForeignPath	   *b = pmemdup(a, sizeof(ForeignPath));
+				b->fdw_outerpath = pgstrom_copy_pathnode(a->fdw_outerpath);
+				return &b->path;
+			}
+		case T_CustomPath:
+			if (pgstrom_path_is_gpuscan(pathnode))
+				return pgstrom_copy_gpuscan_path(pathnode);
+			else if (pgstrom_path_is_gpujoin(pathnode))
+				return pgstrom_copy_gpujoin_path(pathnode);
+			else if (pgstrom_path_is_gpupreagg(pathnode))
+				return pgstrom_copy_gpupreagg_path(pathnode);
+			else
+			{
+				CustomPath	   *a = (CustomPath *)pathnode;
+				CustomPath	   *b = pmemdup(a, sizeof(CustomPath));
+				List		   *subpaths = NIL;
+				ListCell	   *lc;
+				foreach (lc, a->custom_paths)
+					subpaths = lappend(subpaths,
+									   pgstrom_copy_pathnode(lfirst(lc)));
+				b->custom_paths = subpaths;
+				return &b->path;
+			}
+		case T_NestPath:
+			{
+				NestPath   *a = (NestPath *)pathnode;
+				NestPath   *b = pmemdup(a, sizeof(NestPath));
+				b->outerjoinpath = pgstrom_copy_pathnode(a->outerjoinpath);
+				b->innerjoinpath = pgstrom_copy_pathnode(a->innerjoinpath);
+				return &b->path;
+			}
+		case T_MergePath:
+			{
+				MergePath  *a = (MergePath *)pathnode;
+				MergePath  *b = pmemdup(a, sizeof(MergePath));
+				b->jpath.outerjoinpath =
+					pgstrom_copy_pathnode(a->jpath.outerjoinpath);
+				b->jpath.innerjoinpath =
+					pgstrom_copy_pathnode(a->jpath.innerjoinpath);
+				return &b->jpath.path;
+			}
+		case T_HashPath:
+			{
+				HashPath   *a = (HashPath *)pathnode;
+				HashPath   *b = pmemdup(a, sizeof(HashPath));
+				b->jpath.outerjoinpath =
+					pgstrom_copy_pathnode(a->jpath.outerjoinpath);
+				b->jpath.innerjoinpath =
+					pgstrom_copy_pathnode(a->jpath.innerjoinpath);
+				return &b->jpath.path;
+			}
+		case T_AppendPath:
+			{
+				AppendPath *a = (AppendPath *)pathnode;
+				AppendPath *b = pmemdup(a, sizeof(AppendPath));
+				List	   *subpaths = NIL;
+				ListCell   *lc;
+
+				foreach (lc, a->subpaths)
+					subpaths = lappend(subpaths,
+									   pgstrom_copy_pathnode(lfirst(lc)));
+				b->subpaths = subpaths;
+				return &b->path;
+			}
+		case T_MergeAppendPath:
+			{
+				MergeAppendPath *a = (MergeAppendPath *)pathnode;
+				MergeAppendPath *b = pmemdup(a, sizeof(MergeAppendPath));
+				List	   *subpaths = NIL;
+				ListCell   *lc;
+
+				foreach (lc, a->subpaths)
+					subpaths = lappend(subpaths,
+									   pgstrom_copy_pathnode(lfirst(lc)));
+				b->subpaths = subpaths;
+				return &b->path;
+			}
+#if PG_VERSION_NUM < 120000
+		case T_ResultPath:
+			return pmemdup(pathnode, sizeof(ResultPath));
+#else
+		case T_GroupResultPath:
+			return pmemdup(pathnode, sizeof(GroupResultPath));
+#endif
+		case T_MaterialPath:
+			{
+				MaterialPath   *a = (MaterialPath *)pathnode;
+				MaterialPath   *b = pmemdup(a, sizeof(MaterialPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_UniquePath:
+			{
+				UniquePath	   *a = (UniquePath *)pathnode;
+				UniquePath	   *b = pmemdup(a, sizeof(UniquePath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_GatherPath:
+			{
+				GatherPath	   *a = (GatherPath *)pathnode;
+				GatherPath	   *b = pmemdup(a, sizeof(GatherPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_GatherMergePath:
+			{
+				GatherMergePath *a = (GatherMergePath *)pathnode;
+				GatherMergePath *b = pmemdup(a, sizeof(GatherMergePath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_ProjectionPath:
+			{
+				ProjectionPath *a = (ProjectionPath *)pathnode;
+				ProjectionPath *b = pmemdup(a, sizeof(ProjectionPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_ProjectSetPath:
+			{
+				ProjectSetPath *a = (ProjectSetPath *)pathnode;
+				ProjectSetPath *b = pmemdup(a, sizeof(ProjectSetPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_SortPath:
+			{
+				SortPath	   *a = (SortPath *)pathnode;
+				SortPath	   *b = pmemdup(a, sizeof(SortPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_GroupPath:
+			{
+				GroupPath	   *a = (GroupPath *)pathnode;
+				GroupPath	   *b = pmemdup(a, sizeof(GroupPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_UpperUniquePath:
+			{
+				UpperUniquePath *a = (UpperUniquePath *)pathnode;
+				UpperUniquePath *b = pmemdup(a, sizeof(UpperUniquePath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_AggPath:
+			{
+				AggPath		   *a = (AggPath *)pathnode;
+				AggPath		   *b = pmemdup(a, sizeof(AggPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_GroupingSetsPath:
+			{
+				GroupingSetsPath *a = (GroupingSetsPath *)pathnode;
+				GroupingSetsPath *b = pmemdup(a, sizeof(GroupingSetsPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+                return &b->path;
+			}
+		case T_MinMaxAggPath:
+			return pmemdup(pathnode, sizeof(MinMaxAggPath));
+		case T_WindowAggPath:
+			{
+				WindowAggPath  *a = (WindowAggPath *)pathnode;
+				WindowAggPath  *b = pmemdup(a, sizeof(WindowAggPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_SetOpPath:
+			{
+				SetOpPath	   *a = (SetOpPath *)pathnode;
+				SetOpPath	   *b = pmemdup(a, sizeof(SetOpPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_RecursiveUnionPath:
+			{
+				RecursiveUnionPath *a = (RecursiveUnionPath *)pathnode;
+				RecursiveUnionPath *b = pmemdup(a, sizeof(RecursiveUnionPath));
+				b->leftpath = pgstrom_copy_pathnode(a->leftpath);
+				b->rightpath = pgstrom_copy_pathnode(a->rightpath);
+				return &b->path;
+			}
+		case T_LockRowsPath:
+			{
+				LockRowsPath   *a = (LockRowsPath *)pathnode;
+				LockRowsPath   *b = pmemdup(a, sizeof(LockRowsPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		case T_ModifyTablePath:
+			{
+				ModifyTablePath *a = (ModifyTablePath *)pathnode;
+				ModifyTablePath *b = pmemdup(a, sizeof(ModifyTablePath));
+				List	   *subpaths = NIL;
+				ListCell   *lc;
+				foreach (lc, a->subpaths)
+					subpaths = lappend(subpaths,
+									   pgstrom_copy_pathnode(lfirst(lc)));
+				b->subpaths = subpaths;
+				return &b->path;
+			}
+		case T_LimitPath:
+			{
+				LimitPath  *a = (LimitPath *)pathnode;
+				LimitPath  *b = pmemdup(a, sizeof(LimitPath));
+				b->subpath = pgstrom_copy_pathnode(a->subpath);
+				return &b->path;
+			}
+		default:
+			elog(ERROR, "Bug? unknown path-node: %s", nodeToString(pathnode));
+	}
+	return NULL;
 }
 
 /*
@@ -229,6 +676,7 @@ errorText(int errcode)
  *
  * ----------------------------------------------------------------
  */
+Datum pgstrom_random_setseed(PG_FUNCTION_ARGS);
 Datum pgstrom_random_int(PG_FUNCTION_ARGS);
 Datum pgstrom_random_float(PG_FUNCTION_ARGS);
 Datum pgstrom_random_date(PG_FUNCTION_ARGS);
@@ -248,12 +696,44 @@ Datum pgstrom_random_tstzrange(PG_FUNCTION_ARGS);
 Datum pgstrom_random_daterange(PG_FUNCTION_ARGS);
 Datum pgstrom_abort_if(PG_FUNCTION_ARGS);
 
+static unsigned int		pgstrom_random_seed = 0;
+static bool				pgstrom_random_seed_set = false;
+
+Datum
+pgstrom_random_setseed(PG_FUNCTION_ARGS)
+{
+	unsigned int	seed = PG_GETARG_UINT32(0);
+
+	pgstrom_random_seed = seed ^ 0xdeadbeafU;
+	pgstrom_random_seed_set = true;
+
+	PG_RETURN_VOID();
+}
+PG_FUNCTION_INFO_V1(pgstrom_random_setseed);
+
+static cl_long
+__random(void)
+{
+	if (!pgstrom_random_seed_set)
+	{
+		pgstrom_random_seed = (unsigned int)MyProcPid ^ 0xdeadbeaf;
+		pgstrom_random_seed_set = true;
+	}
+	return (cl_ulong)rand_r(&pgstrom_random_seed);
+}
+
+static inline double
+__drand48(void)
+{
+	return (double)__random() / (double)RAND_MAX;
+}
+
 static inline bool
 generate_null(double ratio)
 {
 	if (ratio <= 0.0)
 		return false;
-	if (100.0 * drand48() < ratio)
+	if (100.0 * __drand48() < ratio)
 		return true;
 	return false;
 }
@@ -272,7 +752,7 @@ pgstrom_random_int(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	if (upper == lower)
 		PG_RETURN_INT64(lower);
-	v = ((cl_ulong)random() << 31) | (cl_ulong)random();
+	v = (__random() << 31) | __random();
 
 	PG_RETURN_INT64(lower + v % (upper - lower));
 }
@@ -292,7 +772,7 @@ pgstrom_random_float(PG_FUNCTION_ARGS)
 	if (upper == lower)
 		PG_RETURN_FLOAT8(lower);
 
-	PG_RETURN_FLOAT8((upper - lower) * drand48() + lower);
+	PG_RETURN_FLOAT8((upper - lower) * __drand48() + lower);
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_float);
 
@@ -319,7 +799,7 @@ pgstrom_random_date(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	if (upper == lower)
 		PG_RETURN_DATEADT(lower);
-	v = ((cl_ulong)random() << 31) | (cl_ulong)random();
+	v = (__random() << 31) | __random();
 
 	PG_RETURN_DATEADT(lower + v % (upper - lower));
 }
@@ -343,7 +823,7 @@ pgstrom_random_time(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	if (upper == lower)
 		PG_RETURN_TIMEADT(lower);
-	v = ((cl_ulong)random() << 31) | (cl_ulong)random();
+	v = (__random() << 31) | __random();
 
 	PG_RETURN_TIMEADT(lower + v % (upper - lower));
 }
@@ -367,12 +847,12 @@ pgstrom_random_timetz(PG_FUNCTION_ARGS)
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
 	temp = palloc(sizeof(TimeTzADT));
-	temp->zone = (random() % 23 - 11) * USECS_PER_HOUR;
+	temp->zone = (__random() % 23 - 11) * USECS_PER_HOUR;
 	if (upper == lower)
 		temp->time = lower;
 	else
 	{
-		v = ((cl_ulong)random() << 31) | (cl_ulong)random();
+		v = (__random() << 31) | __random();
 		temp->time = lower + v % (upper - lower);
 	}
 	PG_RETURN_TIMETZADT_P(temp);
@@ -413,7 +893,7 @@ pgstrom_random_timestamp(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	if (upper == lower)
 		PG_RETURN_TIMEADT(lower);
-	v = ((cl_ulong)random() << 31) | (cl_ulong)random();
+	v = (__random() << 31) | __random();
 
 	PG_RETURN_TIMESTAMP(lower + v % (upper - lower));
 }
@@ -456,7 +936,7 @@ pgstrom_random_macaddr(PG_FUNCTION_ARGS)
 		x = lower;
 	else
 	{
-		v = ((cl_ulong)random() << 31) | (cl_ulong)random();
+		v = (__random() << 31) | __random();
 		x = lower + v % (upper - lower);
 	}
 	temp = palloc(sizeof(macaddr));
@@ -502,7 +982,7 @@ pgstrom_random_inet(PG_FUNCTION_ARGS)
 	{
 		if (j < 8)
 		{
-			v |= (cl_ulong)random() << j;
+			v |= __random() << j;
 			j += 31;	/* note: only 31b of random() are valid */
 		}
 		if (bits >= 8)
@@ -549,7 +1029,7 @@ pgstrom_random_text(PG_FUNCTION_ARGS)
 		{
 			if (j < 5)
 			{
-				v |= (cl_ulong)random() << j;
+				v |= __random() << j;
 				j += 31;
 			}
 			*pos = base32[v & 0x1f];
@@ -580,7 +1060,7 @@ pgstrom_random_text_length(PG_FUNCTION_ARGS)
 	maxlen = (PG_ARGISNULL(1) ? 10 : PG_GETARG_INT32(1));
 	if (maxlen < 1 || maxlen > BLCKSZ)
 		elog(ERROR, "%s: max length too much", __FUNCTION__);
-	n = 1 + random() % maxlen;
+	n = 1 + __random() % maxlen;
 
 	temp = palloc(VARHDRSZ + n);
 	SET_VARSIZE(temp, VARHDRSZ + n);
@@ -589,7 +1069,7 @@ pgstrom_random_text_length(PG_FUNCTION_ARGS)
 	{
 		if (j < 6)
 		{
-			v |= (cl_ulong)random() << j;
+			v |= __random() << j;
 			j += 31;
 		}
 		*pos = base64[v & 0x3f];
@@ -641,12 +1121,10 @@ pgstrom_random_int4range(PG_FUNCTION_ARGS)
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
-	type_oid = GetSysCacheOid2(TYPENAMENSP,
-							   CStringGetDatum("int4range"),
-							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	type_oid = get_type_oid("int4range", PG_CATALOG_NAMESPACE, false);
 	typcache = range_get_typcache(fcinfo, type_oid);
-	x = lower + random() % (upper - lower);
-	y = lower + random() % (upper - lower);
+	x = lower + __random() % (upper - lower);
+	y = lower + __random() % (upper - lower);
 	return simple_make_range(typcache,
 							 Int32GetDatum(x),
 							 Int32GetDatum(y));
@@ -665,13 +1143,11 @@ pgstrom_random_int8range(PG_FUNCTION_ARGS)
 
 	if (generate_null(ratio))
 		PG_RETURN_NULL();
-	type_oid = GetSysCacheOid2(TYPENAMENSP,
-							   CStringGetDatum("int8range"),
-							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	type_oid = get_type_oid("int8range", PG_CATALOG_NAMESPACE, false);
 	typcache = range_get_typcache(fcinfo, type_oid);
-	v = ((int64)random() << 31) | (int64)random();
+	v = (__random() << 31) | __random();
 	x = lower + v % (upper - lower);
-	v = ((int64)random() << 31) | (int64)random();
+	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
 							 Int64GetDatum(x),
@@ -715,13 +1191,11 @@ pgstrom_random_tsrange(PG_FUNCTION_ARGS)
 	if (upper < lower)
 		elog(ERROR, "%s: lower bound is larger than upper", __FUNCTION__);
 
-	type_oid = GetSysCacheOid2(TYPENAMENSP,
-							   CStringGetDatum("tsrange"),
-							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	type_oid = get_type_oid("tsrange", PG_CATALOG_NAMESPACE, false);
 	typcache = range_get_typcache(fcinfo, type_oid);
-	v = ((cl_ulong)random() << 31) | random();
+	v = (__random() << 31) | __random();
 	x = lower + v % (upper - lower);
-	v = ((cl_ulong)random() << 31) | random();
+	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
 							 TimestampGetDatum(x),
@@ -765,13 +1239,11 @@ pgstrom_random_tstzrange(PG_FUNCTION_ARGS)
 	if (upper < lower)
 		elog(ERROR, "%s: lower bound is larger than upper", __FUNCTION__);
 
-	type_oid = GetSysCacheOid2(TYPENAMENSP,
-							   CStringGetDatum("tstzrange"),
-							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	type_oid = get_type_oid("tstzrange", PG_CATALOG_NAMESPACE, false);
 	typcache = range_get_typcache(fcinfo, type_oid);
-	v = ((cl_ulong)random() << 31) | random();
+	v = (__random() << 31) | __random();
 	x = lower + v % (upper - lower);
-	v = ((cl_ulong)random() << 31) | random();
+	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
 							 TimestampTzGetDatum(x),
@@ -802,12 +1274,10 @@ pgstrom_random_daterange(PG_FUNCTION_ARGS)
 	if (upper < lower)
 		elog(ERROR, "%s: lower bound is larger than upper", __FUNCTION__);
 
-	type_oid = GetSysCacheOid2(TYPENAMENSP,
-							   CStringGetDatum("daterange"),
-							   ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	type_oid = get_type_oid("daterange", PG_CATALOG_NAMESPACE, false);
 	typcache = range_get_typcache(fcinfo, type_oid);
-	x = lower + random() % (upper - lower);
-	y = lower + random() % (upper - lower);
+	x = lower + __random() % (upper - lower);
+	y = lower + __random() % (upper - lower);
 	return simple_make_range(typcache,
 							 DateADTGetDatum(x),
 							 DateADTGetDatum(y));
@@ -825,3 +1295,314 @@ pgstrom_abort_if(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 PG_FUNCTION_INFO_V1(pgstrom_abort_if);
+
+/*
+ * Simple wrapper for read(2) and write(2) to ensure full-buffer read and
+ * write, regardless of i/o-size and signal interrupts.
+ */
+ssize_t
+__readFile(int fdesc, void *buffer, size_t nbytes)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = read(fdesc, (char *)buffer + count, nbytes - count);
+		if (rv < 0)
+		{
+			if (errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return rv;
+		}
+		else if (rv == 0)
+			break;
+		count += rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+ssize_t
+__writeFile(int fdesc, const void *buffer, size_t nbytes)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = write(fdesc, (const char *)buffer + count, nbytes - count);
+		if (rv < 0)
+		{
+			if (errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+			return -1;
+		}
+		else if (rv == 0)
+			break;
+		count += rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+/*
+ * mmap/munmap wrapper that is automatically unmapped on regarding to
+ * the resource-owner.
+ */
+typedef struct
+{
+	void	   *mmap_addr;
+	size_t		mmap_size;
+	int			mmap_prot;
+	int			mmap_flags;
+	ResourceOwner owner;
+} mmapEntry;
+static HTAB	   *mmap_tracker_htab = NULL;
+
+static void
+cleanup_mmap_chunks(ResourceReleasePhase phase,
+					bool isCommit,
+					bool isTopLevel,
+					void *arg)
+{
+	if (mmap_tracker_htab &&
+		hash_get_num_entries(mmap_tracker_htab) > 0)
+	{
+		HASH_SEQ_STATUS	seq;
+		mmapEntry	   *entry;
+
+		hash_seq_init(&seq, mmap_tracker_htab);
+		while ((entry = hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->owner != CurrentResourceOwner)
+				continue;
+			if (isCommit)
+				elog(WARNING, "mmap (%p-%p; sz=%zu) leaks, and still mapped",
+					 (char *)entry->mmap_addr,
+					 (char *)entry->mmap_addr + entry->mmap_size,
+					 entry->mmap_size);
+			if (munmap(entry->mmap_addr, entry->mmap_size) != 0)
+				elog(WARNING, "failed on munmap(%p, %zu): %m",
+					 entry->mmap_addr, entry->mmap_size);
+			hash_search(mmap_tracker_htab,
+						&entry->mmap_addr,
+						HASH_REMOVE,
+						NULL);
+		}
+	}
+}
+
+void *
+__mmapFile(void *addr, size_t length,
+		   int prot, int flags, int fdesc, off_t offset)
+{
+	void	   *mmap_addr;
+	size_t		mmap_size = TYPEALIGN(PAGE_SIZE, length);
+	mmapEntry  *entry;
+	bool		found;
+
+	if (!mmap_tracker_htab)
+	{
+		HASHCTL		hctl;
+
+		memset(&hctl, 0, sizeof(HASHCTL));
+		hctl.keysize = sizeof(void *);
+		hctl.entrysize = sizeof(mmapEntry);
+		hctl.hcxt = CacheMemoryContext;
+		mmap_tracker_htab = hash_create("mmap_tracker_htab",
+										256,
+										&hctl,
+										HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		RegisterResourceReleaseCallback(cleanup_mmap_chunks, 0);
+	}
+	mmap_addr = mmap(addr, mmap_size, prot, flags, fdesc, offset);
+	if (mmap_addr == MAP_FAILED)
+		return MAP_FAILED;
+	PG_TRY();
+	{
+		entry = hash_search(mmap_tracker_htab,
+							&mmap_addr,
+							HASH_ENTER,
+							&found);
+		if (found)
+			elog(ERROR, "Bug? duplicated mmap entry");
+		Assert(entry->mmap_addr == mmap_addr);
+		entry->mmap_size = mmap_size;
+		entry->mmap_prot = prot;
+		entry->mmap_flags = flags;
+		entry->owner = CurrentResourceOwner;
+	}
+	PG_CATCH();
+	{
+		if (munmap(mmap_addr, mmap_size) != 0)
+			elog(WARNING, "failed on munmap(%p, %zu): %m",
+				 mmap_addr, mmap_size);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return mmap_addr;
+}
+
+int
+__munmapFile(void *mmap_addr)
+{
+	mmapEntry  *entry;
+	int			rv;
+
+	if (mmap_tracker_htab)
+	{
+		entry = hash_search(mmap_tracker_htab,
+							&mmap_addr, HASH_REMOVE, NULL);
+		if (entry)
+		{
+			rv = munmap(entry->mmap_addr,
+						entry->mmap_size);
+			if (rv != 0)
+			{
+				int		errno_saved = errno;
+
+				elog(WARNING, "failed on munmap(%p, %zu): %m",
+					 entry->mmap_addr,
+					 entry->mmap_size);
+				errno = errno_saved;
+			}
+			return rv;
+		}
+	}
+	/* mmapEntry not found */
+	errno = EINVAL;
+	return -1;
+}
+
+/*
+ * dummy entry for deprecated functions
+ */
+static void
+__pg_deprecated_function(PG_FUNCTION_ARGS, const char *cfunc_name)
+{
+	FmgrInfo   *flinfo = fcinfo->flinfo;
+
+	if (OidIsValid(flinfo->fn_oid))
+		elog(ERROR, "'%s' on behalf of %s is already deprecated",
+			 cfunc_name, format_procedure(flinfo->fn_oid));
+	elog(ERROR, "'%s' is already deprecated", cfunc_name);
+}
+
+#define PG_DEPRECATED_FUNCTION(cfunc_name)				\
+	Datum	cfunc_name(PG_FUNCTION_ARGS);				\
+	Datum	cfunc_name(PG_FUNCTION_ARGS)				\
+	{													\
+		__pg_deprecated_function(fcinfo, __FUNCTION__);	\
+		PG_RETURN_NULL();								\
+	}													\
+	PG_FUNCTION_INFO_V1(cfunc_name)
+
+/* deadcode/gstore_(fdw|buf).c */
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_validator);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_handler);
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_in);
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_out);
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_recv);
+PG_DEPRECATED_FUNCTION(pgstrom_reggstore_send);
+
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_chunk_info);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_format);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_nitems);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_nattrs);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_rawsize);
+PG_DEPRECATED_FUNCTION(pgstrom_gstore_export_ipchandle);
+
+/* deadcode/largeobject.c */
+PG_DEPRECATED_FUNCTION(pgstrom_lo_import_gpu);
+PG_DEPRECATED_FUNCTION(pgstrom_lo_export_gpu);
+
+/* deadcode/pl_cuda_v2.c */
+PG_DEPRECATED_FUNCTION(plcuda_function_validator);
+PG_DEPRECATED_FUNCTION(plcuda_function_handler);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_numbers_by_names);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_number_by_name);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_types_by_names);
+PG_DEPRECATED_FUNCTION(pgsql_table_attr_type_by_name);
+PG_DEPRECATED_FUNCTION(pgsql_check_attrs_of_types);
+PG_DEPRECATED_FUNCTION(pgsql_check_attrs_of_type);
+PG_DEPRECATED_FUNCTION(pgsql_check_attr_of_type);
+
+/* deadcode/matrix.c */
+PG_DEPRECATED_FUNCTION(array_matrix_accum);
+PG_DEPRECATED_FUNCTION(array_matrix_accum_varbit);
+PG_DEPRECATED_FUNCTION(varbit_to_int4_array);
+PG_DEPRECATED_FUNCTION(int4_array_to_varbit);
+PG_DEPRECATED_FUNCTION(array_matrix_final_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_final_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_final_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_final_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_final_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_final_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_unnest);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_boolt);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_boolb);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int2t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int2b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int4t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int4b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int8t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_int8b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float4t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float4b);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float8t);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_scalar_float8b);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_booll);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_boolr);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int2l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int2r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int4l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int4r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int8l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_int8r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float4l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float4r);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float8l);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_scalar_float8r);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_accum);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_rbind_final_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_accum);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_cbind_final_float8);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_bool);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_int2);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_int4);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_int8);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_float4);
+PG_DEPRECATED_FUNCTION(array_matrix_transpose_float8);
+PG_DEPRECATED_FUNCTION(float4_as_int4);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(int4_as_float4);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(float8_as_int8);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(int8_as_float8);		/* duplicated, see float2.c */
+PG_DEPRECATED_FUNCTION(array_matrix_validation);
+PG_DEPRECATED_FUNCTION(array_matrix_height);
+PG_DEPRECATED_FUNCTION(array_matrix_width);

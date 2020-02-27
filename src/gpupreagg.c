@@ -3,8 +3,8 @@
  *
  * Aggregate Pre-processing with GPU acceleration
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -137,11 +137,7 @@ typedef struct
 	cl_bool			terminator_done;
 	cl_int			num_group_keys;
 	TupleTableSlot *gpreagg_slot;	/* Slot reflects tlist_dev (w/o junks) */
-#if PG_VERSION_NUM < 100000
-	List		   *outer_quals;	/* List of ExprState */
-#else
 	ExprState	   *outer_quals;
-#endif
 	TupleTableSlot *outer_slot;
 	ProjectionInfo *outer_proj;		/* outer tlist -> custom_scan_tlist */
 
@@ -983,6 +979,8 @@ cost_gpupreagg(PlannerInfo *root,
 			outer_total -= cost_for_dma_receive(input_path->parent, -1.0);
 			outer_total -= cpu_tuple_cost * input_path->rows;
 		}
+		else if (pathtree_has_gpupath(input_path))
+			outer_total += pgstrom_gpu_setup_cost / 2;
 		else
 			outer_total += pgstrom_gpu_setup_cost;
 
@@ -1107,12 +1105,12 @@ cost_gpupreagg(PlannerInfo *root,
 	return true;
 }
 
+#if PG_VERSION_NUM < 120000
 /*
- * estimate_hashagg_tablesize
- *
- * See optimizer/plan/planner.c
+ * estimate_hashagg_tablesize - had been declared as a static function
+ * until PG12 at the optimizer/plan/planner.c.
  */
-static Size
+static double
 estimate_hashagg_tablesize(Path *path, const AggClauseCosts *agg_costs,
                            double dNumGroups)
 {
@@ -1129,6 +1127,7 @@ estimate_hashagg_tablesize(Path *path, const AggClauseCosts *agg_costs,
 
 	return hashentrysize * dNumGroups;
 }
+#endif
 
 /*
  * make_gpupreagg_path
@@ -1358,13 +1357,8 @@ try_add_final_aggregation_paths(PlannerInfo *root,
 								 -1.0);
 			if (parse->groupingSets)
 			{
-#if PG_VERSION_NUM < 100000
-				List	   *rollup_lists = NIL;
-				List	   *rollup_groupclauses = NIL;
-#else
 				AggStrategy	rollup_strategy = AGG_PLAIN;
 				List	   *rollup_data_list = NIL;
-#endif
 				ListCell   *lc;
 				/*
 				 * TODO: In this version, we expect group_rel->pathlist have
@@ -1380,13 +1374,8 @@ try_add_final_aggregation_paths(PlannerInfo *root,
 
 					if (IsA(pathnode, GroupingSetsPath))
 					{
-#if PG_VERSION_NUM < 100000
-						rollup_groupclauses = pathnode->rollup_groupclauses;
-						rollup_lists = pathnode->rollup_lists;
-#else
 						rollup_strategy = pathnode->aggstrategy;
 						rollup_data_list = pathnode->rollups;
-#endif
 						break;
 					}
 				}
@@ -1400,13 +1389,8 @@ try_add_final_aggregation_paths(PlannerInfo *root,
 											 target_final,
 #endif
 											 (List *) parse->havingQual,
-#if PG_VERSION_NUM < 100000
-											 rollup_lists,
-											 rollup_groupclauses,
-#else
 											 rollup_strategy,
 											 rollup_data_list,
-#endif
 											 agg_final_costs,
 											 num_groups);
 #if PG_VERSION_NUM >= 110000
@@ -1468,7 +1452,7 @@ try_add_final_aggregation_paths(PlannerInfo *root,
 		/* make a final grouping path (hash) */
 		if (can_hash)
 		{
-			Size	hashaggtablesize
+			double	hashaggtablesize
 				= estimate_hashagg_tablesize(partial_path,
 											 agg_final_costs,
 											 num_groups);
@@ -1510,44 +1494,48 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 							   bool can_pullup_outerscan,
 							   bool try_parallel_path)
 {
-#if PG_VERSION_NUM >= 100000
+#if PG_VERSION_NUM >= 110000
 	List	   *append_paths_list = NIL;
 	List	   *sub_paths_list;
 	List	   *partitioned_rels;
-	Index		partition_relid;
 	int			parallel_nworkers;
 	AppendPath *append_path;
+	Cost		discount_cost;
 	Path	   *partial_path;
 	ListCell   *lc;
 
 	sub_paths_list = extract_partitionwise_pathlist(root,
-													input_path->pathtarget,
 													input_path,
-													NULL,
 													try_parallel_path,
+													&append_path,
 													&parallel_nworkers,
-													&partition_relid,
-													&partitioned_rels);
+													&discount_cost);
 	if (sub_paths_list == NIL)
 		return;
+	if (list_length(sub_paths_list) > 1)
+		discount_cost /= (Cost)(list_length(sub_paths_list) - 1);
+	else
+		discount_cost = 0.0;
+
 	foreach (lc, sub_paths_list)
 	{
+		Path	   *sub_path = (Path *) lfirst(lc);
+		RelOptInfo *sub_rel = sub_path->parent;
 		PathTarget *curr_partial = copy_pathtarget(target_partial);
 		PathTarget *curr_device = copy_pathtarget(target_device);
-		Path	   *sub_path = (Path *) lfirst(lc);
 		Path	   *partial_path;
+		AppendRelInfo **appinfos;
+		int				nappinfos;
 
+		appinfos = __find_appinfos_by_relids(root, sub_rel->relids,
+											 &nappinfos);
 		/* fixup varno */
-		curr_partial->exprs =
-			fixup_appendrel_child_varnode(curr_partial->exprs,
-										  root,
-										  partition_relid,
-										  sub_path->parent);
-		curr_device->exprs =
-			fixup_appendrel_child_varnode(curr_device->exprs,
-										  root,
-										  partition_relid,
-										  sub_path->parent);
+		curr_partial->exprs = (List *)
+			adjust_appendrel_attrs(root, (Node *)curr_partial->exprs,
+								   nappinfos, appinfos);
+		curr_device->exprs = (List *)
+			adjust_appendrel_attrs(root, (Node *)curr_device->exprs,
+								   nappinfos, appinfos);
 
 		partial_path = prepend_gpupreagg_path(root,
 											  group_rel,
@@ -1560,30 +1548,25 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 											  false);
 		if (!partial_path)
 			return;
+		partial_path->total_cost -= discount_cost;
 		append_paths_list = lappend(append_paths_list, partial_path);
 	}
 	/* also see create_append_path(), some fields must be fixed up */
-#if PG_VERSION_NUM < 110000
-	append_path = create_append_path(input_path->parent,
-									 append_paths_list,
-									 NULL,
-									 parallel_nworkers,
-									 partitioned_rels);
-#else
+	partitioned_rels = copyObject(append_path->partitioned_rels);
 	if (try_parallel_path)
 		append_path = create_append_path(root, input_path->parent,
 										 NIL, append_paths_list,
-										 NULL,
+										 NIL, NULL,
 										 parallel_nworkers, true,
 										 partitioned_rels, -1.0);
 	else
 		append_path = create_append_path(root, input_path->parent,
 										 append_paths_list, NIL,
-										 NULL,
+										 NIL, NULL,
 										 parallel_nworkers, false,
 										 partitioned_rels, -1.0);
-#endif
 	append_path->path.pathtarget = target_partial;
+	append_path->path.total_cost -= discount_cost;
 
 	/* prepend Gather on demand */
 	if (try_parallel_path &&
@@ -1610,7 +1593,7 @@ try_add_gpupreagg_append_paths(PlannerInfo *root,
 									(List *) havingQual,
 									num_groups,
 									agg_final_costs);
-#endif	/* PG_VERSION_NUM >= 100000 */
+#endif	/* PG_VERSION_NUM >= 110000 */
 }
 
 /*
@@ -2018,7 +2001,7 @@ make_altfunc_simple_expr(const char *func_name, Expr *func_arg)
 			 : funcname_signature_string(func_name, 0, NIL, NULL));
 
 	proc_form = (Form_pg_proc) GETSTRUCT(tuple);
-	func_expr = makeFuncExpr(HeapTupleGetOid(tuple),
+	func_expr = makeFuncExpr(PgProcTupleGetOid(tuple),
 							 proc_form->prorettype,
 							 func_arg ? list_make1(func_arg) : NIL,
 							 InvalidOid,
@@ -2136,14 +2119,9 @@ make_altfunc_pcov_xy(Aggref *aggref, const char *func_name)
 	func_argtypes_oid[1] = FLOAT8OID;
 	func_argtypes_oid[2] = FLOAT8OID;
 	func_argtypes = buildoidvector(func_argtypes_oid, 3);
-	func_oid = GetSysCacheOid3(PROCNAMEARGSNSP,
-							   PointerGetDatum(func_name),
-							   PointerGetDatum(func_argtypes),
-							   ObjectIdGetDatum(namespace_oid));
-	if (!OidIsValid(func_oid))
-		elog(ERROR, "alternative function not found: %s",
-			 funcname_signature_string(func_name, 2, NIL, func_argtypes_oid));
-
+	func_oid = get_function_oid(func_name,
+								func_argtypes,
+								namespace_oid, false);
 	/* filter if any */
 	if (aggref->aggfilter)
 		filter_expr = aggref->aggfilter;
@@ -2323,7 +2301,7 @@ make_alternative_aggref(PlannerInfo *root,
 										   NIL,
 										   aggfn_cat->partfn_argtypes));
 		proc_form = (Form_pg_proc) GETSTRUCT(tuple);
-		expr_host = (Expr *)makeFuncExpr(HeapTupleGetOid(tuple),
+		expr_host = (Expr *)makeFuncExpr(PgProcTupleGetOid(tuple),
 										 proc_form->prorettype,
 										 altfunc_args,
 										 InvalidOid,
@@ -2344,15 +2322,10 @@ make_alternative_aggref(PlannerInfo *root,
 
 	func_name = aggfn_cat->finalfn_name + 2;
 	func_argtypes = buildoidvector(&aggfn_cat->finalfn_argtype, 1);
-	func_oid = GetSysCacheOid3(PROCNAMEARGSNSP,
-							   PointerGetDatum(func_name),
-							   PointerGetDatum(func_argtypes),
-							   ObjectIdGetDatum(namespace_oid));
-	if (!OidIsValid(func_oid))
-		elog(ERROR, "cache lookup failed for function %s",
-			 funcname_signature_string(func_name, 1, NIL,
-									   &aggfn_cat->finalfn_argtype));
-	/* sanity checks */
+	func_oid = get_function_oid(func_name,
+								func_argtypes,
+								namespace_oid, false);
+	/* sanity check */
 	Assert(aggref->aggtype == get_func_rettype(func_oid));
 
 	tuple = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(func_oid));
@@ -2799,6 +2772,16 @@ pgstrom_planstate_is_gpupreagg(const PlanState *ps)
 }
 
 /*
+ * pgstrom_copy_gpupreagg_path
+ */
+Path *
+pgstrom_copy_gpupreagg_path(const Path *pathnode)
+{
+	Assert(pgstrom_path_is_gpupreagg(pathnode));
+	return pmemdup(pathnode, sizeof(CustomPath));
+}
+
+/*
  * make_tlist_device_projection
  *
  * It pulls a set of referenced resource numbers according to the supplied
@@ -3134,7 +3117,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 		Assert(outer_scanrelid > 0 &&
 			   outer_scanrelid < root->simple_rel_array_size);
 		rte = root->simple_rte_array[outer_scanrelid];
-		outer_rel = heap_open(rte->relid, NoLock);
+		outer_rel = table_open(rte->relid, NoLock);
 		outer_desc = RelationGetDescr(outer_rel);
 		nattrs = outer_desc->natts;
 	}
@@ -3382,7 +3365,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 		"                         cl_char *dst_dclass,\n"
 		"                         Datum   *dst_values)\n"
 		"{\n"
-		"%s\n%s"
+		"%s%s\n%s"
 		"}\n\n"
 		"#ifdef GPUPREAGG_COMBINED_JOIN\n"
 		"DEVICE_FUNCTION(void)\n"
@@ -3392,7 +3375,7 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 		"                          cl_char *dst_dclass,\n"
 		"                          Datum   *dst_values)\n"
 		"{\n"
-		"%s\n%s"
+		"%s%s\n%s"
 		"}\n"
 		"#endif /* GPUPREAGG_COMBINED_JOIN */\n\n"
 		"DEVICE_FUNCTION(void)\n"
@@ -3402,17 +3385,17 @@ gpupreagg_codegen_projection_row(StringInfo kern,
 		"                           cl_char *dst_dclass,\n"
 		"                           Datum   *dst_values)\n"
 		"{\n"
-		"%s\n%s"
+		"%s%s\n%s"
 		"}\n\n",
-		decl.data,
+		decl.data, context->decl_temp.data,
 		tbody.data,
-		decl.data,
+		decl.data, context->decl_temp.data,
 		sbody.data,
-		decl.data,
+		decl.data, context->decl_temp.data,
 		cbody.data);
 
 	if (outer_rel)
-		heap_close(outer_rel, NoLock);
+		table_close(outer_rel, NoLock);
 
 	pfree(decl.data);
 	pfree(tbody.data);
@@ -3440,6 +3423,7 @@ gpupreagg_codegen_hashvalue(StringInfo kern,
 	StringInfoData	body;
 	List		   *type_oid_list = NIL;
 	ListCell	   *lc;
+	bool			is_first_key = true;
 
 	initStringInfo(&decl);
 	initStringInfo(&body);
@@ -3472,13 +3456,29 @@ gpupreagg_codegen_hashvalue(StringInfo kern,
 			dtype->type_name,
 			tle->resno - 1,
 			tle->resno - 1);
-		/* update hash value (by crc32) */
+		/*
+		 * update hash value
+		 *
+		 * NOTE: In case when GROUP BY has multiple keys and identical values
+		 * may appear on some of them, we should not merge hash values without
+		 * randomization, because (X xor Y) xor Y == X.
+		 * We put a simple randomization using magic number (0x9e370001) here,
+		 * so it enables to generate different hash value, even if key1 and
+		 * key2 has same value.
+		 */
+		if (!is_first_key)
+		{
+			appendStringInfo(
+				&body,
+				"  hash = ((cl_ulong)hash * 0x9e370001UL) >> 32;\n");
+		}
 		appendStringInfo(
 			&body,
 			"  hash ^= pg_comp_hash(kcxt, temp.%s_v);\n",
 			dtype->type_name);
 		type_oid_list = list_append_unique_oid(type_oid_list,
 											   dtype->type_oid);
+		is_first_key = false;
 	}
 	pgstrom_union_type_declarations(&decl, "temp", type_oid_list);
 
@@ -3588,7 +3588,7 @@ gpupreagg_codegen_keymatch(StringInfo kern,
 		appendStringInfo(
 			&body,
 			"  pg_datum_ref_slot(kcxt, x_temp.%s_v,\n"
-			"                    x_dclass[%d], y_values[%d]);\n"
+			"                    x_dclass[%d], x_values[%d]);\n"
 			"  pg_datum_ref_slot(kcxt, y_temp.%s_v,\n"
 			"                    y_dclass[%d], y_values[%d]);\n"
 			"  if (!x_temp.%s_v.isnull && !y_temp.%s_v.isnull)\n"
@@ -4074,7 +4074,6 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 	CustomScan	   *cscan = (CustomScan *) node->ss.ps.plan;
 	GpuPreAggInfo  *gpa_info = deform_gpupreagg_info(cscan);
 	List		   *tlist_dev = cscan->custom_scan_tlist;
-	List		   *tlist_fallback = NIL;
 	ListCell	   *lc	__attribute__((unused));
 	TupleDesc		gpreagg_tupdesc;
 	TupleDesc		outer_tupdesc;
@@ -4082,7 +4081,6 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 	ProgramId		program_id;
 	size_t			length;
 	bool			explain_only = ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0);
-	bool			has_oid;
 
 	Assert(scan_rel ? outerPlan(node) == NULL : outerPlan(cscan) != NULL);
 	/* activate a GpuContext for CUDA kernel execution */
@@ -4127,17 +4125,13 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 	else
 	{
 		Assert(scan_rel != NULL);
-#if PG_VERSION_NUM < 100000
-		gpas->outer_quals = (List *)
-			ExecInitExpr((Expr *)gpa_info->outer_quals, &gpas->gts.css.ss.ps);
-#else
 		gpas->outer_quals = ExecInitQual(gpa_info->outer_quals,
 										 &gpas->gts.css.ss.ps);
-#endif
 		outer_tupdesc = RelationGetDescr(scan_rel);
 		pgstromExecInitBrinIndexMap(&gpas->gts,
 									gpa_info->index_oid,
-									gpa_info->index_conds);
+									gpa_info->index_conds,
+									gpa_info->index_quals);
 	}
 
 	/*
@@ -4146,34 +4140,27 @@ ExecInitGpuPreAgg(CustomScanState *node, EState *estate, int eflags)
 	 * Projection from the outer-relation to the custom_scan_tlist is a job
 	 * of CPU fallback. It is equivalent to the initial device projection.
 	 */
-#if PG_VERSION_NUM < 100000
-	tlist_fallback = (List *)ExecInitExpr((Expr *)gpa_info->tlist_fallback,
-										  &gpas->gts.css.ss.ps);
-#else
-	tlist_fallback = gpa_info->tlist_fallback;
-#endif
-	if (!ExecContextForcesOids(&gpas->gts.css.ss.ps, &has_oid))
-		has_oid = false;
-	gpreagg_tupdesc = ExecCleanTypeFromTL(tlist_dev, has_oid);
-	gpas->gpreagg_slot = MakeSingleTupleTableSlot(gpreagg_tupdesc);
+	gpreagg_tupdesc = ExecCleanTypeFromTL(tlist_dev);
+	gpas->gpreagg_slot = MakeSingleTupleTableSlot(gpreagg_tupdesc,
+												  &TTSOpsVirtual);
 	//XXX - tlist_dev and tlist_fallback are compatible; needs Assert()?
 
-	gpas->outer_slot = MakeSingleTupleTableSlot(outer_tupdesc);
-	gpas->outer_proj = ExecBuildProjectionInfo(tlist_fallback,
+	gpas->outer_slot = MakeSingleTupleTableSlot(outer_tupdesc,
+												&TTSOpsHeapTuple);
+	gpas->outer_proj = ExecBuildProjectionInfo(gpa_info->tlist_fallback,
 											   econtext,
 											   gpas->gpreagg_slot,
 											   &gpas->gts.css.ss.ps,
 											   outer_tupdesc);
 	/* Template of kds_slot */
-	length = KDS_calculateHeadSize(gpreagg_tupdesc, false);
+	length = KDS_calculateHeadSize(gpreagg_tupdesc);
 	gpas->kds_slot_head = MemoryContextAllocZero(CurTransactionContext,
 												 length);
 	init_kernel_data_store(gpas->kds_slot_head,
 						   gpreagg_tupdesc,
 						   INT_MAX,		/* to be set individually */
 						   KDS_FORMAT_SLOT,
-						   INT_MAX,		/* to be set individually */
-						   false);
+						   INT_MAX);	/* to be set individually */
 
 	/* Save the plan-time estimations */
 	gpas->plan_nrows_per_chunk =
@@ -4370,7 +4357,6 @@ ExecGpuPreAggInitWorker(CustomScanState *node,
 	pgstromInitWorkerGpuTaskState(&gpas->gts, coordinate);
 }
 
-#if PG_VERSION_NUM >= 100000
 /*
  * ExecGpuPreAggReInitializeDSM
  */
@@ -4413,7 +4399,6 @@ ExecShutdownGpuPreAgg(CustomScanState *node)
 		gpas->gpa_rtstat = gpa_rtstat_new;
 	}
 }
-#endif
 
 /*
  * ExplainGpuPreAgg
@@ -4507,15 +4492,7 @@ createGpuPreAggSharedState(GpuPreAggState *gpas,
 
 	gpa_rtstat = &gpa_sstate->gpa_rtstat;
 	SpinLockInit(&gpa_rtstat->c.lock);
-#if PG_VERSION_NUM < 100000
-	/* Because of restrictions at PG9.6, see createScanSharedState */
-	if (dsm_addr)
-	{
-		gpa_rtstat = MemoryContextAllocZero(estate->es_query_cxt,
-											sizeof(GpuPreAggRuntimeStat));
-		SpinLockInit(&gpa_rtstat->c.lock);
-	}
-#endif
+
 	gpas->gpa_sstate = gpa_sstate;
 	gpas->gpa_rtstat = gpa_rtstat;
 }
@@ -4898,14 +4875,8 @@ gpupreagg_next_tuple_fallback(GpuPreAggState *gpas, GpuPreAggTask *gpreagg)
 			/* Run CPU Projection of GpuJoin, instead */
 			if (outer_gts->css.ss.ps.ps_ProjInfo)
 			{
-				ExprContext *__econtext = outer_gts->css.ss.ps.ps_ExprContext;
-
-				__econtext->ecxt_scantuple = slot;
-#if PG_VERSION_NUM < 100000
-				slot = ExecProject(outer_gts->css.ss.ps.ps_ProjInfo, &is_done);
-#else
+				outer_gts->css.ss.ps.ps_ExprContext->ecxt_scantuple = slot;
 				slot = ExecProject(outer_gts->css.ss.ps.ps_ProjInfo);
-#endif
 			}
 			econtext->ecxt_scantuple = slot;
 		}
@@ -4925,25 +4896,15 @@ gpupreagg_next_tuple_fallback(GpuPreAggState *gpas, GpuPreAggTask *gpreagg)
 		pg_atomic_add_fetch_u64(&gpa_rtstat->c.source_nitems, 1L);
 
 		/* filter out the tuple, if any outer quals */
-#if PG_VERSION_NUM < 100000
-		retval = ExecQual(gpas->outer_quals, econtext, false);
-#else
 		retval = ExecQual(gpas->outer_quals, econtext);
-#endif
 		if (!retval)
 		{
 			pg_atomic_add_fetch_u64(&gpa_rtstat->c.nitems_filtered, 1L);
 			continue;
 		}
 		/* makes a projection from the outer-scan to the pseudo-tlist */
-#if PG_VERSION_NUM < 100000
-		slot = ExecProject(gpas->outer_proj, &is_done);
-		if (is_done != ExprEndResult)
-			break;		/* XXX is this logic really right? */
-#else
 		slot = ExecProject(gpas->outer_proj);
 		break;
-#endif
 	}
 	pg_atomic_add_fetch_u64(&gpa_rtstat->c.fallback_count, 1);
 	return slot;
@@ -5149,6 +5110,7 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 	CUdeviceptr		m_kds_slot = 0UL;
 	CUdeviceptr		m_kds_final = (CUdeviceptr)&pds_final->kds;
 	CUdeviceptr		m_fhash = gpas->m_fhash;
+	bool			m_kds_src_release = false;
 	cl_int			grid_sz;
 	cl_int			block_sz;
 	void		   *last_suspend = NULL;
@@ -5207,7 +5169,9 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 		rc = gpuMemAllocIOMap(gcontext,
 							  &m_kds_src,
 							  required);
-		if (rc == CUDA_ERROR_OUT_OF_MEMORY)
+		if (rc == CUDA_SUCCESS)
+			m_kds_src_release = true;
+		else if (rc == CUDA_ERROR_OUT_OF_MEMORY)
 		{
 			gpreagg->with_nvme_strom = false;
 			if (pds_src->kds.format == KDS_FORMAT_BLOCK)
@@ -5217,9 +5181,11 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 				rc = gpuMemAlloc(gcontext,
 								 &m_kds_src,
 								 required);
-				if (rc == CUDA_ERROR_OUT_OF_MEMORY)
+				if (rc == CUDA_SUCCESS)
+					m_kds_src_release = true;
+				else if (rc == CUDA_ERROR_OUT_OF_MEMORY)
 					goto out_of_resource;
-				else if (rc != CUDA_SUCCESS)
+				else
 					werror("failed on gpuMemAlloc: %s", errorText(rc));
 			}
 			else
@@ -5230,7 +5196,7 @@ gpupreagg_process_reduction_task(GpuPreAggTask *gpreagg,
 				Assert(!pds_src->iovec);
 			}
 		}
-		else if (rc != CUDA_SUCCESS)
+		else
 			werror("failed on gpuMemAllocIOMap: %s", errorText(rc));
 	}
 	else
@@ -5412,6 +5378,11 @@ resume_kernel:
 					werror("failed on cuMemcpyDtoH: %s", errorText(rc));
 				pds_src->nblocks_uncached = 0;
 			}
+			else if (pds_src->kds.format == KDS_FORMAT_ARROW &&
+					 pds_src->iovec != NULL)
+			{
+				gpreagg->pds_src = PDS_writeback_arrow(pds_src, m_kds_src);
+			}
 			/* restore the point where suspended most recently */
 			gpreagg->kern.resume_context = (last_suspend != NULL);
 			if (last_suspend)
@@ -5468,9 +5439,7 @@ resume_kernel:
 		retval = 0;
 	}
 out_of_resource:
-	if (m_kds_src != 0UL &&
-		((pds_src->kds.format == KDS_FORMAT_BLOCK) ||
-		 (pds_src->kds.format == KDS_FORMAT_ARROW && pds_src->iovec)))
+	if (m_kds_src_release)
 		gpuMemFree(gcontext, m_kds_src);
 	if (m_kds_slot != 0UL)
 		gpuMemFree(gcontext, m_kds_slot);
@@ -5502,6 +5471,7 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 	CUdeviceptr		m_kparams = ((CUdeviceptr)&gpreagg->kern +
 								 offsetof(kern_gpupreagg, kparams));
 	CUresult		rc;
+	bool			m_kds_src_release = false;
 	cl_int			grid_sz;
 	cl_int			block_sz;
 	void		   *kern_args[10];
@@ -5547,7 +5517,9 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 		rc = gpuMemAllocIOMap(gcontext,
 							  &m_kds_src,
 							  required);
-		if (rc == CUDA_ERROR_OUT_OF_MEMORY)
+		if (rc == CUDA_SUCCESS)
+			m_kds_src_release = true;
+		else if (rc == CUDA_ERROR_OUT_OF_MEMORY)
 		{
 			gpreagg->with_nvme_strom = false;
 			if (pds_src->kds.format == KDS_FORMAT_BLOCK)
@@ -5557,9 +5529,11 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 				rc = gpuMemAlloc(gcontext,
 								 &m_kds_src,
 								 required);
-				if (rc == CUDA_ERROR_OUT_OF_MEMORY)
+				if (rc == CUDA_SUCCESS)
+					m_kds_src_release = true;
+				else if (rc == CUDA_ERROR_OUT_OF_MEMORY)
 					goto out_of_resource;
-				else if (rc != CUDA_SUCCESS)
+				else
 					werror("failed on gpuMemAlloc: %s", errorText(rc));
 			}
 			else
@@ -5570,7 +5544,7 @@ gpupreagg_process_combined_task(GpuPreAggTask *gpreagg, CUmodule cuda_module)
 				Assert(!pds_src->iovec);
 			}
 		}
-		else if (rc != CUDA_SUCCESS)
+		else
 			werror("failed on gpuMemAllocIOMap: %s", errorText(rc));
 	}
 	else
@@ -5746,6 +5720,13 @@ resume_kernel:
 					werror("failed on cuMemcpyDtoH: %s", errorText(rc));
 				pds_src->nblocks_uncached = 0;
 			}
+			else if (pds_src &&
+					 pds_src->kds.format == KDS_FORMAT_ARROW &&
+					 pds_src->iovec != NULL)
+			{
+				gpreagg->pds_src = PDS_writeback_arrow(pds_src, m_kds_src);
+			}
+
 			/* restore the suspend context if any */
 			kgjoin->resume_context = (last_suspend != NULL);
 			if (last_suspend)
@@ -5838,9 +5819,7 @@ resume_kernel:
 		retval = -1;
 	}
 out_of_resource:
-	if (m_kds_src != 0UL &&
-		((pds_src->kds.format == KDS_FORMAT_BLOCK) ||
-		 (pds_src->kds.format == KDS_FORMAT_ARROW && pds_src->iovec)))
+	if (m_kds_src_release)
 		gpuMemFree(gcontext, m_kds_src);
 	if (m_kds_slot)
 		gpuMemFree(gcontext, m_kds_slot);
@@ -5904,7 +5883,7 @@ pgstrom_init_gpupreagg(void)
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
-#if PG_VERSION_NUM >= 100000
+#if PG_VERSION_NUM >= 110000
 	/* pg_strom.enable_partitionwise_gpupreagg */
 	DefineCustomBoolVariable("pg_strom.enable_partitionwise_gpupreagg",
 							 "(EXPERIMENTAL) Enables partition wise GpuPreAgg",
@@ -5959,10 +5938,8 @@ pgstrom_init_gpupreagg(void)
 	gpupreagg_exec_methods.EstimateDSMCustomScan = ExecGpuPreAggEstimateDSM;
     gpupreagg_exec_methods.InitializeDSMCustomScan = ExecGpuPreAggInitDSM;
     gpupreagg_exec_methods.InitializeWorkerCustomScan = ExecGpuPreAggInitWorker;
-#if PG_VERSION_NUM >= 100000
 	gpupreagg_exec_methods.ReInitializeDSMCustomScan = ExecGpuPreAggReInitializeDSM;
 	gpupreagg_exec_methods.ShutdownCustomScan  = ExecShutdownGpuPreAgg;
-#endif
 	gpupreagg_exec_methods.ExplainCustomScan   = ExplainGpuPreAgg;
 	/* hook registration */
 	create_upper_paths_next = create_upper_paths_hook;

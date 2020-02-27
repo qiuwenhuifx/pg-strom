@@ -1,6 +1,7 @@
 ---
 --- Micro test cases for numeric operators / functions
 ---
+SET pg_strom.regression_test_mode = on;
 SET client_min_messages = error;
 DROP SCHEMA IF EXISTS regtest_dtype_numeric_temp CASCADE;
 CREATE SCHEMA regtest_dtype_numeric_temp;
@@ -19,7 +20,7 @@ CREATE TABLE rt_numeric (
   y     numeric(12,3),
   z     numeric(12,3)
 );
-SELECT setseed(0.20190611);
+SELECT pgstrom.random_setseed(20190611);
 INSERT INTO rt_numeric (
   SELECT x, pgstrom.random_int(1,   -20000,   20000),
             pgstrom.random_int(1,  -200000,  200000),

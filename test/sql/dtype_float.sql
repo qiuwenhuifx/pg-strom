@@ -1,6 +1,7 @@
 ---
 --- Micro test cases for floating-point operators / functions
 ---
+SET pg_strom.regression_test_mode = on;
 SET client_min_messages = error;
 DROP SCHEMA IF EXISTS regtest_dtype_float_temp CASCADE;
 CREATE SCHEMA regtest_dtype_float_temp;
@@ -19,7 +20,7 @@ CREATE TABLE rt_float (
   y    int4,
   z    int8
 );
-SELECT setseed(0.20190609);
+SELECT pgstrom.random_setseed(20190609);
 INSERT INTO rt_float (
   SELECT x, pgstrom.random_float(1,     -3200.0,     3200.0),
             pgstrom.random_float(1,     -3200.0,     3200.0),

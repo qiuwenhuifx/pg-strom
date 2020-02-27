@@ -1,29 +1,47 @@
 /*
  * pg2arrow.c - main logic of the command
  *
- * Copyright 2018-2019 (C) KaiGai Kohei <kaigai@heterodb.com>
+ * Copyright 2018-2020 (C) KaiGai Kohei <kaigai@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License. See the LICENSE file.
  */
-#include "pg2arrow.h"
-#include "arrow_read.c"
-#include "arrow_types.c"
+#include "postgres.h"
+#include <assert.h>
+#include <endian.h>
+#include <getopt.h>
+#include <libpq-fe.h>
+#include "arrow_ipc.h"
 
 /* static functions */
 #define CURSOR_NAME		"curr_pg2arrow"
 static PGresult *pgsql_begin_query(PGconn *conn, const char *query);
 static PGresult *pgsql_next_result(PGconn *conn);
 static void      pgsql_end_query(PGconn *conn);
-static SQLtable *pgsql_create_composite_type(PGconn *conn,
-											 Oid comptype_relid);
-static SQLattribute *pgsql_create_array_element(PGconn *conn,
-												Oid array_elemid,
-												int *p_numFieldNode,
-												int *p_numBuffers);
+static void      pgsql_setup_composite_type(PGconn *conn,
+											SQLtable *root,
+											SQLfield *attr,
+											Oid comptype_relid,
+											int *p_numFieldNodes,
+											int *p_numBuffers);
+static void      pgsql_setup_array_element(PGconn *conn,
+										   SQLtable *root,
+										   SQLfield *attr,
+										   Oid array_elemid,
+										   int *p_numFieldNode,
+										   int *p_numBuffers);
+/* for --set option */
+typedef struct userConfigOption		userConfigOption;
+struct userConfigOption
+{
+	userConfigOption *next;
+	char		query[1];		/* SET xxx='xxx' command */
+};
+
 /* command options */
 static char	   *sql_command = NULL;
 static char	   *output_filename = NULL;
+static char	   *append_filename = NULL;
 static size_t	batch_segment_sz = 0;
 static char	   *pgsql_hostname = NULL;
 static char	   *pgsql_portno = NULL;
@@ -31,10 +49,20 @@ static char	   *pgsql_username = NULL;
 static int		pgsql_password_prompt = 0;
 static char	   *pgsql_database = NULL;
 static char	   *dump_arrow_filename = NULL;
-int				shows_progress = 0;
+static int		shows_progress = 0;
+static userConfigOption *session_preset_commands = NULL;
+/* server settings */
+static char	   *server_timezone_name = NULL;
+static int64_t	server_timezone_offset = 0;
 /* dictionary batches */
 SQLdictionary  *pgsql_dictionary_list = NULL;
-static int		pgsql_dictionary_count = 0;
+
+/* ntohll() */
+#if __BYTE_ORDER == __BIG_ENDIAN
+#define ntohll(x)		(x)
+#else
+#define ntohll(x)		__bswap_64(x)
+#endif
 
 static void
 usage(void)
@@ -48,7 +76,10 @@ usage(void)
 		  "  -f, --file=FILENAME     SQL command from file\n"
 		  "      (-c and -f are exclusive, either of them must be specified)\n"
 		  "  -o, --output=FILENAME   result file in Apache Arrow format\n"
-		  "      (default creates a temporary file)\n"
+		  "      --append=FILENAME   result file to be appended\n"
+		  "\n"
+		  "      --output and --append are exclusive to use at the same time.\n"
+		  "      If neither of them are specified, it creates a temporary file.)\n"
 		  "\n"
 		  "Arrow format options:\n"
 		  "  -s, --segment-size=SIZE size of record batch for each\n"
@@ -61,9 +92,10 @@ usage(void)
 		  "  -w, --no-password       never prompt for password\n"
 		  "  -W, --password          force password prompt\n"
 		  "\n"
-		  "Debug options:\n"
+		  "Other options:\n"
 		  "      --dump=FILENAME     dump information of arrow file\n"
-		  "      --progress          shows progress of the job.\n"
+		  "      --progress          shows progress of the job\n"
+		  "      --set=NAME:VALUE    GUC option to set before SQL execution\n"
 		  "\n"
 		  "Report bugs to <pgstrom@heterodb.com>.\n",
 		  stderr);
@@ -75,35 +107,28 @@ dumpArrowFile(const char *filename)
 {
 	ArrowFileInfo	af_info;
 	int				i, fdesc;
-	StringInfoData	buf1;
-	StringInfoData	buf2;
 
 	memset(&af_info, 0, sizeof(ArrowFileInfo));
-	fdesc = open(dump_arrow_filename, O_RDONLY);
+	fdesc = open(filename, O_RDONLY);
 	if (fdesc < 0)
-		Elog("unable to open '%s': %m", dump_arrow_filename);
+		Elog("unable to open '%s': %m", filename);
 	readArrowFileDesc(fdesc, &af_info);
 
-	initStringInfo(&buf1);
-	initStringInfo(&buf2);
-	__dumpArrowNode(&buf1, &af_info.footer.node);
-	printf("[Footer]\n%s\n", buf1.data);
+	printf("[Footer]\n%s\n",
+		   dumpArrowNode((ArrowNode *)&af_info.footer));
 
 	for (i=0; i < af_info.footer._num_dictionaries; i++)
 	{
-		resetStringInfo(&buf1);
-		resetStringInfo(&buf2);
-		__dumpArrowNode(&buf1, &af_info.footer.dictionaries[i].node);
-		__dumpArrowNode(&buf2, &af_info.dictionaries[i].node);
-		printf("[Dictionary Batch %d]\n%s\n%s\n", i, buf1.data, buf2.data);
+		printf("[Dictionary Batch %d]\n%s\n%s\n", i,
+			   dumpArrowNode((ArrowNode *)&af_info.footer.dictionaries[i]),
+			   dumpArrowNode((ArrowNode *)&af_info.dictionaries[i]));
 	}
+
 	for (i=0; i < af_info.footer._num_recordBatches; i++)
 	{
-		resetStringInfo(&buf1);
-		resetStringInfo(&buf2);
-		__dumpArrowNode(&buf1, &af_info.footer.recordBatches[i].node);
-		__dumpArrowNode(&buf2, &af_info.recordBatches[i].node);
-		printf("[Record Batch %d]\n%s\n%s\n", i, buf1.data, buf2.data);
+		printf("[Record Batch %d]\n%s\n%s\n", i,
+			   dumpArrowNode((ArrowNode *)&af_info.footer.recordBatches[i]),
+			   dumpArrowNode((ArrowNode *)&af_info.recordBatches[i]));
 	}
 	return 0;
 }
@@ -124,12 +149,15 @@ parse_options(int argc, char * const argv[])
 		{"password",     no_argument,        NULL,  'W' },
 		{"dump",         required_argument,  NULL, 1000 },
 		{"progress",     no_argument,        NULL, 1001 },
+		{"append",       required_argument,  NULL, 1002 },
+		{"set",          required_argument,  NULL, 1003 },
 		{"help",         no_argument,        NULL, 9999 },
 		{NULL, 0, NULL, 0},
 	};
 	int			c;
 	char	   *pos;
 	char	   *sql_file = NULL;
+	userConfigOption *last_user_config = NULL;
 
 	while ((c = getopt_long(argc, argv, "d:c:f:o:s:n:dh:p:U:wW",
 							long_options, NULL)) >= 0)
@@ -158,6 +186,8 @@ parse_options(int argc, char * const argv[])
 			case 'o':
 				if (output_filename)
 					Elog("-o option specified twice");
+				if (append_filename)
+					Elog("-o and --append are exclusive");
 				output_filename = optarg;
 				break;
 			case 's':
@@ -211,7 +241,42 @@ parse_options(int argc, char * const argv[])
 				dump_arrow_filename = optarg;
 				break;
 			case 1001:		/* --progress */
+				if (shows_progress)
+					Elog("--progress option specified twice");
 				shows_progress = 1;
+				break;
+			case 1002:		/* --append */
+				if (append_filename)
+					Elog("--append option specified twice");
+				if (output_filename)
+					Elog("-o and --append are exclusive");
+				append_filename = optarg;
+				break;
+			case 1003:		/* --set */
+				{
+					userConfigOption *conf;
+					char   *pos, *tail;
+
+					pos = strchr(optarg, ':');
+					if (!pos)
+						Elog("--set option should take NAME:VALUE");
+					*pos++ = '\0';
+					while (isspace(*pos))
+						pos++;
+					tail = pos + strlen(pos) - 1;
+					while (tail > pos && isspace(*tail))
+						tail--;
+					conf = calloc(1, sizeof(userConfigOption) +
+								  strlen(optarg) + strlen(pos) + 40);
+					if (!conf)
+						Elog("out of memory");
+					sprintf(conf->query, "SET %s = '%s'", optarg, pos);
+					if (last_user_config)
+						last_user_config->next = conf;
+					else
+						session_preset_commands = conf;
+					last_user_config = conf;
+				}
 				break;
 			case 9999:		/* --help */
 			default:
@@ -236,11 +301,15 @@ parse_options(int argc, char * const argv[])
 	}
 	else if (optind != argc)
 		Elog("Too much command line arguments");
-	/*
-	 * special code path if '--dump' option is specified.
-	 */
+
+	/* '--dump' option is exclusive other options */
 	if (dump_arrow_filename)
-		exit(dumpArrowFile(dump_arrow_filename));
+	{
+		if (sql_command || sql_file || output_filename)
+			Elog("--dump FILENAME is exclusive with -c, -f, or -o");
+		return;
+	}
+
 	if (batch_segment_sz == 0)
 		batch_segment_sz = (1UL << 28);		/* 256MB in default */
 	if (sql_file)
@@ -330,6 +399,71 @@ pgsql_server_connect(void)
 		Elog("failed on PostgreSQL connection: %s",
 			 PQerrorMessage(conn));
 	return conn;
+}
+
+/*
+ * pgsql_init_session
+ */
+static void
+pgsql_init_session(PGconn *conn)
+{
+	PGresult   *res;
+	const char *query;
+	const char *ptr;
+	userConfigOption *conf;
+
+	/*
+	 * Preset user's config option
+	 */
+	for (conf = session_preset_commands; conf != NULL; conf = conf->next)
+	{
+		res = PQexec(conn, conf->query);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			Elog("failed on setting user's config option: %s", conf->query);
+		PQclear(res);
+	}
+	
+	/*
+	 * ensure client encoding is UTF-8
+	 *
+	 * Even if user config tries to change client_encoding, pg2arrow
+	 * must ensure text encoding is UTF-8.
+	 */
+	query = "set client_encoding = 'UTF8'";
+	res = PQexec(conn, query);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		Elog("failed to change client_encoding to UTF-8: %s", query);
+	PQclear(res);
+
+	/*
+	 * collect server timezone info
+	 */
+#if 0
+	res = PQexec(conn, "SET timezone='ASIA/TOKYO'");
+	PQclear(res);
+#endif
+	query = "show timezone";
+	res = PQexec(conn, query);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK ||
+		PQntuples(res) != 1 ||
+		PQgetisnull(res, 0, 0))
+		Elog("failed on getting server timezone configuration: %s", query);
+	server_timezone_name = strdup(PQgetvalue(res, 0, 0));
+	if (!server_timezone_name)
+		Elog("out of memory");
+	PQclear(res);
+
+	query = "SELECT '2000-01-01 00:00:00'::timestamptz";
+	res = PQexecParams(conn,
+					   query,
+					   0, NULL, NULL,
+					   NULL, NULL, 1);
+	if (PQresultStatus(res) != PGRES_TUPLES_OK ||
+		PQntuples(res) != 1 ||
+		PQgetisnull(res, 0, 0))
+		Elog("failed on getting server timezone offset: %s", query);
+	ptr = PQgetvalue(res, 0, 0);
+	server_timezone_offset = -ntohll(*((uint64_t *)ptr));
 }
 
 /*
@@ -426,18 +560,20 @@ pg_strtochar(const char *v)
 }
 
 static SQLdictionary *
-pgsql_create_dictionary(PGconn *conn, Oid enum_typeid)
+pgsql_create_dictionary(PGconn *conn, SQLtable *root, Oid enum_typeid)
 {
 	SQLdictionary *dict;
 	PGresult   *res;
 	char		query[4096];
 	int			i, j, nitems;
 	int			nslots;
+	int			num_dicts = 0;
 
-	for (dict = pgsql_dictionary_list; dict != NULL; dict = dict->next)
+	for (dict = root->sql_dict_list; dict != NULL; dict = dict->next)
 	{
 		if (dict->enum_typeid == enum_typeid)
 			return dict;
+		num_dicts++;
 	}
 
 	snprintf(query, sizeof(query),
@@ -453,7 +589,7 @@ pgsql_create_dictionary(PGconn *conn, Oid enum_typeid)
 	nslots = Min(Max(nitems, 1<<10), 1<<18);
 	dict = palloc0(offsetof(SQLdictionary, hslots[nslots]));
 	dict->enum_typeid = enum_typeid;
-	dict->dict_id = pgsql_dictionary_count++;
+	dict->dict_id = num_dicts;
 	sql_buffer_init(&dict->values);
 	sql_buffer_init(&dict->extra);
 	dict->nitems = nitems;
@@ -484,9 +620,47 @@ pgsql_create_dictionary(PGconn *conn, Oid enum_typeid)
 		sql_buffer_append(&dict->values, &dict->extra.usage, sizeof(int32));
 	}
 	dict->nitems = nitems;
-	dict->next = pgsql_dictionary_list;
-	pgsql_dictionary_list = dict;
+	dict->next = root->sql_dict_list;
+	root->sql_dict_list = dict;
 	PQclear(res);
+
+	return dict;
+}
+
+static SQLdictionary *
+pgsql_duplicate_dictionary(SQLtable *root,
+						   SQLdictionary *orig, int dict_id)
+{
+	SQLdictionary  *dict;
+	int		i;
+
+	dict = palloc0(offsetof(SQLdictionary, hslots[orig->nslots]));
+	dict->enum_typeid = orig->enum_typeid;
+	dict->dict_id = dict_id;
+	dict->is_delta = true;
+	sql_buffer_copy(&dict->values, &orig->values);
+	sql_buffer_copy(&dict->extra,  &orig->extra);
+	dict->nitems = orig->nitems;
+	dict->nslots = orig->nslots;
+	for (i=0; i < orig->nslots; i++)
+	{
+		hashItem   *hitem;
+		hashItem   *hcopy;
+		
+		for (hitem = orig->hslots[i]; hitem != NULL; hitem = hitem->next)
+		{
+			hcopy = palloc0(offsetof(hashItem, label[hitem->label_len+1]));
+			hcopy->hash = hitem->hash;
+			hcopy->index = hitem->index;
+			hcopy->label_len = hitem->label_len;
+			strcpy(hcopy->label, hitem->label);
+
+			hcopy->next = dict->hslots[i];
+			dict->hslots[i] = hcopy;
+		}
+	}
+	dict->next = root->sql_dict_list;
+	root->sql_dict_list = dict;
 
 	return dict;
 }
@@ -496,7 +670,8 @@ pgsql_create_dictionary(PGconn *conn, Oid enum_typeid)
  */
 static void
 pgsql_setup_attribute(PGconn *conn,
-					  SQLattribute *attr,
+					  SQLtable *root,
+					  SQLfield *column,
 					  const char *attname,
 					  Oid atttypid,
 					  int atttypmod,
@@ -504,77 +679,62 @@ pgsql_setup_attribute(PGconn *conn,
 					  char attbyval,
 					  char attalign,
 					  char typtype,
-					  Oid comp_typrelid,
-					  Oid array_elemid,
+					  Oid typrelid,		/* valid, if composite type */
+					  Oid typelemid,	/* valid, if array type */
 					  const char *nspname,
 					  const char *typname,
 					  int *p_numFieldNodes,
 					  int *p_numBuffers)
 {
-	attr->attname   = pstrdup(attname);
-	attr->atttypid  = atttypid;
-	attr->atttypmod = atttypmod;
-	attr->attlen    = attlen;
-	attr->attbyval  = attbyval;
-
-	if (attalign == 'c')
-		attr->attalign = sizeof(char);
-	else if (attalign == 's')
-		attr->attalign = sizeof(short);
-	else if (attalign == 'i')
-		attr->attalign = sizeof(int);
-	else if (attalign == 'd')
-		attr->attalign = sizeof(double);
-	else
-		Elog("unknown state of attalign: %c", attalign);
-
-	attr->typnamespace = pstrdup(nspname);
-	attr->typname = pstrdup(typname);
-	attr->typtype = typtype;
-	if (typtype == 'b')
+	*p_numFieldNodes += 1;
+	*p_numBuffers += assignArrowTypePgSQL(column,
+										  attname,
+										  atttypid,
+										  atttypmod,
+										  typname,
+										  nspname,
+										  attlen,
+										  attbyval,
+										  typtype,
+										  attalign,
+										  typrelid,
+										  typelemid,
+										  server_timezone_name,
+										  server_timezone_offset);
+	if (typrelid != InvalidOid)
 	{
-		if (array_elemid != InvalidOid)
-			attr->element = pgsql_create_array_element(conn, array_elemid,
-													   p_numFieldNodes,
-													   p_numBuffers);
+		assert(typtype == 'c');
+		pgsql_setup_composite_type(conn, root, column,
+								   typrelid,
+								   p_numFieldNodes,
+								   p_numBuffers);
 	}
-	else if (typtype == 'c')
+	else if (typelemid != InvalidOid)
 	{
-		/* composite data type */
-		SQLtable   *subtypes;
-
-		assert(comp_typrelid != 0);
-		subtypes = pgsql_create_composite_type(conn, comp_typrelid);
-		*p_numFieldNodes += subtypes->numFieldNodes;
-		*p_numBuffers += subtypes->numBuffers;
-
-		attr->subtypes = subtypes;
+		pgsql_setup_array_element(conn, root, column,
+								  typelemid,
+								  p_numFieldNodes,
+								  p_numBuffers);
 	}
 	else if (typtype == 'e')
 	{
-		attr->enumdict = pgsql_create_dictionary(conn, atttypid);
+		column->enumdict = pgsql_create_dictionary(conn, root, atttypid);
 	}
-	else
-		Elog("unknown state pf typtype: %c", typtype);
-
-	/* init statistics */
-	attr->min_isnull = true;
-	attr->max_isnull = true;
-	attr->min_value  = 0UL;
-	attr->max_value  = 0UL;
-	/* assign properties of Apache Arrow Type */
-	assignArrowType(attr, p_numBuffers);
-	*p_numFieldNodes += 1;
 }
 
 /*
- * pgsql_create_composite_type
+ * pgsql_setup_composite_type
  */
-static SQLtable *
-pgsql_create_composite_type(PGconn *conn, Oid comptype_relid)
+static void
+pgsql_setup_composite_type(PGconn *conn,
+						   SQLtable *root,
+						   SQLfield *attr,
+						   Oid comptype_relid,
+						   int *p_numFieldNodes,
+						   int *p_numBuffers)						   
 {
 	PGresult   *res;
-	SQLtable   *table;
+	SQLfield *subfields;
 	char		query[4096];
 	int			j, nfields;
 
@@ -594,8 +754,7 @@ pgsql_create_composite_type(PGconn *conn, Oid comptype_relid)
 			 PQresultErrorMessage(res));
 
 	nfields = PQntuples(res);
-	table = palloc0(offsetof(SQLtable, attrs[nfields]));
-	table->nfields = nfields;
+	subfields = palloc0(sizeof(SQLfield) * nfields);
 	for (j=0; j < nfields; j++)
 	{
 		const char *attname   = PQgetvalue(res, j, 0);
@@ -615,7 +774,8 @@ pgsql_create_composite_type(PGconn *conn, Oid comptype_relid)
 		if (index < 1 || index > nfields)
 			Elog("attribute number is out of range");
 		pgsql_setup_attribute(conn,
-							  &table->attrs[index-1],
+							  root,
+							  &subfields[index-1],
 							  attname,
 							  atooid(atttypid),
 							  atoi(atttypmod),
@@ -625,19 +785,24 @@ pgsql_create_composite_type(PGconn *conn, Oid comptype_relid)
 							  pg_strtochar(typtype),
 							  atooid(typrelid),
 							  atooid(typelem),
-							  nspname, typname,
-							  &table->numFieldNodes,
-							  &table->numBuffers);
+							  nspname,
+							  typname,
+							  p_numFieldNodes,
+							  p_numBuffers);
 	}
-	return table;
+	attr->nfields = nfields;
+	attr->subfields = subfields;
 }
 
-static SQLattribute *
-pgsql_create_array_element(PGconn *conn, Oid array_elemid,
-						   int *p_numFieldNode,
-						   int *p_numBuffers)
+static void
+pgsql_setup_array_element(PGconn *conn,
+						  SQLtable *root,
+						  SQLfield *attr,
+						  Oid typelemid,
+						  int *p_numFieldNode,
+						  int *p_numBuffers)
 {
-	SQLattribute   *attr = palloc0(sizeof(SQLattribute));
+	SQLfield	   *element = palloc0(sizeof(SQLfield));
 	PGresult	   *res;
 	char			query[4096];
 	const char     *nspname;
@@ -656,7 +821,7 @@ pgsql_create_array_element(PGconn *conn, Oid array_elemid,
 			 "  FROM pg_catalog.pg_type t,"
 			 "       pg_catalog.pg_namespace n"
 			 " WHERE t.typnamespace = n.oid"
-			 "   AND t.oid = %u", array_elemid);
+			 "   AND t.oid = %u", typelemid);
 	res = PQexec(conn, query);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		Elog("failed on pg_type system catalog query: %s",
@@ -673,9 +838,10 @@ pgsql_create_array_element(PGconn *conn, Oid array_elemid,
 	typelem  = PQgetvalue(res, 0, 7);
 
 	pgsql_setup_attribute(conn,
-						  attr,
+						  root,
+						  element,
 						  typname,
-						  array_elemid,
+						  typelemid,
 						  -1,
 						  atoi(typlen),
 						  pg_strtobool(typbyval),
@@ -687,19 +853,22 @@ pgsql_create_array_element(PGconn *conn, Oid array_elemid,
 						  typname,
 						  p_numFieldNode,
 						  p_numBuffers);
-	return attr;
+	attr->element = element;
 }
 
 /*
  * pgsql_create_buffer
  */
 SQLtable *
-pgsql_create_buffer(PGconn *conn, PGresult *res, size_t segment_sz)
+pgsql_create_buffer(PGconn *conn, PGresult *res,
+					size_t segment_sz,
+					const char *sql_command)
 {
 	int			j, nfields = PQnfields(res);
 	SQLtable   *table;
+	ArrowKeyValue *kv;
 
-	table = palloc0(offsetof(SQLtable, attrs[nfields]));
+	table = palloc0(offsetof(SQLtable, columns[nfields]));
 	table->segment_sz = segment_sz;
 	table->nitems = 0;
 	table->nfields = nfields;
@@ -741,7 +910,8 @@ pgsql_create_buffer(PGconn *conn, PGresult *res, size_t segment_sz)
 		nspname  = PQgetvalue(__res, 0, 6);
 		typname  = PQgetvalue(__res, 0, 7);
 		pgsql_setup_attribute(conn,
-							  &table->attrs[j],
+							  table,
+							  &table->columns[j],
                               attname,
 							  atttypid,
 							  atttypmod,
@@ -751,84 +921,219 @@ pgsql_create_buffer(PGconn *conn, PGresult *res, size_t segment_sz)
 							  *typtype,
 							  atoi(typrelid),
 							  atoi(typelem),
-							  nspname, typname,
+							  nspname,
+							  typname,
 							  &table->numFieldNodes,
 							  &table->numBuffers);
 		PQclear(__res);
 	}
+
+	/* save the SQL command as custom metadata */
+	kv = palloc0(sizeof(ArrowKeyValue));
+	initArrowNode(kv, KeyValue);
+	kv->key = "sql_command";
+	kv->_key_len = 11;
+	kv->value = sql_command;
+	kv->_value_len = strlen(sql_command);
+
+	table->customMetadata = kv;
+	table->numCustomMetadata = 1;
+
 	return table;
 }
 
-/*
- * pgsql_clear_attribute
- */
-static void
-pgsql_clear_attribute(SQLattribute *attr)
+static int
+__arrow_type_is_compatible(SQLtable *root,
+						   SQLfield *attr,
+						   ArrowField *field)
 {
-	attr->nitems = 0;
-	attr->nullcount = 0;
-	sql_buffer_clear(&attr->nullmap);
-	sql_buffer_clear(&attr->values);
-	sql_buffer_clear(&attr->extra);
+	ArrowType  *sql_type = &attr->arrow_type;
+	int			j;
 
-	if (attr->subtypes)
+	if (sql_type->node.tag != field->type.node.tag)
+		return 0;
+
+	switch (sql_type->node.tag)
 	{
-		SQLtable   *subtypes = attr->subtypes;
-		int			j;
-
-		for (j=0; j < subtypes->nfields; j++)
-			pgsql_clear_attribute(&subtypes->attrs[j]);
+		case ArrowNodeTag__Int:
+			if (sql_type->Int.bitWidth != field->type.Int.bitWidth)
+				return 0;	/* not compatible */
+			sql_type->Int.is_signed = field->type.Int.is_signed;
+			break;
+		case ArrowNodeTag__FloatingPoint:
+			if (sql_type->FloatingPoint.precision
+				!= field->type.FloatingPoint.precision)
+				return 0;
+			break;
+		case ArrowNodeTag__Decimal:
+			/* adjust precision and scale to the previous one */
+			sql_type->Decimal.precision = field->type.Decimal.precision;
+			sql_type->Decimal.scale = field->type.Decimal.scale;
+			break;
+		case ArrowNodeTag__Date:
+			/* adjust unit */
+			sql_type->Date.unit = field->type.Date.unit;
+			break;
+		case ArrowNodeTag__Time:
+			/* adjust unit */
+			sql_type->Time.unit = field->type.Time.unit;
+			sql_type->Time.bitWidth = field->type.Time.bitWidth;
+			break;
+		case ArrowNodeTag__Timestamp:
+			/* adjust unit */
+			sql_type->Timestamp.unit = field->type.Timestamp.unit;
+			break;
+		case ArrowNodeTag__Interval:
+			/* adjust unit */
+			sql_type->Interval.unit = field->type.Interval.unit;
+			break;
+		case ArrowNodeTag__FixedSizeBinary:
+			if (sql_type->FixedSizeBinary.byteWidth
+				!= field->type.FixedSizeBinary.byteWidth)
+				return 0;
+			break;
+		default:
+			break;
 	}
+
 	if (attr->element)
-		pgsql_clear_attribute(attr->element);
-	/* clear statistics */
-	attr->min_isnull = true;
-	attr->max_isnull = true;
-	attr->min_value  = 0UL;
-	attr->max_value  = 0UL;
+	{
+		/* array type */
+		assert(sql_type->node.tag == ArrowNodeTag__List);
+		if (field->_num_children != 1 ||
+			!__arrow_type_is_compatible(root, attr->element, field->children))
+			return 0;
+	}
+	else if (attr->subfields)
+	{
+		/* composite type */
+		assert(sql_type->node.tag == ArrowNodeTag__Struct);
+		if (attr->nfields != field->_num_children)
+			return 0;
+		for (j=0; j < attr->nfields; j++)
+		{
+			if (!__arrow_type_is_compatible(root,
+											&attr->subfields[j],
+											&field->children[j]))
+				return 0;
+		}
+	}
+	else if (attr->enumdict)
+	{
+		/* enum type; encoded UTF-8 values */
+		SQLdictionary  *enumdict = attr->enumdict;
+
+		assert(sql_type->node.tag == ArrowNodeTag__Utf8);
+		if (field->dictionary.indexType.bitWidth != 32 ||
+			!field->dictionary.indexType.is_signed)
+			Elog("Index of DictionaryBatch must be unsigned 32bit");
+		if (field->dictionary.isOrdered)
+			Elog("Ordered DictionaryBatch is not supported right now");
+		if (enumdict->is_delta)
+		{
+			if (enumdict->dict_id == field->dictionary.id)
+				return 1;		/* nothing to do */
+			enumdict = pgsql_duplicate_dictionary(root,
+												  enumdict,
+												  field->dictionary.id);
+		}
+		else
+		{
+			enumdict->is_delta = true;
+			enumdict->dict_id  = field->dictionary.id;
+		}
+		/*
+		 * Right now, we don't implement "true" delta DictionaryBatch.
+		 * The appended RecordBatch will reference the new DictionaryBatch
+		 * that replaced entire dictionary we previously written on.
+		 */
+	}
+	return 1;
+}
+
+static void
+initial_setup_append_file(SQLtable *table)
+{
+	ArrowFileInfo	af_info;
+	ArrowSchema	   *af_schema;
+	int				i, nitems;
+	size_t			nbytes;
+	off_t			offset;
+	char			buffer[100];
+
+	/*
+	 * check schema compatibility
+	 */
+	readArrowFileDesc(table->fdesc, &af_info);
+	af_schema = &af_info.footer.schema;
+	if (af_schema->_num_fields != table->nfields)
+		Elog("--append is given, but number of columns are different.");
+	for (i=0; i < table->nfields; i++)
+	{
+		if (!__arrow_type_is_compatible(table,
+										&table->columns[i],
+										af_schema->fields + i))
+			Elog("--append is given, but attribute %d is not compatible", i+1);
+	}
+
+	/* restore DictionaryBatches already in the file */
+	nitems = af_info.footer._num_dictionaries;
+	table->numDictionaries = nitems;
+	table->dictionaries = palloc0(sizeof(ArrowBlock) * nitems);
+	memcpy(table->dictionaries,
+		   af_info.footer.dictionaries,
+		   sizeof(ArrowBlock) * nitems);
+
+	/* restore RecordBatches already in the file */
+	nitems = af_info.footer._num_recordBatches;
+	table->numRecordBatches = nitems;
+	table->recordBatches = palloc0(sizeof(ArrowBlock) * nitems);
+	memcpy(table->recordBatches,
+		   af_info.footer.recordBatches,
+		   sizeof(ArrowBlock) * nitems);
+
+	/* move the file offset in front of the Footer portion */
+	nbytes = sizeof(int32) + 6;	/* strlen("ARROW1") */
+	offset = lseek(table->fdesc, -nbytes, SEEK_END);
+	if (offset < 0)
+		Elog("failed on lseek(%d, %zu, SEEK_END): %m",
+			 table->fdesc, sizeof(int32) + 6);
+	if (read(table->fdesc, buffer, nbytes) != nbytes)
+		Elog("failed on read(2): %m");
+	offset -= *((int32 *)buffer);
+	if (lseek(table->fdesc, offset, SEEK_SET) < 0)
+		Elog("failed on lseek(%d, %zu, SEEK_SET): %m",
+			 table->fdesc, offset);
 }
 
 /*
  * pgsql_writeout_buffer
  */
-void
+static void
 pgsql_writeout_buffer(SQLtable *table)
 {
-	off_t		currPos;
-	size_t		metaSize;
-	size_t		bodySize;
-	int			j, index;
-	ArrowBlock *b;
+	size_t		nitems = table->nitems;
 
-	/* write a new record batch */
-	currPos = lseek(table->fdesc, 0, SEEK_CUR);
-	if (currPos < 0)
-		Elog("unable to get current position of the file");
-	writeArrowRecordBatch(table, &metaSize, &bodySize);
+	if (table->nitems == 0)
+		return;
 
-	index = table->numRecordBatches++;
-	if (index == 0)
-		table->recordBatches = palloc(sizeof(ArrowBlock));
-	else
-		table->recordBatches = repalloc(table->recordBatches,
-										sizeof(ArrowBlock) * (index+1));
-	b = &table->recordBatches[index];
-	INIT_ARROW_NODE(b, Block);
-	b->offset = currPos;
-	b->metaDataLength = metaSize;
-	b->bodyLength = bodySize;
-
-	/* shows progress (optional) */
+	writeArrowRecordBatch(table);
 	if (shows_progress)
 	{
-		printf("RecordBatch %d: offset=%lu length=%lu (meta=%zu, body=%zu)\n",
-			   index, currPos, metaSize + bodySize, metaSize, bodySize);
-	}
+		ArrowBlock *block;
+		int		index = table->numRecordBatches - 1;
 
-	/* makes table/attributes empty again */
-	table->nitems = 0;
-	for (j=0; j < table->nfields; j++)
-		pgsql_clear_attribute(&table->attrs[j]);
+		assert(index >= 0);
+		block = &table->recordBatches[index];
+		printf("RecordBatch[%d]: "
+			   "offset=%lu length=%lu (meta=%u, body=%lu) nitems=%zu\n",
+			   index,
+			   block->offset,
+			   block->metaDataLength + block->bodyLength,
+			   block->metaDataLength,
+			   block->bodyLength,
+			   nitems);
+	}
 }
 
 /*
@@ -837,18 +1142,19 @@ pgsql_writeout_buffer(SQLtable *table)
 void
 pgsql_append_results(SQLtable *table, PGresult *res)
 {
+	SQLfield  *columns = table->columns;
 	int		i, ntuples = PQntuples(res);
 	int		j, nfields = PQnfields(res);
-	size_t	usage;
 
-	assert(nfields == table->nfields);
+	assert(table->nfields == nfields);
 	for (i=0; i < ntuples; i++)
 	{
-		usage = 0;
+		size_t	usage = 0;
+		size_t	nitems = columns[0].nitems;
 
 		for (j=0; j < nfields; j++)
 		{
-			SQLattribute   *attr = &table->attrs[j];
+			SQLfield	   *column = &columns[j];
 			const char	   *addr;
 			size_t			sz;
 			/* data must be binary format */
@@ -863,17 +1169,14 @@ pgsql_append_results(SQLtable *table, PGresult *res)
 				addr = PQgetvalue(res, i, j);
 				sz = PQgetlength(res, i, j);
 			}
-			assert(attr->nitems == table->nitems);
-			attr->put_value(attr, addr, sz);
-			if (attr->stat_update)
-				attr->stat_update(attr, addr, sz);
-			usage += attr->buffer_usage(attr);
+			assert(column->nitems == nitems);
+			usage += sql_field_put_value(column, addr, sz);
 		}
 		table->nitems++;
 		/* exceeds the threshold to write? */
 		if (usage > table->segment_sz)
 		{
-			if (table->nitems == 0)
+			if (nitems == 0)
 				Elog("A result row is larger than size of record batch!!");
 			pgsql_writeout_buffer(table);
 		}
@@ -884,34 +1187,37 @@ pgsql_append_results(SQLtable *table, PGresult *res)
  * pgsql_dump_attribute
  */
 static void
-pgsql_dump_attribute(SQLattribute *attr, const char *label, int indent)
+pgsql_dump_attribute(SQLfield *column, const char *label, int indent)
 {
-	char   *dump;
 	int		j;
 
 	for (j=0; j < indent; j++)
 		putchar(' ');
-	dump = dumpArrowNode((ArrowNode *)&attr->arrow_type);
 	printf("%s {attname='%s', atttypid=%u, atttypmod=%d, attlen=%d,"
 		   " attbyval=%s, attalign=%d, typtype=%c, arrow_type=%s}\n",
 		   label,
-		   attr->attname, attr->atttypid, attr->atttypmod, attr->attlen,
-		   attr->attbyval ? "true" : "false", attr->attalign, attr->typtype);
+		   column->field_name,
+		   column->sql_type.pgsql.typeid,
+		   column->sql_type.pgsql.typmod,
+		   column->sql_type.pgsql.typlen,
+		   column->sql_type.pgsql.typbyval ? "true" : "false",
+		   column->sql_type.pgsql.typalign,
+		   column->sql_type.pgsql.typtype,
+		   column->arrow_typename);
 
-	if (attr->typtype == 'b')
+	if (column->sql_type.pgsql.typtype == 'b')
 	{
-		if (attr->element)
-			pgsql_dump_attribute(attr->element, "element", indent+2);
+		if (column->element)
+			pgsql_dump_attribute(column->element, "element", indent+2);
 	}
-	else if (attr->typtype == 'c')
+	else if (column->sql_type.pgsql.typtype == 'c')
 	{
-		SQLtable   *subtypes = attr->subtypes;
 		char		label[64];
 
-		for (j=0; j < subtypes->nfields; j++)
+		for (j=0; j < column->nfields; j++)
 		{
-			snprintf(label, sizeof(label), "subtype[%d]", j);
-			pgsql_dump_attribute(&subtypes->attrs[j], label, indent+2);
+			snprintf(label, sizeof(label), "subfields[%d]", j);
+			pgsql_dump_attribute(&column->subfields[j], label, indent+2);
 		}
 	}
 }
@@ -922,8 +1228,8 @@ pgsql_dump_attribute(SQLattribute *attr, const char *label, int indent)
 void
 pgsql_dump_buffer(SQLtable *table)
 {
-	int		j;
 	char	label[64];
+	int		j;
 
 	printf("Dump of SQL buffer:\n"
 		   "nfields: %d\n"
@@ -933,285 +1239,8 @@ pgsql_dump_buffer(SQLtable *table)
 	for (j=0; j < table->nfields; j++)
 	{
 		snprintf(label, sizeof(label), "attr[%d]", j);
-		pgsql_dump_attribute(&table->attrs[j], label, 0);
+		pgsql_dump_attribute(&table->columns[j], label, 0);
 	}
-}
-
-/*
- * setupArrowFieldNode
- */
-static int
-setupArrowFieldNode(ArrowFieldNode *node, SQLattribute *attr)
-{
-	SQLtable   *subtypes = attr->subtypes;
-	SQLattribute *element = attr->element;
-	int			i, count = 1;
-
-	memset(node, 0, sizeof(ArrowFieldNode));
-	INIT_ARROW_NODE(node, FieldNode);
-	node->length = attr->nitems;
-	node->null_count = attr->nullcount;
-	/* array types */
-	if (element)
-		count += setupArrowFieldNode(node + count, element);
-	/* composite types */
-	if (subtypes)
-	{
-		for (i=0; i < subtypes->nfields; i++)
-			count += setupArrowFieldNode(node + count, &subtypes->attrs[i]);
-	}
-	return count;
-}
-
-void
-writeArrowRecordBatch(SQLtable *table,
-					  size_t *p_metaLength,
-					  size_t *p_bodyLength)
-{
-	ArrowMessage	message;
-	ArrowRecordBatch *rbatch;
-	ArrowFieldNode *nodes;
-	ArrowBuffer	   *buffers;
-	int32			i, j;
-	size_t			metaLength;
-	size_t			bodyLength = 0;
-
-	/* fill up [nodes] vector */
-	nodes = alloca(sizeof(ArrowFieldNode) * table->numFieldNodes);
-	for (i=0, j=0; i < table->nfields; i++)
-	{
-		SQLattribute   *attr = &table->attrs[i];
-		assert(table->nitems == attr->nitems);
-		j += setupArrowFieldNode(nodes + j, attr);
-	}
-	assert(j == table->numFieldNodes);
-
-	/* fill up [buffers] vector */
-	buffers = alloca(sizeof(ArrowBuffer) * table->numBuffers);
-	for (i=0, j=0; i < table->nfields; i++)
-	{
-		SQLattribute   *attr = &table->attrs[i];
-		j += attr->setup_buffer(attr, buffers+j, &bodyLength);
-	}
-	assert(j == table->numBuffers);
-
-	/* setup Message of Schema */
-	memset(&message, 0, sizeof(ArrowMessage));
-	INIT_ARROW_NODE(&message, Message);
-	message.version = ArrowMetadataVersion__V4;
-	message.bodyLength = bodyLength;
-
-	rbatch = &message.body.recordBatch;
-	INIT_ARROW_NODE(rbatch, RecordBatch);
-	rbatch->length = table->nitems;
-	rbatch->nodes = nodes;
-	rbatch->_num_nodes = table->numFieldNodes;
-	rbatch->buffers = buffers;
-	rbatch->_num_buffers = table->numBuffers;
-	/* serialization */
-	metaLength = writeFlatBufferMessage(table->fdesc, &message);
-	for (i=0; i < table->nfields; i++)
-	{
-		SQLattribute   *attr = &table->attrs[i];
-		attr->write_buffer(attr, table->fdesc);
-	}
-	*p_metaLength = metaLength;
-	*p_bodyLength = bodyLength;
-}
-
-static void
-setupArrowDictionaryEncoding(ArrowDictionaryEncoding *dict,
-							 SQLattribute *attr)
-{
-	INIT_ARROW_NODE(dict, DictionaryEncoding);
-	if (attr->enumdict)
-	{
-		ArrowTypeInt   *indexType = &dict->indexType;
-
-		dict->id = attr->enumdict->dict_id;
-		INIT_ARROW_TYPE_NODE(indexType, Int);
-		indexType->bitWidth  = 32;		/* OID in PostgreSQL */
-		indexType->is_signed = true;
-		dict->isOrdered = false;
-	}
-}
-
-static void
-setupArrowField(ArrowField *field, SQLattribute *attr)
-{
-	memset(field, 0, sizeof(ArrowField));
-	INIT_ARROW_NODE(field, Field);
-	field->name = attr->attname;
-	field->_name_len = strlen(attr->attname);
-	field->nullable = true;
-	field->type = attr->arrow_type;
-	setupArrowDictionaryEncoding(&field->dictionary, attr);
-	/* array type */
-	if (attr->element)
-	{
-		field->children = palloc0(sizeof(ArrowField));
-		field->_num_children = 1;
-		setupArrowField(field->children, attr->element);
-	}
-	/* composite type */
-	if (attr->subtypes)
-	{
-		SQLtable   *sub = attr->subtypes;
-		int			i;
-
-		field->children = palloc0(sizeof(ArrowField) * sub->nfields);
-		field->_num_children = sub->nfields;
-		for (i=0; i < sub->nfields; i++)
-			setupArrowField(&field->children[i], &sub->attrs[i]);
-	}
-}
-
-static ssize_t
-writeArrowSchema(SQLtable *table)
-{
-	ArrowMessage	message;
-	ArrowSchema	   *schema;
-	int32			i;
-
-	/* setup Message of Schema */
-	memset(&message, 0, sizeof(ArrowMessage));
-	INIT_ARROW_NODE(&message, Message);
-	message.version = ArrowMetadataVersion__V4;
-	schema = &message.body.schema;
-	INIT_ARROW_NODE(schema, Schema);
-	schema->endianness = ArrowEndianness__Little;
-	schema->fields = alloca(sizeof(ArrowField) * table->nfields);
-	schema->_num_fields = table->nfields;
-	for (i=0; i < table->nfields; i++)
-		setupArrowField(&schema->fields[i], &table->attrs[i]);
-	/* serialization */
-	return writeFlatBufferMessage(table->fdesc, &message);
-}
-
-static void
-__writeArrowDictionaryBatch(int fdesc, ArrowBlock *block, SQLdictionary *dict)
-{
-	ArrowMessage	message;
-	ArrowDictionaryBatch *dbatch;
-	ArrowRecordBatch *rbatch;
-	ArrowFieldNode	nodes[1];
-	ArrowBuffer		buffers[3];
-	loff_t			currPos;
-	size_t			metaLength = 0;
-	size_t			bodyLength = 0;
-
-	memset(&message, 0, sizeof(ArrowMessage));
-
-	/* DictionaryBatch portion */
-	dbatch = &message.body.dictionaryBatch;
-	INIT_ARROW_NODE(dbatch, DictionaryBatch);
-	dbatch->id = dict->dict_id;
-	dbatch->isDelta = false;
-
-	/* ArrowFieldNode of RecordBatch */
-	INIT_ARROW_NODE(&nodes[0], FieldNode);
-	nodes[0].length = dict->nitems;
-	nodes[0].null_count = 0;
-
-	/* ArrowBuffer[0] of RecordBatch -- nullmap */
-	INIT_ARROW_NODE(&buffers[0], Buffer);
-	buffers[0].offset = bodyLength;
-	buffers[0].length = 0;
-
-	/* ArrowBuffer[1] of RecordBatch -- offset to extra buffer */
-	INIT_ARROW_NODE(&buffers[1], Buffer);
-	buffers[1].offset = bodyLength;
-	buffers[1].length = ARROWALIGN(dict->values.usage);
-	bodyLength += buffers[1].length;
-
-	/* ArrowBuffer[2] of RecordBatch -- extra buffer */
-	INIT_ARROW_NODE(&buffers[2], Buffer);
-	buffers[2].offset = bodyLength;
-	buffers[2].length = ARROWALIGN(dict->extra.usage);
-	bodyLength += buffers[2].length;
-
-	/* RecordBatch portion */
-	rbatch = &dbatch->data;
-	INIT_ARROW_NODE(rbatch, RecordBatch);
-	rbatch->length = dict->nitems;
-	rbatch->_num_nodes = 1;
-    rbatch->nodes = nodes;
-	rbatch->_num_buffers = 3;	/* empty nullmap + offset + extra buffer */
-	rbatch->buffers = buffers;
-
-	/* final wrap-up message */
-	INIT_ARROW_NODE(&message, Message);
-    message.version = ArrowMetadataVersion__V4;
-	message.bodyLength = bodyLength;
-
-	currPos = lseek(fdesc, 0, SEEK_CUR);
-	if (currPos < 0)
-		Elog("unable to get current position of the file");
-	metaLength = writeFlatBufferMessage(fdesc, &message);
-	__write_buffer_common(fdesc, dict->values.data, dict->values.usage);
-	__write_buffer_common(fdesc, dict->extra.data,  dict->extra.usage);
-
-	/* setup Block of Footer */
-	INIT_ARROW_NODE(block, Block);
-	block->offset = currPos;
-	block->metaDataLength = metaLength;
-	block->bodyLength = bodyLength;
-}
-
-static void
-writeArrowDictionaryBatches(SQLtable *table)
-{
-	SQLdictionary  *dict;
-	int				index, count;
-
-	if (!pgsql_dictionary_list)
-		return;
-
-	for (dict = pgsql_dictionary_list, count=0;
-		 dict != NULL;
-		 dict = dict->next, count++);
-	table->numDictionaries = count;
-	table->dictionaries = palloc0(sizeof(ArrowBlock) * count);
-
-	for (dict = pgsql_dictionary_list, index=0;
-		 dict != NULL;
-		 dict = dict->next, index++)
-	{
-		__writeArrowDictionaryBatch(table->fdesc,
-									table->dictionaries + index,
-									dict);
-	}
-}
-
-static ssize_t
-writeArrowFooter(SQLtable *table)
-{
-	ArrowFooter		footer;
-	ArrowSchema	   *schema;
-	int				i;
-
-	/* setup Footer */
-	memset(&footer, 0, sizeof(ArrowFooter));
-	INIT_ARROW_NODE(&footer, Footer);
-	footer.version = ArrowMetadataVersion__V4;
-	/* setup Schema of Footer */
-	schema = &footer.schema;
-	INIT_ARROW_NODE(schema, Schema);
-	schema->endianness = ArrowEndianness__Little;
-	schema->fields = alloca(sizeof(ArrowField) * table->nfields);
-	schema->_num_fields = table->nfields;
-	for (i=0; i < table->nfields; i++)
-		setupArrowField(&schema->fields[i], &table->attrs[i]);
-	/* [dictionaries] */
-	footer.dictionaries = table->dictionaries;
-	footer._num_dictionaries = table->numDictionaries;
-
-	/* [recordBatches] */
-	footer.recordBatches = table->recordBatches;
-	footer._num_recordBatches = table->numRecordBatches;
-
-	/* serialization */
-	return writeFlatBufferFooter(table->fdesc, &footer);
 }
 
 /*
@@ -1225,43 +1254,59 @@ int main(int argc, char * const argv[])
 	ssize_t		nbytes;
 
 	parse_options(argc, argv);
+	/* special case if '--dump <filename>' is given */
+	if (dump_arrow_filename)
+		return dumpArrowFile(dump_arrow_filename);
+
 	/* open PostgreSQL connection */
 	conn = pgsql_server_connect();
+	/* initialize the session */
+	pgsql_init_session(conn);
 	/* run SQL command */
 	res = pgsql_begin_query(conn, sql_command);
 	if (!res)
 		Elog("SQL command returned an empty result");
-	table = pgsql_create_buffer(conn, res, batch_segment_sz);
-	/* open the output file */
-	if (output_filename)
+	table = pgsql_create_buffer(conn, res, batch_segment_sz, sql_command);
+	if (append_filename)
 	{
-		table->fdesc = open(output_filename,
-							O_RDWR | O_CREAT | O_TRUNC, 0644);
+		table->fdesc = open(append_filename, O_RDWR, 0644);
 		if (table->fdesc < 0)
-			Elog("failed to open '%s'", output_filename);
-		table->filename = output_filename;
+			Elog("failed to open '%s'", append_filename);
+		table->filename = append_filename;
+
+		initial_setup_append_file(table);
 	}
 	else
 	{
-		char	temp_filename[128];
+		if (output_filename)
+		{
+			table->fdesc = open(output_filename,
+								O_RDWR | O_CREAT | O_TRUNC, 0644);
+			if (table->fdesc < 0)
+				Elog("failed to open '%s'", output_filename);
+			table->filename = output_filename;
+		}
+		else
+		{
+			char	temp_fname[128];
 
-		strcpy(temp_filename, "/tmp/XXXXXX.arrow");
-		table->fdesc = mkostemps(temp_filename, 6,
-								 O_RDWR | O_CREAT | O_TRUNC);
-		if (table->fdesc < 0)
-			Elog("failed to open '%s' : %m", temp_filename);
-		table->filename = pstrdup(temp_filename);
-		fprintf(stderr,
-				"notice: -o, --output=FILENAME options was not specified,\n"
-				"        so, a temporary file '%s' was built instead.\n",
-				temp_filename);
+			strcpy(temp_fname, "/tmp/XXXXXX.arrow");
+			table->fdesc = mkostemps(temp_fname, 6,
+									 O_RDWR | O_CREAT | O_TRUNC);
+			if (table->fdesc < 0)
+				Elog("failed to open '%s' : %m", temp_fname);
+			table->filename = pstrdup(temp_fname);
+			fprintf(stderr,
+					"NOTICE: -o, --output=FILENAME option was not given,\n"
+					"        so a temporary file '%s' was built instead.\n",
+					temp_fname);
+		}
+		/* write out header stuff from the file head */
+		nbytes = write(table->fdesc, "ARROW1\0\0", 8);
+		if (nbytes != 8)
+			Elog("failed on write(2): %m");
+		nbytes = writeArrowSchema(table);
 	}
-	//pgsql_dump_buffer(table);
-	/* write header portion */
-	nbytes = write(table->fdesc, "ARROW1\0\0", 8);
-	if (nbytes != 8)
-		Elog("failed on write(2): %m");
-	nbytes = writeArrowSchema(table);
 	writeArrowDictionaryBatches(table);
 	do {
 		pgsql_append_results(table, res);
@@ -1269,9 +1314,342 @@ int main(int argc, char * const argv[])
 		res = pgsql_next_result(conn);
 	} while (res != NULL);
 	pgsql_end_query(conn);
-	if (table->nitems > 0)
-		pgsql_writeout_buffer(table);
+	pgsql_writeout_buffer(table);
 	nbytes = writeArrowFooter(table);
 
 	return 0;
+}
+
+/*
+ * This hash function was written by Bob Jenkins
+ * (bob_jenkins@burtleburtle.net), and superficially adapted
+ * for PostgreSQL by Neil Conway. For more information on this
+ * hash function, see http://burtleburtle.net/bob/hash/doobs.html,
+ * or Bob's article in Dr. Dobb's Journal, Sept. 1997.
+ *
+ * In the current code, we have adopted Bob's 2006 update of his hash
+ * function to fetch the data a word at a time when it is suitably aligned.
+ * This makes for a useful speedup, at the cost of having to maintain
+ * four code paths (aligned vs unaligned, and little-endian vs big-endian).
+ * It also uses two separate mixing functions mix() and final(), instead
+ * of a slower multi-purpose function.
+ */
+
+/* Get a bit mask of the bits set in non-uint32 aligned addresses */
+#define UINT32_ALIGN_MASK (sizeof(uint32) - 1)
+
+/* Rotate a uint32 value left by k bits - note multiple evaluation! */
+#define rot(x,k) (((x)<<(k)) | ((x)>>(32-(k))))
+
+/*----------
+ * mix -- mix 3 32-bit values reversibly.
+ *
+ * This is reversible, so any information in (a,b,c) before mix() is
+ * still in (a,b,c) after mix().
+ *
+ * If four pairs of (a,b,c) inputs are run through mix(), or through
+ * mix() in reverse, there are at least 32 bits of the output that
+ * are sometimes the same for one pair and different for another pair.
+ * This was tested for:
+ * * pairs that differed by one bit, by two bits, in any combination
+ *	 of top bits of (a,b,c), or in any combination of bottom bits of
+ *	 (a,b,c).
+ * * "differ" is defined as +, -, ^, or ~^.  For + and -, I transformed
+ *	 the output delta to a Gray code (a^(a>>1)) so a string of 1's (as
+ *	 is commonly produced by subtraction) look like a single 1-bit
+ *	 difference.
+ * * the base values were pseudorandom, all zero but one bit set, or
+ *	 all zero plus a counter that starts at zero.
+ *
+ * This does not achieve avalanche.  There are input bits of (a,b,c)
+ * that fail to affect some output bits of (a,b,c), especially of a.  The
+ * most thoroughly mixed value is c, but it doesn't really even achieve
+ * avalanche in c.
+ *
+ * This allows some parallelism.  Read-after-writes are good at doubling
+ * the number of bits affected, so the goal of mixing pulls in the opposite
+ * direction from the goal of parallelism.  I did what I could.  Rotates
+ * seem to cost as much as shifts on every machine I could lay my hands on,
+ * and rotates are much kinder to the top and bottom bits, so I used rotates.
+ *----------
+ */
+#define mix(a,b,c) \
+{ \
+  a -= c;  a ^= rot(c, 4);	c += b; \
+  b -= a;  b ^= rot(a, 6);	a += c; \
+  c -= b;  c ^= rot(b, 8);	b += a; \
+  a -= c;  a ^= rot(c,16);	c += b; \
+  b -= a;  b ^= rot(a,19);	a += c; \
+  c -= b;  c ^= rot(b, 4);	b += a; \
+}
+
+/*----------
+ * final -- final mixing of 3 32-bit values (a,b,c) into c
+ *
+ * Pairs of (a,b,c) values differing in only a few bits will usually
+ * produce values of c that look totally different.  This was tested for
+ * * pairs that differed by one bit, by two bits, in any combination
+ *	 of top bits of (a,b,c), or in any combination of bottom bits of
+ *	 (a,b,c).
+ * * "differ" is defined as +, -, ^, or ~^.  For + and -, I transformed
+ *	 the output delta to a Gray code (a^(a>>1)) so a string of 1's (as
+ *	 is commonly produced by subtraction) look like a single 1-bit
+ *	 difference.
+ * * the base values were pseudorandom, all zero but one bit set, or
+ *	 all zero plus a counter that starts at zero.
+ *
+ * The use of separate functions for mix() and final() allow for a
+ * substantial performance increase since final() does not need to
+ * do well in reverse, but is does need to affect all output bits.
+ * mix(), on the other hand, does not need to affect all output
+ * bits (affecting 32 bits is enough).  The original hash function had
+ * a single mixing operation that had to satisfy both sets of requirements
+ * and was slower as a result.
+ *----------
+ */
+#define final(a,b,c) \
+{ \
+  c ^= b; c -= rot(b,14); \
+  a ^= c; a -= rot(c,11); \
+  b ^= a; b -= rot(a,25); \
+  c ^= b; c -= rot(b,16); \
+  a ^= c; a -= rot(c, 4); \
+  b ^= a; b -= rot(a,14); \
+  c ^= b; c -= rot(b,24); \
+}
+
+/*
+ * hash_any() -- hash a variable-length key into a 32-bit value
+ *		k		: the key (the unaligned variable-length array of bytes)
+ *		len		: the length of the key, counting by bytes
+ *
+ * Returns a uint32 value.  Every bit of the key affects every bit of
+ * the return value.  Every 1-bit and 2-bit delta achieves avalanche.
+ * About 6*len+35 instructions. The best hash table sizes are powers
+ * of 2.  There is no need to do mod a prime (mod is sooo slow!).
+ * If you need less than 32 bits, use a bitmask.
+ *
+ * This procedure must never throw elog(ERROR); the ResourceOwner code
+ * relies on this not to fail.
+ *
+ * Note: we could easily change this function to return a 64-bit hash value
+ * by using the final values of both b and c.  b is perhaps a little less
+ * well mixed than c, however.
+ */
+Datum
+hash_any(const unsigned char *k, int keylen)
+{
+	register uint32 a,
+				b,
+				c,
+				len;
+
+	/* Set up the internal state */
+	len = keylen;
+	a = b = c = 0x9e3779b9 + len + 3923095;
+
+	/* If the source pointer is word-aligned, we use word-wide fetches */
+	if (((uintptr_t) k & UINT32_ALIGN_MASK) == 0)
+	{
+		/* Code path for aligned source data */
+		register const uint32 *ka = (const uint32 *) k;
+
+		/* handle most of the key */
+		while (len >= 12)
+		{
+			a += ka[0];
+			b += ka[1];
+			c += ka[2];
+			mix(a, b, c);
+			ka += 3;
+			len -= 12;
+		}
+
+		/* handle the last 11 bytes */
+		k = (const unsigned char *) ka;
+#ifdef WORDS_BIGENDIAN
+		switch (len)
+		{
+			case 11:
+				c += ((uint32) k[10] << 8);
+				/* fall through */
+			case 10:
+				c += ((uint32) k[9] << 16);
+				/* fall through */
+			case 9:
+				c += ((uint32) k[8] << 24);
+				/* fall through */
+			case 8:
+				/* the lowest byte of c is reserved for the length */
+				b += ka[1];
+				a += ka[0];
+				break;
+			case 7:
+				b += ((uint32) k[6] << 8);
+				/* fall through */
+			case 6:
+				b += ((uint32) k[5] << 16);
+				/* fall through */
+			case 5:
+				b += ((uint32) k[4] << 24);
+				/* fall through */
+			case 4:
+				a += ka[0];
+				break;
+			case 3:
+				a += ((uint32) k[2] << 8);
+				/* fall through */
+			case 2:
+				a += ((uint32) k[1] << 16);
+				/* fall through */
+			case 1:
+				a += ((uint32) k[0] << 24);
+				/* case 0: nothing left to add */
+		}
+#else							/* !WORDS_BIGENDIAN */
+		switch (len)
+		{
+			case 11:
+				c += ((uint32) k[10] << 24);
+				/* fall through */
+			case 10:
+				c += ((uint32) k[9] << 16);
+				/* fall through */
+			case 9:
+				c += ((uint32) k[8] << 8);
+				/* fall through */
+			case 8:
+				/* the lowest byte of c is reserved for the length */
+				b += ka[1];
+				a += ka[0];
+				break;
+			case 7:
+				b += ((uint32) k[6] << 16);
+				/* fall through */
+			case 6:
+				b += ((uint32) k[5] << 8);
+				/* fall through */
+			case 5:
+				b += k[4];
+				/* fall through */
+			case 4:
+				a += ka[0];
+				break;
+			case 3:
+				a += ((uint32) k[2] << 16);
+				/* fall through */
+			case 2:
+				a += ((uint32) k[1] << 8);
+				/* fall through */
+			case 1:
+				a += k[0];
+				/* case 0: nothing left to add */
+		}
+#endif							/* WORDS_BIGENDIAN */
+	}
+	else
+	{
+		/* Code path for non-aligned source data */
+
+		/* handle most of the key */
+		while (len >= 12)
+		{
+#ifdef WORDS_BIGENDIAN
+			a += (k[3] + ((uint32) k[2] << 8) + ((uint32) k[1] << 16) + ((uint32) k[0] << 24));
+			b += (k[7] + ((uint32) k[6] << 8) + ((uint32) k[5] << 16) + ((uint32) k[4] << 24));
+			c += (k[11] + ((uint32) k[10] << 8) + ((uint32) k[9] << 16) + ((uint32) k[8] << 24));
+#else							/* !WORDS_BIGENDIAN */
+			a += (k[0] + ((uint32) k[1] << 8) + ((uint32) k[2] << 16) + ((uint32) k[3] << 24));
+			b += (k[4] + ((uint32) k[5] << 8) + ((uint32) k[6] << 16) + ((uint32) k[7] << 24));
+			c += (k[8] + ((uint32) k[9] << 8) + ((uint32) k[10] << 16) + ((uint32) k[11] << 24));
+#endif							/* WORDS_BIGENDIAN */
+			mix(a, b, c);
+			k += 12;
+			len -= 12;
+		}
+
+		/* handle the last 11 bytes */
+#ifdef WORDS_BIGENDIAN
+		switch (len)
+		{
+			case 11:
+				c += ((uint32) k[10] << 8);
+				/* fall through */
+			case 10:
+				c += ((uint32) k[9] << 16);
+				/* fall through */
+			case 9:
+				c += ((uint32) k[8] << 24);
+				/* fall through */
+			case 8:
+				/* the lowest byte of c is reserved for the length */
+				b += k[7];
+				/* fall through */
+			case 7:
+				b += ((uint32) k[6] << 8);
+				/* fall through */
+			case 6:
+				b += ((uint32) k[5] << 16);
+				/* fall through */
+			case 5:
+				b += ((uint32) k[4] << 24);
+				/* fall through */
+			case 4:
+				a += k[3];
+				/* fall through */
+			case 3:
+				a += ((uint32) k[2] << 8);
+				/* fall through */
+			case 2:
+				a += ((uint32) k[1] << 16);
+				/* fall through */
+			case 1:
+				a += ((uint32) k[0] << 24);
+				/* case 0: nothing left to add */
+		}
+#else							/* !WORDS_BIGENDIAN */
+		switch (len)
+		{
+			case 11:
+				c += ((uint32) k[10] << 24);
+				/* fall through */
+			case 10:
+				c += ((uint32) k[9] << 16);
+				/* fall through */
+			case 9:
+				c += ((uint32) k[8] << 8);
+				/* fall through */
+			case 8:
+				/* the lowest byte of c is reserved for the length */
+				b += ((uint32) k[7] << 24);
+				/* fall through */
+			case 7:
+				b += ((uint32) k[6] << 16);
+				/* fall through */
+			case 6:
+				b += ((uint32) k[5] << 8);
+				/* fall through */
+			case 5:
+				b += k[4];
+				/* fall through */
+			case 4:
+				a += ((uint32) k[3] << 24);
+				/* fall through */
+			case 3:
+				a += ((uint32) k[2] << 16);
+				/* fall through */
+			case 2:
+				a += ((uint32) k[1] << 8);
+				/* fall through */
+			case 1:
+				a += k[0];
+				/* case 0: nothing left to add */
+		}
+#endif							/* WORDS_BIGENDIAN */
+	}
+
+	final(a, b, c);
+
+	/* report the result */
+	return c;
 }

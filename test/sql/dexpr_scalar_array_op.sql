@@ -1,6 +1,7 @@
 ---
 --- Test for ScalarArrayOp expression
 ---
+SET pg_strom.regression_test_mode = on;
 SET client_min_messages = error;
 DROP SCHEMA IF EXISTS regtest_dexpr_scalar_array_op_temp CASCADE;
 CREATE SCHEMA regtest_dexpr_scalar_array_op_temp;
@@ -13,7 +14,7 @@ CREATE TABLE regtest_data (
   y     numeric[],
   z     text[]
 );
-SELECT setseed(0.20190630);
+SELECT pgstrom.random_setseed(20190630);
 INSERT INTO regtest_data (
   SELECT x, array[pgstrom.random_int(2,0,1000),
                   pgstrom.random_int(2,0,1000),
@@ -89,3 +90,7 @@ SELECT id,z INTO test03p FROM regtest_data
 -- should be empty result
 SET pg_strom.enabled = off;
 SELECT * FROM regtest_data WHERE null = ANY (x);
+
+-- cleanup
+SET client_min_messages = error;
+DROP SCHEMA regtest_dexpr_scalar_array_op_temp CASCADE;

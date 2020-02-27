@@ -3,8 +3,8 @@
  *
  * Collection of text functions for CUDA GPU devices
  * --
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -68,6 +68,15 @@ DEVICE_FUNCTION(pg_int4_t)
 pgfn_textlen(kern_context *kcxt, pg_text_t arg1);
 DEVICE_FUNCTION(pg_text_t)
 pgfn_textcat(kern_context *kcxt, pg_text_t arg1, pg_text_t arg2);
+DEVICE_FUNCTION(pg_text_t)
+pgfn_text_concat2(kern_context *kcxt, pg_text_t arg1, pg_text_t arg2);
+DEVICE_FUNCTION(pg_text_t)
+pgfn_text_concat3(kern_context *kcxt,
+				  pg_text_t arg1, pg_text_t arg2, pg_text_t arg3);
+DEVICE_FUNCTION(pg_text_t)
+pgfn_text_concat4(kern_context *kcxt,
+				  pg_text_t arg1, pg_text_t arg2,
+				  pg_text_t arg3, pg_text_t arg4);
 DEVICE_FUNCTION(pg_text_t)
 pgfn_text_substring(kern_context *kcxt,
 					pg_text_t arg1, pg_int4_t arg2, pg_int4_t arg3);

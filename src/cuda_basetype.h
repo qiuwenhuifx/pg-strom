@@ -4,8 +4,8 @@
  * Definition of base device types. "BASE" type means ones required by
  * PG-Strom core, or Apache Arrow support.
  * --
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -633,20 +633,20 @@ pgfn_to_bool(kern_context *kcxt, pg_int4_t arg)
 }
 PG_SIMPLE_TYPECAST_TEMPLATE(int2,int4,(cl_short))
 PG_SIMPLE_TYPECAST_TEMPLATE(int2,int8,(cl_short))
-PG_SIMPLE_TYPECAST_TEMPLATE(int2,float2,lrint)
-PG_SIMPLE_TYPECAST_TEMPLATE(int2,float4,lrint)
+PG_SIMPLE_TYPECAST_TEMPLATE(int2,float2,lrintf)
+PG_SIMPLE_TYPECAST_TEMPLATE(int2,float4,lrintf)
 PG_SIMPLE_TYPECAST_TEMPLATE(int2,float8,llrint)
 
 PG_SIMPLE_TYPECAST_TEMPLATE(int4,int2,(cl_int))
 PG_SIMPLE_TYPECAST_TEMPLATE(int4,int8,(cl_int))
-PG_SIMPLE_TYPECAST_TEMPLATE(int4,float2,lrint)
-PG_SIMPLE_TYPECAST_TEMPLATE(int4,float4,lrint)
+PG_SIMPLE_TYPECAST_TEMPLATE(int4,float2,lrintf)
+PG_SIMPLE_TYPECAST_TEMPLATE(int4,float4,lrintf)
 PG_SIMPLE_TYPECAST_TEMPLATE(int4,float8,llrint)
 
 PG_SIMPLE_TYPECAST_TEMPLATE(int8,int2,(cl_long))
 PG_SIMPLE_TYPECAST_TEMPLATE(int8,int4,(cl_long))
-PG_SIMPLE_TYPECAST_TEMPLATE(int8,float2,lrint)
-PG_SIMPLE_TYPECAST_TEMPLATE(int8,float4,lrint)
+PG_SIMPLE_TYPECAST_TEMPLATE(int8,float2,lrintf)
+PG_SIMPLE_TYPECAST_TEMPLATE(int8,float4,lrintf)
 PG_SIMPLE_TYPECAST_TEMPLATE(int8,float8,llrint)
 
 PG_SIMPLE_TYPECAST_TEMPLATE(float2,int2,(cl_half))

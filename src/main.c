@@ -3,8 +3,8 @@
  *
  * Entrypoint of PG-Strom extension, and misc uncategolized functions.
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -25,6 +25,7 @@ PG_MODULE_MAGIC;
 bool		pgstrom_enabled;
 bool		pgstrom_debug_kernel_source;
 bool		pgstrom_cpu_fallback_enabled;
+bool		pgstrom_regression_test_mode;
 static int	pgstrom_chunk_size_kb;
 
 /* cost factors */
@@ -54,7 +55,7 @@ pgstrom_chunk_size(void)
 }
 
 static void
-pgstrom_init_misc_guc(void)
+pgstrom_init_common_guc(void)
 {
 	/* turn on/off PG-Strom feature */
 	DefineCustomBoolVariable("pg_strom.enabled",
@@ -124,6 +125,15 @@ pgstrom_init_misc_guc(void)
 							 DEFAULT_CPU_OPERATOR_COST / 16.0,
 							 0,
 							 DBL_MAX,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+	/* disables some platform specific EXPLAIN output */
+	DefineCustomBoolVariable("pg_strom.regression_test_mode",
+							 "Disables some platform specific output in EXPLAIN; that can lead undesired test failed but harmless",
+							 NULL,
+							 &pgstrom_regression_test_mode,
+							 false,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -557,26 +567,23 @@ _PG_init(void)
 	PHYS_PAGES = sysconf(_SC_PHYS_PAGES);
 
 	/* init GPU/CUDA infrastracture */
-	pgstrom_init_misc_guc();
+	pgstrom_init_common_guc();
+	pgstrom_init_shmbuf();
 	pgstrom_init_gpu_device();
 	pgstrom_init_gpu_mmgr();
 	pgstrom_init_gpu_context();
 	pgstrom_init_cuda_program();
 	pgstrom_init_nvme_strom();
+	pgstrom_init_codegen();
 
-	/* registration of custom-scan providers */
+	/* init custom-scan providers/FDWs */
 	pgstrom_init_gputasks();
 	pgstrom_init_gpuscan();
 	pgstrom_init_gpujoin();
+	pgstrom_init_inners();
 	pgstrom_init_gpupreagg();
 	pgstrom_init_relscan();
-
-	/* miscellaneous initializations */
-	pgstrom_init_codegen();
-	pgstrom_init_plcuda();
 	pgstrom_init_arrow_fdw();
-	pgstrom_init_gstore_buf();
-	pgstrom_init_gstore_fdw();
 
 	/* check commercial license, if any */
 	check_heterodb_license();

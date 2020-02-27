@@ -3,8 +3,8 @@
  *
  * Collection of text functions for CUDA GPU devices
  * --
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -425,6 +425,12 @@ pgfn_textlen(kern_context *kcxt, pg_text_t arg1)
 DEVICE_FUNCTION(pg_text_t)
 pgfn_textcat(kern_context *kcxt, pg_text_t arg1, pg_text_t arg2)
 {
+	return pgfn_text_concat2(kcxt, arg1, arg2);
+}
+
+DEVICE_FUNCTION(pg_text_t)
+pgfn_text_concat2(kern_context *kcxt, pg_text_t arg1, pg_text_t arg2)
+{
 	char	   *s1, *s2;
 	cl_int		len1, len2;
 	pg_text_t	result;
@@ -462,6 +468,102 @@ pgfn_textcat(kern_context *kcxt, pg_text_t arg1, pg_text_t arg2)
 	return result;
 }
 
+DEVICE_FUNCTION(pg_text_t)
+pgfn_text_concat3(kern_context *kcxt,
+				  pg_text_t arg1, pg_text_t arg2, pg_text_t arg3)
+{
+	char	   *s1, *s2, *s3;
+	cl_int		len1, len2, len3;
+	cl_int		sz;
+	pg_text_t	result;
+	char	   *pos;
+
+	if (arg1.isnull || arg2.isnull || arg3.isnull)
+	{
+		result.isnull = true;
+		return result;
+	}
+	if (!pg_varlena_datum_extract(kcxt, arg1, &s1, &len1) ||
+		!pg_varlena_datum_extract(kcxt, arg2, &s2, &len2) ||
+		!pg_varlena_datum_extract(kcxt, arg3, &s3, &len3))
+	{
+		result.isnull = true;
+		return result;
+	}
+	sz = VARHDRSZ + len1 + len2 + len3;
+	pos = (char *)kern_context_alloc(kcxt, sz);
+	if (!pos)
+	{
+		STROM_CPU_FALLBACK(kcxt, ERRCODE_OUT_OF_MEMORY,
+						   "out of memory");
+		result.isnull = true;
+		return result;
+	}
+	result.isnull = false;
+	result.value = pos;
+	result.length = -1;
+	SET_VARSIZE(pos, sz);
+	pos += VARHDRSZ;
+	memcpy(pos, s1, len1);
+	pos += len1;
+	memcpy(pos, s2, len2);
+	pos += len2;
+	memcpy(pos, s3, len3);
+	pos += len3;
+
+	return result;
+}
+
+DEVICE_FUNCTION(pg_text_t)
+pgfn_text_concat4(kern_context *kcxt,
+				  pg_text_t arg1, pg_text_t arg2,
+				  pg_text_t arg3, pg_text_t arg4)
+{
+	char	   *s1, *s2, *s3, *s4;
+	cl_int		len1, len2, len3, len4;
+	cl_int		sz;
+	pg_text_t	result;
+	char	   *pos;
+
+	if (arg1.isnull || arg2.isnull || arg3.isnull || arg4.isnull)
+	{
+		result.isnull = true;
+		return result;
+	}
+	if (!pg_varlena_datum_extract(kcxt, arg1, &s1, &len1) ||
+		!pg_varlena_datum_extract(kcxt, arg2, &s2, &len2) ||
+		!pg_varlena_datum_extract(kcxt, arg3, &s3, &len3) ||
+		!pg_varlena_datum_extract(kcxt, arg4, &s4, &len4))
+	{
+		result.isnull = true;
+		return result;
+	}
+	sz = VARHDRSZ + len1 + len2 + len3 + len4;
+	pos = (char *)kern_context_alloc(kcxt, sz);
+	if (!pos)
+	{
+		STROM_CPU_FALLBACK(kcxt, ERRCODE_OUT_OF_MEMORY,
+						   "out of memory");
+		result.isnull = true;
+		return result;
+	}
+	result.isnull = false;
+	result.value = pos;
+	result.length = -1;
+	SET_VARSIZE(pos, sz);
+	pos += VARHDRSZ;
+	memcpy(pos, s1, len1);
+	pos += len1;
+	memcpy(pos, s2, len2);
+	pos += len2;
+	memcpy(pos, s3, len3);
+	pos += len3;
+	memcpy(pos, s4, len4);
+	pos += len4;
+
+	return result;
+}
+
 /*
  * substring
  */
@@ -471,44 +573,57 @@ text_substring(kern_context *kcxt,
 {
 	pg_text_t	result;
 	char	   *pos;
-	char	   *end = str + strlen;
-	char	   *mark __attribute__((unused));
 
-#if PG_DATABASE_ENCODING_MAX_LENGTH == 1
-	start = Max(start, 1) - 1;
-	if (start >= strlen)
-		goto empty;
-	pos = str + start;
+	if (pg_database_encoding_max_length() == 1)
+	{
+		cl_int	tail = start + length - 1;
 
-	if (length < 0 || start + length >= strlen)
-		length = strlen - start;
-	/* substring */
-	result.isnull = false;
-	result.value  = pos;
-	result.length = length;
-#else
-	start = Max(start, 1) - 1;
-	pos = str;
-	while (start-- > 0 && pos < end)
-		pos += pg_wchar_mblen(pos);
-	if (pos >= end)
-		goto empty;
-	mark = pos;
-	if (length < 0)
-		length = INT_MAX;
-	while (length-- > 0 && pos < end)
-		pos += pg_wchar_mblen(pos);
-	if (pos >= end)
-		pos = end;
-	result.isnull = false;
-	result.value  = mark;
-	result.length = (pos - mark);
-#endif	/* PG_DATABASE_ENCODING_MAX_LENGTH */
+		start = Max(start, 1) - 1;	/* 0-origin */
+		if (start >= strlen)
+			goto empty;
+		pos = str + start;
+
+		if (length < 0 || tail >= strlen)
+			length = strlen - start;
+		else
+			length = tail - start;
+		/* substring */
+		result.isnull = false;
+		result.value  = pos;
+		result.length = length;
+	}
+	else
+	{
+		cl_int	tail = start + length - 1;
+		char   *end = str + strlen;
+		char   *mark;
+
+		start = Max(start, 1) - 1;
+		if (length < 0)
+			length = INT_MAX;
+		else
+			length = tail - start;
+		pos = str;
+		while (start-- > 0 && pos < end)
+			pos += pg_wchar_mblen(pos);
+		if (pos >= end)
+			goto empty;
+		mark = pos;
+		if (length < 0)
+			length = INT_MAX;
+		while (length-- > 0 && pos < end)
+			pos += pg_wchar_mblen(pos);
+		if (pos >= end)
+			pos = end;
+		result.isnull = false;
+		result.value  = mark;
+		result.length = (pos - mark);
+	}
 	return result;
 
 empty:
 	result.isnull = false;
-	result.value  = end;
+	result.value  = str + strlen;
 	result.length = 0;
 	return result;
 }

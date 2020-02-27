@@ -3,8 +3,8 @@
  *
  * Header file of pg_strom module
  * --
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This software is an extension of PostgreSQL; You can use, copy,
  * modify or distribute it under the terms of 'LICENSE' included
@@ -12,10 +12,18 @@
  */
 #ifndef PG_STROM_H
 #define PG_STROM_H
+
 #include "postgres.h"
+#if PG_VERSION_NUM < 100000
+#error Base PostgreSQL version must be v10 or later
+#endif
+#define PG_MAJOR_VERSION		(PG_VERSION_NUM / 100)
+#define PG_MINOR_VERSION		(PG_VERSION_NUM % 100)
+
 #include "access/brin.h"
 #include "access/brin_revmap.h"
 #include "access/hash.h"
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
@@ -50,19 +58,18 @@
 #if PG_VERSION_NUM < 110000
 #include "catalog/pg_type_fn.h"
 #endif
+#include "catalog/pg_user_mapping.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/event_trigger.h"
 #include "commands/explain.h"
 #include "commands/proclang.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
-#if PG_VERSION_NUM >= 100000
+#include "commands/variable.h"
 #include "common/base64.h"
 #include "common/md5.h"
-#else
-#include "libpq/md5.h"	//moved at PG10
-#endif
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeIndexscan.h"
@@ -76,6 +83,7 @@
 #include "lib/stringinfo.h"
 #include "libpq/be-fsstubs.h"
 #include "libpq/libpq-fs.h"
+#include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
@@ -85,20 +93,32 @@
 #include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
 #include "nodes/readfuncs.h"
+#if PG_VERSION_NUM < 120000
 #include "nodes/relation.h"
+#endif
+#if PG_VERSION_NUM >= 120000
+#include "optimizer/appendinfo.h"
+#endif
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#if PG_VERSION_NUM >= 120000
+#include "optimizer/optimizer.h"
+#endif
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
+#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
+#if PG_VERSION_NUM < 120000
 #include "optimizer/var.h"
+#endif
 #include "parser/parsetree.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
+#include "parser/scansup.h"
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "postmaster/bgworker.h"
@@ -125,6 +145,9 @@
 #include "utils/bytea.h"
 #include "utils/cash.h"
 #include "utils/date.h"
+#if PG_VERSION_NUM >= 120000
+#include "utils/float.h"
+#endif
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/json.h"
@@ -138,9 +161,7 @@
 #include "utils/pg_crc.h"
 #include "utils/pg_locale.h"
 #include "utils/rangetypes.h"
-#if PG_VERSION_NUM >= 100000
 #include "utils/regproc.h"
-#endif
 #include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/ruleutils.h"
@@ -148,13 +169,13 @@
 #include "utils/snapmgr.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
+#if PG_VERSION_NUM < 120000
 #include "utils/tqual.h"
+#endif
 #include "utils/typcache.h"
 #include "utils/uuid.h"
 #include "utils/varbit.h"
-#if PG_VERSION_NUM >= 100000
 #include "utils/varlena.h"
-#endif
 
 #define CUDA_API_PER_THREAD_DEFAULT_STREAM		1
 #include <cuda.h>
@@ -164,6 +185,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <float.h>
+#include <libgen.h>
 #include <limits.h>
 #include <math.h>
 #include <sys/ioctl.h>
@@ -190,12 +212,6 @@
  *
  * --------------------------------------------------------------------
  */
-#if PG_VERSION_NUM < 90600
-#error Base PostgreSQL version is too OLD for this PG-Strom code
-#endif
-#define PG_MAJOR_VERSION		(PG_VERSION_NUM / 100)
-#define PG_MINOR_VERSION		(PG_VERSION_NUM % 100)
-
 #if SIZEOF_DATUM != 8
 #error PG-Strom expects 64bit platform
 #endif
@@ -214,6 +230,7 @@
 #error PG-Strom expects timestamp has 64bit integer format
 #endif
 #include "cuda_common.h"
+#include "pg_compat.h"
 
 #define PGSTROM_SCHEMA_NAME		"pgstrom"
 
@@ -374,13 +391,14 @@ struct GpuTaskSharedState
 	/* for arrow_fdw file scan  */
 	pg_atomic_uint32 af_rbatch_index;
 
-	/* for regular table scan */
-	uint64		nr_allocated;	/* number of blocks already allocated to
-								 * workers; almost equivalent to the
-								 * @phs_nallocated in PG11 or later.
-								 */
-	ParallelHeapScanDescData	phscan;
-	/* variable length */
+	/* for block-based regular table scan */
+	BlockNumber		pbs_nblocks;	/* # blocks in relation at start of scan */
+	slock_t			pbs_mutex;		/* lock of the fields below */
+	BlockNumber		pbs_startblock;	/* starting block number */
+	BlockNumber		pbs_nallocated;	/* # of blocks allocated to workers */
+
+	/* common parallel table scan descriptor */
+	ParallelTableScanDescData phscan;
 };
 
 /*
@@ -644,6 +662,13 @@ extern CUresult gpuOptimalBlockSize(int *p_grid_sz,
 									size_t dyn_shmem_per_block,
 									size_t dyn_shmem_per_thread);
 /*
+ * shmbuf.c
+ */
+extern MemoryContext	SharedMemoryContextCreate(const char *name);
+extern void				pgstrom_init_shmbuf(void);
+extern MemoryContext	TopSharedMemoryContext;
+
+/*
  * gpu_mmgr.c
  */
 extern CUresult __gpuMemAllocRaw(GpuContext *gcontext,
@@ -684,7 +709,6 @@ extern CUresult __gpuMemAllocHost(GpuContext *gcontext,
 								  const char *filename, int lineno);
 extern CUresult __gpuMemAllocPreserved(cl_int cuda_dindex,
 									   CUipcMemHandle *ipc_mhandle,
-									   dsm_handle *dsm_mhandle,
 									   ssize_t bytesize,
 									   const char *filename, int lineno);
 extern CUresult __gpuIpcOpenMemHandle(GpuContext *gcontext,
@@ -700,18 +724,7 @@ extern CUresult gpuMemFreePreserved(cl_int cuda_dindex,
 									CUipcMemHandle m_handle);
 extern CUresult gpuIpcCloseMemHandle(GpuContext *gcontext,
 									 CUdeviceptr m_deviceptr);
-extern CUresult gpuMemLoadPreserved(cl_int cuda_dindex,
-									CUipcMemHandle m_handle);
-extern void gpuIpcMemCopyFromHost(cl_int cuda_dindex,
-								  CUipcMemHandle m_handle,
-								  size_t offset,
-								  void *hbuffer,
-								  size_t length);
-extern void gpuIpcMemCopyToHost(void *hbuffer,
-								cl_int cuda_dindex,
-								CUipcMemHandle m_handle,
-								size_t offset,
-								size_t length);
+
 #define gpuMemAllocRaw(a,b,c)				\
 	__gpuMemAllocRaw((a),(b),(c),__FILE__,__LINE__)
 #define gpuMemAllocManagedRaw(a,b,c,d)		\
@@ -728,8 +741,8 @@ extern void gpuIpcMemCopyToHost(void *hbuffer,
 	__gpuMemAllocIOMap((a),(b),(c),__FILE__,__LINE__)
 #define gpuMemAllocHost(a,b,c)				\
 	__gpuMemAllocHost((a),(b),(c),__FILE__,__LINE__)
-#define gpuMemAllocPreserved(a,b,c,d)						\
-	__gpuMemAllocPreserved((a),(b),(c),(d),__FILE__,__LINE__)
+#define gpuMemAllocPreserved(a,b,c)						\
+	__gpuMemAllocPreserved((a),(b),(c),__FILE__,__LINE__)
 #define gpuIpcOpenMemHandle(a,b,c,d)		\
 	__gpuIpcOpenMemHandle((a),(b),(c),(d),__FILE__,__LINE__)
 
@@ -966,7 +979,7 @@ extern void pgstrom_init_gputasks(void);
  */
 extern Size	nvme_strom_threshold(void);
 extern int	nvme_strom_ioctl(int cmd, void *arg);
-extern int	GetOptimalGpuForFile(const char *fname, File fdesc);
+extern int	GetOptimalGpuForFile(File fdesc);
 extern int	GetOptimalGpuForRelation(PlannerInfo *root,
 									 RelOptInfo *rel);
 extern bool ScanPathWillUseNvmeStrom(PlannerInfo *root,
@@ -1006,7 +1019,9 @@ extern void pgstrom_init_cuda_program(void);
  */
 struct codegen_context {
 	StringInfoData	str;
-	PlannerInfo *root;
+	StringInfoData	decl_temp;	/* declarations of temporary variables */
+	int				decl_count;	/* # of temporary variabes in decl */
+	PlannerInfo *root;		//not necessary?
 	RelOptInfo	*baserel;	/* scope of Var-node, if any */
 	List	   *used_params;/* list of Const/Param in use */
 	List	   *used_vars;	/* list of Var in use */
@@ -1087,21 +1102,13 @@ extern pgstrom_data_store *__PDS_clone(pgstrom_data_store *pds,
 extern pgstrom_data_store *PDS_retain(pgstrom_data_store *pds);
 extern void PDS_release(pgstrom_data_store *pds);
 
-extern size_t	KDS_calculateHeadSize(TupleDesc tupdesc, bool has_attnames);
-#if 0
-extern size_t	KDS_calculateRowSize(TupleDesc tupdesc,
-									 size_t nitems, size_t dataLen);
-extern size_t	KDS_calculateHashSize(TupleDesc tupdesc,
-									  size_t nitems, size_t dataLen);
-extern size_t	KDS_calculateSlotSz(TupleDesc tupdesc,
-									size_t nitems);
-#endif
+extern size_t	KDS_calculateHeadSize(TupleDesc tupdesc);
+
 extern void init_kernel_data_store(kern_data_store *kds,
 								   TupleDesc tupdesc,
 								   Size length,
 								   int format,
-								   uint nrooms,
-								   bool has_attnames);
+								   uint nrooms);
 
 extern pgstrom_data_store *__PDS_create_row(GpuContext *gcontext,
 											TupleDesc tupdesc,
@@ -1149,7 +1156,8 @@ extern void __PDS_fillup_arrow(pgstrom_data_store *pds_dst,
 							   kern_data_store *kds_head,
 							   int fdesc, strom_io_vector *iovec);
 extern pgstrom_data_store *PDS_fillup_arrow(pgstrom_data_store *pds_src);
-
+extern pgstrom_data_store *PDS_writeback_arrow(pgstrom_data_store *pds_src,
+											   CUdeviceptr m_kds_src);
 extern bool KDS_insert_tuple(kern_data_store *kds,
 							 TupleTableSlot *slot);
 #define PDS_insert_tuple(pds,slot)	KDS_insert_tuple(&(pds)->kds,slot)
@@ -1183,10 +1191,13 @@ extern int pgstrom_common_relscan_cost(PlannerInfo *root,
 									   cl_uint *p_nrows_per_block,
 									   Cost *p_startup_cost,
 									   Cost *p_run_cost);
-
+extern Bitmapset *pgstrom_pullup_outer_refs(PlannerInfo *root,
+											RelOptInfo *base_rel,
+											Bitmapset *referenced);
 extern void pgstromExecInitBrinIndexMap(GpuTaskState *gts,
 										Oid index_oid,
-										List *index_conds);
+										List *index_conds,
+										List *index_quals);
 extern Size pgstromSizeOfBrinIndexMap(GpuTaskState *gts);
 extern void pgstromExecGetBrinIndexMap(GpuTaskState *gts);
 extern void pgstromExecEndBrinIndexMap(GpuTaskState *gts);
@@ -1248,19 +1259,13 @@ extern bool pgstrom_planstate_is_gpujoin(const PlanState *ps);
 extern Path *pgstrom_copy_gpujoin_path(const Path *pathnode);
 extern cl_int gpujoin_get_optimal_gpu(const Path *pathnode);
 
-#if PG_VERSION_NUM >= 100000
+#if PG_VERSION_NUM >= 110000
 extern List *extract_partitionwise_pathlist(PlannerInfo *root,
-											PathTarget *path_target,
 											Path *outer_path,
-											Path *inner_path,
 											bool try_parallel_path,
+											AppendPath **p_append_path,
 											int *p_parallel_nworkers,
-											Index *p_partition_relid,
-											List **p_partitioned_rels);
-extern List *fixup_appendrel_child_varnode(List *exprs_list,
-										   PlannerInfo *root,
-										   Index partition_relid,
-										   RelOptInfo *subrel);
+											Cost *p_discount_cost);
 #endif
 extern int	gpujoin_process_task(GpuTask *gtask, CUmodule cuda_module);
 extern void	gpujoin_release_task(GpuTask *gtask);
@@ -1293,11 +1298,28 @@ extern void gpujoinUpdateRunTimeStat(GpuTaskState *gts,
 									 struct kern_gpujoin *kgjoin);
 
 /*
+ * inners.c
+ */
+typedef struct shared_mmap_segment		shared_mmap_segment;
+
+extern shared_mmap_segment *shared_mmap_create(size_t size);
+extern shared_mmap_segment *shared_mmap_attach(uint32 handle);
+extern void shared_mmap_detach(shared_mmap_segment *shm_seg);
+extern void *shared_mmap_expand(shared_mmap_segment *shm_seg, size_t new_size);
+
+extern void *shared_mmap_address(shared_mmap_segment *shm_seg);
+extern size_t shared_mmap_length(shared_mmap_segment *shm_seg);
+extern uint64 shared_mmap_handle(shared_mmap_segment *shm_seg);
+
+extern void	pgstrom_init_inners(void);
+
+/*
  * gpupreagg.c
  */
 extern bool pgstrom_path_is_gpupreagg(const Path *pathnode);
 extern bool pgstrom_plan_is_gpupreagg(const Plan *plan);
 extern bool pgstrom_planstate_is_gpupreagg(const PlanState *ps);
+extern Path *pgstrom_copy_gpupreagg_path(const Path *pathnode);
 extern void gpupreagg_post_planner(PlannedStmt *pstmt, CustomScan *cscan);
 extern void assign_gpupreagg_session_info(StringInfo buf,
 										  GpuTaskState *gts);
@@ -1360,11 +1382,6 @@ extern GstoreIpcHandle *__pgstrom_gstore_export_ipchandle(Oid ftable_oid);
 extern bool baseRelIsArrowFdw(RelOptInfo *baserel);
 extern cl_int GetOptimalGpuForArrowFdw(PlannerInfo *root,
 									   RelOptInfo *baserel);
-
-extern void readArrowFileDesc(int fdesc, ArrowFileInfo *af_info);
-extern char *dumpArrowNode(ArrowNode *node);
-extern void copyArrowNode(ArrowNode *dest, const ArrowNode *src);
-extern char *arrowTypeName(ArrowField *field);
 extern bool KDS_fetch_tuple_arrow(TupleTableSlot *slot,
 								  kern_data_store *kds,
 								  size_t row_index);
@@ -1388,11 +1405,10 @@ extern void pgstrom_init_arrow_fdw(void);
  * misc.c
  */
 extern Expr *make_flat_ands_explicit(List *andclauses);
-#if PG_VERSION_NUM < 100000
-extern int __compute_parallel_worker(RelOptInfo *rel,
-									 double heap_pages,
-									 double index_pages);
-#endif
+extern AppendRelInfo **__find_appinfos_by_relids(PlannerInfo *root,
+												 Relids relids,
+												 int *nappinfos);
+extern double get_parallel_divisor(Path *path);
 #if PG_VERSION_NUM < 110000
 /* PG11 changed pg_proc definition */
 extern char get_func_prokind(Oid funcid);
@@ -1402,8 +1418,23 @@ extern char get_func_prokind(Oid funcid);
 #define PROKIND_PROCEDURE	'p'
 #endif
 extern int	get_relnatts(Oid relid);
+extern Oid	get_function_oid(const char *func_name,
+							 oidvector *func_args,
+							 Oid namespace_oid,
+							 bool missing_ok);
+extern Oid	get_type_oid(const char *type_name,
+						 Oid namespace_oid,
+						 bool missing_ok);
 extern char *bms_to_cstring(Bitmapset *x);
+extern bool pathtree_has_gpupath(Path *node);
+extern Path *pgstrom_copy_pathnode(const Path *pathnode);
 extern const char *errorText(int errcode);
+
+extern ssize_t	__readFile(int fdesc, void *buffer, size_t nbytes);
+extern ssize_t	__writeFile(int fdesc, const void *buffer, size_t nbytes);
+extern void	   *__mmapFile(void *addr, size_t length,
+						   int prot, int flags, int fdesc, off_t offset);
+extern int		__munmapFile(void *mmap_addr);
 
 /*
  * nvrtc.c
@@ -1422,13 +1453,11 @@ extern bool		pgstrom_enabled;
 extern bool		pgstrom_debug_kernel_source;
 extern bool		pgstrom_bulkexec_enabled;
 extern bool		pgstrom_cpu_fallback_enabled;
+extern bool		pgstrom_regression_test_mode;
 extern int		pgstrom_max_async_tasks;
 extern double	pgstrom_gpu_setup_cost;
 extern double	pgstrom_gpu_dma_cost;
 extern double	pgstrom_gpu_operator_cost;
-extern double	pgstrom_nrows_growth_ratio_limit;
-extern double	pgstrom_nrows_growth_margin;
-extern double	pgstrom_chunk_size_margin;
 extern Size		pgstrom_chunk_size(void);
 extern long		PAGE_SIZE;
 extern long		PAGE_MASK;
@@ -1453,13 +1482,6 @@ extern void show_scan_qual(List *qual, const char *qlabel,
 						   ExplainState *es);
 extern void show_instrumentation_count(const char *qlabel, int which,
 									   PlanState *planstate, ExplainState *es);
-
-/* ----------------------------------------------------------------
- *
- * Thin abstruction layer across multiple PostgreSQL versions
- *
- * ---------------------------------------------------------------- */
-#include "pg_compat.h"
 
 /* ----------------------------------------------------------------
  *
@@ -1647,6 +1669,21 @@ get_next_log2(Size size)
 }
 
 /*
+ * __trim - remove whitespace at the head/tail of cstring
+ */
+static inline char *
+__trim(char *token)
+{
+	char   *tail = token + strlen(token) - 1;
+
+	while (*token == ' ' || *token == '\t')
+		token++;
+	while (tail >= token && (*tail == ' ' || *tail == '\t'))
+		*tail-- = '\0';
+	return token;
+}
+
+/*
  * It translate an alignment character into width
  */
 static inline int
@@ -1749,9 +1786,18 @@ __basename(const char *filename)
 }
 
 /*
- * XXX - why PG does not have palloc_huge()?
+ * Some usuful memory allocation wrapper
  */
 #define palloc_huge(sz)		MemoryContextAllocHuge(CurrentMemoryContext,(sz))
+static inline void *
+pmemdup(const void *src, Size sz)
+{
+	void   *dst = palloc(sz);
+
+	memcpy(dst, src, sz);
+
+	return dst;
+}
 
 /*
  * simple wrapper for pthread_mutex_lock
@@ -1909,6 +1955,38 @@ pthreadCondSignal(pthread_cond_t *cond)
 {
 	if ((errno = pthread_cond_signal(cond)) != 0)
 		wfatal("failed on pthread_cond_signal: %m");
+}
+
+/*
+ * functions for execution time measurement
+ */
+typedef struct timeval		timeval_t;
+
+static inline timeval_t
+stat_time_begin(void)
+{
+	timeval_t	tv_start;
+
+	gettimeofday(&tv_start, NULL);
+
+	return tv_start;
+}
+
+static inline void
+stat_time_end(timeval_t tv_start, const char *label)
+{
+	timeval_t	tv_end;
+	cl_long		delta;		/* us */
+
+	gettimeofday(&tv_end, NULL);
+	delta = ((tv_end.tv_sec - tv_start.tv_sec) * 1000000 +
+			 (tv_end.tv_usec - tv_start.tv_usec));
+	if (delta > 4000000)
+		elog(INFO, "%s: %.2fs", label, (double)delta / 1000000.0);
+	else if (delta > 4000)
+		elog(INFO, "%s: %.2fms", label, (double)delta / 1000.0);
+	else
+		elog(INFO, "%s: %luus", label, delta);
 }
 
 /*

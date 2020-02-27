@@ -3,8 +3,8 @@
  *
  * Routines for just-in-time comple cuda code
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -81,7 +81,7 @@ typedef struct
 {
 	pg_atomic_uint32	num_active_builders;
 	struct {
-		volatile Latch *latch;
+		Latch *latch;
 	} builders[FLEXIBLE_ARRAY_MEMBER];
 } program_builder_state;
 
@@ -1421,7 +1421,7 @@ assign_timelib_session_info(StringInfo buf)
 	{
 		for (i=0; i < sp->timecnt; i++)
 		{
-			appendStringInfo(buf, "    % 10ld,\n", sp->ats[i]);
+			appendStringInfo(buf, "    %10ld,\n", sp->ats[i]);
 		}
 	}
 	appendStringInfo(buf, " };\n");
@@ -1822,7 +1822,7 @@ cudaProgramBuilderWakeUp(bool error_if_no_builders)
 
 	for (i=0; i < num_program_builders; i++)
 	{
-		volatile Latch *latch = pgbuilder_state->builders[i].latch;
+		Latch *latch = pgbuilder_state->builders[i].latch;
 
 		if (latch)
 		{

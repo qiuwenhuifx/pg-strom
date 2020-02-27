@@ -4,8 +4,8 @@
  * Routines to manage data store; row-store, column-store, toast-buffer,
  * and param-buffer.
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -72,7 +72,7 @@ KDS_fetch_tuple_row(TupleTableSlot *slot,
 		tuple_buf->t_tableOid = kds->table_oid;
 		tuple_buf->t_data = &tup_item->htup;
 
-		ExecStoreTuple(tuple_buf, slot, InvalidBuffer, false);
+		ExecStoreHeapTuple(tuple_buf, slot, false);
 
 		return true;
 	}
@@ -197,7 +197,7 @@ KDS_fetch_tuple_block(TupleTableSlot *slot,
 			tuple->t_tableOid = (rel ? RelationGetRelid(rel) : InvalidOid);
 			tuple->t_data = (HeapTupleHeader)((char *)hpage +
 											  ItemIdGetOffset(lpp));
-			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(tuple, slot, false);
 			return true;
 		}
 		/* move to the next block */
@@ -227,6 +227,9 @@ PDS_fetch_tuple(TupleTableSlot *slot,
 		case KDS_FORMAT_COLUMN:
 			return KDS_fetch_tuple_column(slot, &pds->kds,
 										  gts->curr_index++);
+		case KDS_FORMAT_ARROW:
+			return KDS_fetch_tuple_arrow(slot, &pds->kds,
+										 gts->curr_index++);
 		default:
 			elog(ERROR, "Bug? unsupported data store format: %d",
 				pds->kds.format);
@@ -330,6 +333,7 @@ PDS_release(pgstrom_data_store *pds)
 			Assert(pds->kds.format == KDS_FORMAT_ARROW);
 			pfree(pds);
 		}
+#if 0
 		else if ((pds->kds.format == KDS_FORMAT_BLOCK) ||
 				 (pds->kds.format == KDS_FORMAT_ARROW && pds->iovec))
 		{
@@ -337,6 +341,7 @@ PDS_release(pgstrom_data_store *pds)
 			if (rc != CUDA_SUCCESS)
 				werror("failed on gpuMemFreeHost: %s", errorText(rc));
 		}
+#endif
 		else
 		{
 			rc = gpuMemFree(gcontext, (CUdeviceptr) pds);
@@ -347,25 +352,25 @@ PDS_release(pgstrom_data_store *pds)
 }
 
 static int
-count_num_of_subfields(Form_pg_attribute attr)
+count_num_of_subfields(Oid type_oid)
 {
 	HeapTuple		tup;
 	Form_pg_type	typeForm;
 	int				result = 0;
 
-	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(attr->atttypid));
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
 	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for type %u", attr->atttypid);
+		elog(ERROR, "cache lookup failed for type %u", type_oid);
 	typeForm = (Form_pg_type) GETSTRUCT(tup);
 	if (typeForm->typlen == -1 && OidIsValid(typeForm->typelem))
 	{
 		/* array type */
-		result = 1;
+		result = 1 + count_num_of_subfields(typeForm->typelem);
 	}
 	else if (typeForm->typtype == TYPTYPE_COMPOSITE &&
 			 OidIsValid(typeForm->typrelid))
 	{
-		TupleDesc	tupdesc = lookup_rowtype_tupdesc(attr->atttypid, -1);
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc(type_oid, -1);
 		int			i;
 
 		result = tupdesc->natts;
@@ -373,7 +378,7 @@ count_num_of_subfields(Form_pg_attribute attr)
 		{
 			Form_pg_attribute attr = tupleDescAttr(tupdesc, i);
 
-			result += count_num_of_subfields(attr);
+			result += count_num_of_subfields(attr->atttypid);
 		}
 		ReleaseTupleDesc(tupdesc);
 	}
@@ -381,143 +386,124 @@ count_num_of_subfields(Form_pg_attribute attr)
 	return result;
 }
 
-static char
-pg_type_to_typeKind(Form_pg_type type)
+static void
+__init_kernel_column_metadata(kern_data_store *kds,
+							  int column_index,
+							  const char *attname,
+							  int attnum,
+							  Oid atttypid,
+							  int atttypmod,
+							  int *p_attcacheoff)
 {
-	switch (type->typtype)
+	kern_colmeta   *cmeta = &kds->colmeta[column_index];
+	HeapTuple		tup;
+	Form_pg_type	typ;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(atttypid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for type %u", atttypid);
+	typ = (Form_pg_type) GETSTRUCT(tup);
+
+	cmeta->attbyval = typ->typbyval;
+	if (!cmeta->attbyval)
+		kds->has_notbyval = true;
+	cmeta->attalign = typealign_get_width(typ->typalign);
+	cmeta->attlen   = typ->typlen;
+	cmeta->attnum   = attnum;
+	if (p_attcacheoff && *p_attcacheoff > 0)
+		cmeta->attcacheoff = att_align_nominal(*p_attcacheoff, typ->typalign);
+	else
+		cmeta->attcacheoff = -1;
+	cmeta->atttypid = atttypid;
+	cmeta->atttypmod = atttypmod;
+	strncpy(cmeta->attname.data, attname, NAMEDATALEN);
+
+	if (OidIsValid(typ->typelem))
 	{
-		case TYPTYPE_BASE:
-			if (type->typlen == -1 && OidIsValid(type->typelem))
-				return TYPE_KIND__ARRAY;
-			return TYPE_KIND__BASE;
-		case TYPTYPE_COMPOSITE:
-			if (OidIsValid(type->typrelid))
-				return TYPE_KIND__COMPOSITE;
-			elog(ERROR, "composite type without relevant relation OID");
-		case TYPTYPE_DOMAIN:
-			return TYPE_KIND__DOMAIN;
-		case TYPTYPE_ENUM:
-			return TYPE_KIND__ENUM;
-		case TYPTYPE_PSEUDO:
-			return TYPE_KIND__PSEUDO;
-		case TYPTYPE_RANGE:
-			return TYPE_KIND__RANGE;
-		default:
-			break;
+		char		elem_name[NAMEDATALEN + 10];
+
+		Assert(typ->typlen == -1);
+		cmeta->atttypkind = TYPE_KIND__ARRAY;
+		cmeta->idx_subattrs = kds->nr_colmeta++;
+		cmeta->num_subattrs = 1;
+
+		snprintf(elem_name, sizeof(elem_name), "__%s", attname);
+		__init_kernel_column_metadata(kds,
+									  cmeta->idx_subattrs,
+									  elem_name,
+									  1,		/* attnum */
+									  typ->typelem,
+									  -1,		/* typmod */
+									  NULL);	/* attcacheoff */
 	}
-	elog(ERROR, "unknown pg_type.typtype definition: '%c'", type->typtype);
-}
-
-static int
-init_kernel_tupdesc(kern_colmeta *cmeta,
-					NameData *attNames,
-					TupleDesc tupdesc,
-					int format,
-					cl_char *p_has_notbyval)
-{
-	bool		has_notbyval = false;
-	int			attcacheoff = -1;
-	int			j, cusage = tupdesc->natts;
-
-	/* attcacheoff is valuable for row-format */
-	if (format == KDS_FORMAT_ROW ||
-		format == KDS_FORMAT_HASH ||
-		format == KDS_FORMAT_BLOCK)
+	else if (OidIsValid(typ->typrelid))
 	{
-		attcacheoff = offsetof(HeapTupleHeaderData, t_bits);
-        if (tupdesc->tdhasoid)
-            attcacheoff += sizeof(Oid);
-        attcacheoff = MAXALIGN(attcacheoff);
-	}
+		TupleDesc	rowdesc;
+		int			j, attcacheoff = -1;
 
-	for (j=0; j < tupdesc->natts; j++)
+		Assert(typ->typtype == TYPTYPE_COMPOSITE);
+		cmeta->atttypkind = TYPE_KIND__COMPOSITE;
+
+		rowdesc = lookup_rowtype_tupdesc(atttypid, atttypmod);
+		cmeta->idx_subattrs = kds->nr_colmeta;
+		cmeta->num_subattrs = rowdesc->natts;
+		kds->nr_colmeta += rowdesc->natts;
+
+		if (kds->format == KDS_FORMAT_ROW ||
+			kds->format == KDS_FORMAT_HASH ||
+			kds->format == KDS_FORMAT_BLOCK)
+		{
+			attcacheoff = offsetof(HeapTupleHeaderData, t_bits);
+			if (tupleDescHasOid(rowdesc))
+				attcacheoff += sizeof(Oid);
+			attcacheoff = MAXALIGN(attcacheoff);
+		}
+		
+		for (j=0; j < rowdesc->natts; j++)
+		{
+			Form_pg_attribute	attr = tupleDescAttr(rowdesc, j);
+			__init_kernel_column_metadata(kds,
+										  cmeta->idx_subattrs + j,
+										  NameStr(attr->attname),
+										  attr->attnum,
+										  attr->atttypid,
+										  attr->atttypmod,
+										  &attcacheoff);
+		}
+		ReleaseTupleDesc(rowdesc);
+	}
+	else
 	{
-		Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
-		Form_pg_type	type;
-		HeapTuple		tup;
-		int				attalign;
-		cl_char			atttypkind;
-		cl_ushort		idx_subattrs = 0;
-		cl_ushort		num_subattrs = 0;
-
-		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(attr->atttypid));
-		if (!HeapTupleIsValid(tup))
-			elog(ERROR, "cache lookup failed for type %u", attr->atttypid);
-		type = (Form_pg_type) GETSTRUCT(tup);
-		atttypkind = pg_type_to_typeKind(type);
-		if (atttypkind == TYPE_KIND__ARRAY)
+		switch (typ->typtype)
 		{
-			HeapTuple		tp;
-			Form_pg_type	elem;
-			kern_colmeta   *ctemp;
-
-			tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type->typelem));
-			if (!HeapTupleIsValid(tp))
-				elog(ERROR, "cache lookup failed for type %u", type->typelem);
-			elem = (Form_pg_type) GETSTRUCT(tp);
-
-			ctemp = cmeta + cusage;
-			ctemp->attbyval = elem->typbyval;
-			ctemp->attalign = typealign_get_width(elem->typalign);
-			ctemp->attlen   = elem->typlen;
-			ctemp->attcacheoff = -1;
-			ctemp->atttypid = type->typelem;
-			ctemp->atttypmod = -1;
-			ctemp->atttypkind = pg_type_to_typeKind(elem);
-			ctemp->idx_subattrs = 0;
-			ctemp->num_subattrs = 0;
-			if (attNames)
-				memcpy(&attNames[cusage], &attr->attname, sizeof(NameData));
-			ReleaseSysCache(tp);
-			/* colmeta[] slot for element type */
-			idx_subattrs = cusage++;
-			num_subattrs = 1;
+			case TYPTYPE_BASE:
+				cmeta->atttypkind = TYPE_KIND__BASE;
+				break;
+			case TYPTYPE_DOMAIN:
+				cmeta->atttypkind = TYPE_KIND__DOMAIN;
+				break;
+			case TYPTYPE_ENUM:
+				cmeta->atttypkind = TYPE_KIND__ENUM;
+				break;
+			case TYPTYPE_PSEUDO:
+				cmeta->atttypkind = TYPE_KIND__PSEUDO;
+				break;
+			case TYPTYPE_RANGE:
+				cmeta->atttypkind = TYPE_KIND__RANGE;
+				break;
+			default:
+				elog(ERROR, "Unexpected typtype ('%c')", typ->typtype);
+				break;
 		}
-		else if (atttypkind == TYPE_KIND__COMPOSITE)
-		{
-			NameData   *__attNames = (attNames ? attNames + cusage : NULL);
-			TupleDesc	rowdesc = lookup_rowtype_tupdesc(attr->atttypid,
-														 attr->atttypmod);
-			/* colmeta[] slot for child types */
-			idx_subattrs = cusage;
-			num_subattrs = init_kernel_tupdesc(cmeta + cusage,
-											   __attNames,
-											   rowdesc, format, NULL);
-			ReleaseTupleDesc(rowdesc);
-			cusage += num_subattrs;
-		}
-		/* setup colmeta */
-		attalign = typealign_get_width(attr->attalign);
-		if (!attr->attbyval)
-			has_notbyval = true;
-		if (attcacheoff > 0)
-		{
-			if (attr->attlen > 0)
-				attcacheoff = TYPEALIGN(attalign, attcacheoff);
-			else
-				attcacheoff = -1;	/* no more shortcut any more */
-		}
-		cmeta[j].attbyval = attr->attbyval;
-		cmeta[j].attalign = attalign;
-		cmeta[j].attlen = attr->attlen;
-		cmeta[j].attnum = attr->attnum;
-		cmeta[j].attcacheoff = attcacheoff;
-		cmeta[j].atttypid = (cl_uint)attr->atttypid;
-		cmeta[j].atttypmod = (cl_int)attr->atttypmod;
-		cmeta[j].atttypkind = atttypkind;
-		cmeta[j].idx_subattrs = idx_subattrs;
-		cmeta[j].num_subattrs = num_subattrs;
-		if (attcacheoff >= 0)
-			attcacheoff += attr->attlen;
-		if (attNames)
-			memcpy(&attNames[j], &attr->attname, sizeof(NameData));
-		ReleaseSysCache(tup);
 	}
-
-	if (p_has_notbyval)
-		*p_has_notbyval = has_notbyval;
-
-	return cusage;
+	if (p_attcacheoff)
+	{
+		if (*p_attcacheoff > 0 && typ->typlen > 0)
+			*p_attcacheoff += typ->typlen;
+		else
+			*p_attcacheoff = -1;
+	}
+	ReleaseSysCache(tup);
 }
 
 void
@@ -525,17 +511,16 @@ init_kernel_data_store(kern_data_store *kds,
 					   TupleDesc tupdesc,
 					   Size length,
 					   int format,
-					   uint nrooms,
-					   bool has_attnames)
+					   uint nrooms)
 {
 	int			j, nr_colmeta = tupdesc->natts;
-	NameData   *attNames = NULL;
+	int			attcacheoff = -1;
 
 	for (j=0; j < tupdesc->natts; j++)
 	{
 		Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
 
-		nr_colmeta += count_num_of_subfields(attr);
+		nr_colmeta += count_num_of_subfields(attr->atttypid);
 	}
 	memset(kds, 0, offsetof(kern_data_store, colmeta[nr_colmeta]));
 	kds->length = length;
@@ -544,73 +529,55 @@ init_kernel_data_store(kern_data_store *kds,
 	kds->nrooms = nrooms;
 	kds->ncols = tupdesc->natts;
 	kds->format = format;
-	kds->has_attnames = has_attnames;
-	kds->tdhasoid = tupdesc->tdhasoid;
+	kds->tdhasoid = tupleDescHasOid(tupdesc);
 	kds->tdtypeid = tupdesc->tdtypeid;
 	kds->tdtypmod = tupdesc->tdtypmod;
 	kds->table_oid = InvalidOid;	/* caller shall set */
 	kds->nslots = 0;				/* caller shall set, if any */
 	kds->nrows_per_block = 0;
-	kds->nr_colmeta = nr_colmeta;
-	attNames = KERN_DATA_STORE_ATTNAMES(kds);
+	kds->nr_colmeta = tupdesc->natts;
 
-	nr_colmeta -= init_kernel_tupdesc(kds->colmeta, attNames,
-									  tupdesc, format,
-									  &kds->has_notbyval);
-	Assert(nr_colmeta == 0);
+	if (format == KDS_FORMAT_ROW ||
+		format == KDS_FORMAT_HASH ||
+		format == KDS_FORMAT_BLOCK)
+	{
+		attcacheoff = offsetof(HeapTupleHeaderData, t_bits);
+		if (tupleDescHasOid(tupdesc))
+			attcacheoff += sizeof(Oid);
+		attcacheoff = MAXALIGN(attcacheoff);
+	}
+	else
+		attcacheoff = -1;
+	
+	for (j=0; j < tupdesc->natts; j++)
+	{
+		Form_pg_attribute	attr = tupleDescAttr(tupdesc, j);
+		__init_kernel_column_metadata(kds, j,
+									  NameStr(attr->attname),
+									  attr->attnum,
+									  attr->atttypid,
+									  attr->atttypmod,
+									  &attcacheoff);
+	}
+	Assert(kds->nr_colmeta == nr_colmeta);
 }
 
 /*
  * KDS length calculators
  */
 size_t
-KDS_calculateHeadSize(TupleDesc tupdesc, bool has_attnames)
+KDS_calculateHeadSize(TupleDesc tupdesc)
 {
-    int         j, nr_colmeta = tupdesc->natts;
-	size_t		head_sz;
+	int		j, nr_colmeta = tupdesc->natts;
 
 	for (j=0; j < tupdesc->natts; j++)
 	{
 		Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
 
-		nr_colmeta += count_num_of_subfields(attr);
+		nr_colmeta += count_num_of_subfields(attr->atttypid);
 	}
-	head_sz = STROMALIGN(offsetof(kern_data_store, colmeta[nr_colmeta]));
-	if (has_attnames)
-		head_sz += sizeof(NameData) * nr_colmeta;
-	return head_sz;
+	return STROMALIGN(offsetof(kern_data_store, colmeta[nr_colmeta]));
 }
-
-#ifdef NOT_USED
-size_t
-KDS_calculateRowSize(TupleDesc tupdesc, size_t nitems, size_t dataLen)
-{
-	size_t		headsz = KDS_calculateHeadSize(tupdesc, false);
-
-	return (headsz + STROMALIGN(sizeof(cl_uint) * (nitems)) + dataLen);
-}
-
-size_t
-KDS_calculateHashSize(TupleDesc tupdesc, size_t nitems, size_t dataLen)
-{
-	size_t		headsz = KDS_calculateHeadSize(tupdesc, false);
-	cl_uint		nslots = __KDS_NSLOTS(nitems);
-
-	return (headsz +
-			STROMALIGN(sizeof(cl_uint) * (nitems)) +
-			STROMALIGN(sizeof(cl_uint) * (nslots)) + dataLen);
-}
-
-size_t
-KDS_calculateSlotSz(TupleDesc tupdesc, size_t nitems)
-{
-	size_t		headsz = KDS_calculateHeadSize(tupdesc, false);
-	size_t		unitsz;
-
-	unitsz = LONGALIGN((sizeof(Datum) + sizeof(char)) * tupdesc->natts);
-	return (headsz + unitsz * nitems);
-}
-#endif
 
 pgstrom_data_store *
 __PDS_create_row(GpuContext *gcontext,
@@ -637,7 +604,7 @@ __PDS_create_row(GpuContext *gcontext,
 	pds->gcontext = gcontext;
 	pg_atomic_init_u32(&pds->refcnt, 1);
 	init_kernel_data_store(&pds->kds, tupdesc, bytesize,
-						   KDS_FORMAT_ROW, INT_MAX, false);
+						   KDS_FORMAT_ROW, INT_MAX);
 	pds->nblocks_uncached = 0;
 	pds->filedesc = -1;
 
@@ -655,7 +622,7 @@ __PDS_create_hash(GpuContext *gcontext,
 	CUresult	rc;
 
 	bytesize = STROMALIGN_DOWN(bytesize);
-	if (KDS_calculateHeadSize(tupdesc, false) > bytesize)
+	if (KDS_calculateHeadSize(tupdesc) > bytesize)
 		elog(ERROR, "Required length for KDS-Hash is too short");
 
 	rc = __gpuMemAllocManaged(gcontext,
@@ -672,7 +639,7 @@ __PDS_create_hash(GpuContext *gcontext,
 	pds->gcontext = gcontext;
 	pg_atomic_init_u32(&pds->refcnt, 1);
 	init_kernel_data_store(&pds->kds, tupdesc, bytesize,
-						   KDS_FORMAT_HASH, INT_MAX, false);
+						   KDS_FORMAT_HASH, INT_MAX);
 	pds->nblocks_uncached = 0;
 	pds->filedesc = -1;
 
@@ -693,7 +660,7 @@ __PDS_create_slot(GpuContext *gcontext,
 	size_t		nrooms;
 
 	bytesize = STROMALIGN_DOWN(bytesize);
-	kds_head_sz = KDS_calculateHeadSize(tupdesc, false);
+	kds_head_sz = KDS_calculateHeadSize(tupdesc);
 	if (kds_head_sz > bytesize)
 		elog(ERROR, "Required length for KDS-Slot is too short");
 	unitsz = MAXALIGN((sizeof(Datum) + sizeof(char)) * tupdesc->natts);
@@ -714,7 +681,7 @@ __PDS_create_slot(GpuContext *gcontext,
 	pg_atomic_init_u32(&pds->refcnt, 1);
 	init_kernel_data_store(&pds->kds, tupdesc,
 						   bytesize - offsetof(pgstrom_data_store, kds),
-						   KDS_FORMAT_SLOT, nrooms, false);
+						   KDS_FORMAT_SLOT, nrooms);
 	pds->nblocks_uncached = 0;
 	pds->filedesc = -1;
 
@@ -732,7 +699,7 @@ __PDS_create_block(GpuContext *gcontext,
 	size_t		bytesize;
 	CUresult	rc;
 
-	bytesize = KDS_calculateHeadSize(tupdesc, false)
+	bytesize = KDS_calculateHeadSize(tupdesc)
 		+ STROMALIGN(sizeof(BlockNumber) * nrooms)
 		+ BLCKSZ * nrooms;
 	if (offsetof(pgstrom_data_store, kds) + bytesize > pgstrom_chunk_size())
@@ -751,7 +718,7 @@ __PDS_create_block(GpuContext *gcontext,
 	pds->gcontext = gcontext;
 	pg_atomic_init_u32(&pds->refcnt, 1);
 	init_kernel_data_store(&pds->kds, tupdesc, bytesize,
-						   KDS_FORMAT_BLOCK, nrooms, false);
+						   KDS_FORMAT_BLOCK, nrooms);
     pds->kds.nrows_per_block = nvme_sstate->nrows_per_block;
     pds->nblocks_uncached = 0;
 	pds->filedesc = -1;
@@ -772,9 +739,6 @@ typedef struct _MdfdVec
 {
 	File			mdfd_vfd;		/* fd number in fd.c's pool */
 	BlockNumber		mdfd_segno;		/* segment number, from 0 */
-#if PG_VERSION_NUM < 100000
-	struct _MdfdVec *mdfd_chain;	/* next segment, or NULL */
-#endif
 } MdfdVec;
 
 static int
@@ -812,52 +776,6 @@ nvme_sstate_open_files(GpuContext *gcontext,
 	int			i, nr_segs;
 	int			fdesc;
 
-#if PG_VERSION_NUM < 100000
-	/* PG9.6 */
-	nr_segs = nvme_sstate->nr_segs;
-	memset(nvme_sstate->fdesc, -1, sizeof(int) * nr_segs);
-	for (vec = rd_smgr->md_fd[MAIN_FORKNUM];
-		 vec != NULL;
-		 vec = vec->mdfd_chain)
-	{
-		if (vec->mdfd_vfd < 0)
-			elog(ERROR, "Bug? seg=%u of relation %s is not opened",
-				 vec->mdfd_segno, RelationGetRelationName(relation));
-		if (vec->mdfd_segno >= nr_segs)
-			continue;	/* skip, out of the range */
-
-		fdesc = FileGetRawDesc(vec->mdfd_vfd);
-		if (fdesc < 0)
-			fdesc = nvme_sstate_open_segment(rd_smgr, vec->mdfd_segno);
-		else
-		{
-			fdesc = dup(fdesc);
-			if (fdesc < 0)
-				elog(ERROR, "failed on dup(2): %m");
-		}
-
-		if (!trackRawFileDesc(gcontext, fdesc, __FILE__, __LINE__))
-		{
-			close(fdesc);
-			elog(ERROR, "out of memory");
-		}
-		nvme_sstate->fdesc[vec->mdfd_segno] = fdesc;
-	}
-
-	for (i=0; i < nr_segs; i++)
-	{
-		if (nvme_sstate->fdesc[i] >= 0)
-			continue;
-		fdesc = nvme_sstate_open_segment(rd_smgr, i);
-		if (!trackRawFileDesc(gcontext, fdesc, __FILE__, __LINE__))
-		{
-			close(fdesc);
-			elog(ERROR, "out of memory");
-		}
-		nvme_sstate->fdesc[i] = fdesc;
-	}
-#else
-	/* PG10 or later */
 	nr_segs = Min(rd_smgr->md_num_open_segs[MAIN_FORKNUM],
 				  nvme_sstate->nr_segs);
 	for (i=0; i < nr_segs; i++)
@@ -896,7 +814,6 @@ nvme_sstate_open_files(GpuContext *gcontext,
 		}
 		nvme_sstate->fdesc[i] = fdesc;
 	}
-#endif
 }
 
 /*
@@ -939,7 +856,7 @@ PDS_init_heapscan_state(GpuTaskState *gts)
 	 * So, we will adjust @nblocks_per_chunk to balance chunk size all
 	 * around the relation scan.
 	 */
-	kds_head_sz = KDS_calculateHeadSize(tupdesc, false);
+	kds_head_sz = KDS_calculateHeadSize(tupdesc);
 	nrooms_max = (pgstrom_chunk_size() - kds_head_sz)
 		/ (sizeof(BlockNumber) + BLCKSZ);
 	while (kds_head_sz +
@@ -1009,7 +926,7 @@ PDS_exec_heapscan_block(pgstrom_data_store *pds,
 {
 	BlockNumber		blknum = hscan->rs_cblock;
 	BlockNumber	   *block_nums;
-	Snapshot		snapshot = hscan->rs_snapshot;
+	Snapshot		snapshot = ((TableScanDesc)hscan)->rs_snapshot;
 	BufferAccessStrategy strategy = hscan->rs_strategy;
 	SMgrRelation	smgr = relation->rd_smgr;
 	Buffer			buffer;
@@ -1149,7 +1066,7 @@ PDS_exec_heapscan_row(pgstrom_data_store *pds,
 					  HeapScanDesc hscan)
 {
 	BlockNumber		blknum = hscan->rs_cblock;
-	Snapshot		snapshot = hscan->rs_snapshot;
+	Snapshot		snapshot = ((TableScanDesc)hscan)->rs_snapshot;
 	BufferAccessStrategy strategy = hscan->rs_strategy;
 	kern_data_store	*kds = &pds->kds;
 	Buffer			buffer;
@@ -1166,7 +1083,6 @@ PDS_exec_heapscan_row(pgstrom_data_store *pds,
 	/* Load the target buffer */
 	buffer = ReadBufferExtended(relation, MAIN_FORKNUM, blknum,
 								RBM_NORMAL, strategy);
-
 #if 1
 	/* Just like heapgetpage(), however, jobs we focus on is OLAP
 	 * workload, so it's uncertain whether we should vacuum the page
@@ -1174,7 +1090,6 @@ PDS_exec_heapscan_row(pgstrom_data_store *pds,
 	 */
 	heap_page_prune_opt(relation, buffer);
 #endif
-
 	/* we will check tuple's visibility under the shared lock */
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	page = (Page) BufferGetPage(buffer);
@@ -1260,7 +1175,7 @@ bool
 PDS_exec_heapscan(GpuTaskState *gts, pgstrom_data_store *pds)
 {
 	Relation		relation = gts->css.ss.ss_currentRelation;
-	HeapScanDesc	hscan = gts->css.ss.ss_currentScanDesc;
+	HeapScanDesc	hscan = (HeapScanDesc)gts->css.ss.ss_currentScanDesc;
 	bool			retval;
 
 	CHECK_FOR_INTERRUPTS();
@@ -1305,7 +1220,7 @@ KDS_insert_tuple(kern_data_store *kds, TupleTableSlot *slot)
 	tup_index = KERN_DATA_STORE_ROWINDEX(kds);
 
 	/* reference a HeapTuple in TupleTableSlot */
-	tuple = ExecFetchSlotTuple(slot);
+	tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
 
 	/* check whether we have room for this tuple */
 	curr_usage = (__kds_unpack(kds->usage) +
@@ -1352,7 +1267,7 @@ KDS_insert_hashitem(kern_data_store *kds,
 		elog(ERROR, "Bug? unexpected data-store format: %d", kds->format);
 
 	/* compute required length */
-	tuple = ExecFetchSlotTuple(slot);
+	tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
 	curr_usage = (__kds_unpack(kds->usage) +
 				  MAXALIGN(offsetof(kern_hashitem, t.htup) + tuple->t_len));
 
@@ -1524,6 +1439,9 @@ __PDS_fillup_arrow(pgstrom_data_store *pds_dst,
 	}
 }
 
+/*
+ * PDS_fillup_arrow - fills up PDS buffer using filesystem i/o
+ */
 pgstrom_data_store *
 PDS_fillup_arrow(pgstrom_data_store *pds_src)
 {
@@ -1542,5 +1460,40 @@ PDS_fillup_arrow(pgstrom_data_store *pds_src)
 					   &pds_src->kds,
 					   pds_src->filedesc,
 					   pds_src->iovec);
+	return pds_dst;
+}
+
+/*
+ * PDS_writeback_arrow - write back PDS buffer on device memory to host
+ *                       if buffer content is not kept in host-side.
+ */
+pgstrom_data_store *
+PDS_writeback_arrow(pgstrom_data_store *pds_src,
+					CUdeviceptr m_kds_src)
+{
+	pgstrom_data_store *pds_dst;
+	CUresult		rc;
+
+	Assert(pds_src->kds.format == KDS_FORMAT_ARROW &&
+		   pds_src->iovec != NULL);
+	rc = gpuMemAllocHostRaw(pds_src->gcontext,
+							(void **)&pds_dst,
+							offsetof(pgstrom_data_store,
+									 kds) + pds_src->kds.length);
+	if (rc != CUDA_SUCCESS)
+		werror("failed on gpuMemAllocHostRaw: %s", errorText(rc));
+
+	memset(pds_dst, 0, offsetof(pgstrom_data_store, kds));
+	pds_dst->gcontext = pds_src->gcontext;
+	pg_atomic_init_u32(&pds_dst->refcnt, 1);
+	pds_dst->filedesc = -1;
+	rc = cuMemcpyDtoH(&pds_dst->kds,
+					  m_kds_src,
+					  pds_src->kds.length);
+	if (rc != CUDA_SUCCESS)
+		werror("failed on cuMemcpyDtoH: %s", errorText(rc));
+	/* detach old buffer */
+	PDS_release(pds_src);
+
 	return pds_dst;
 }

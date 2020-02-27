@@ -3,8 +3,8 @@
  *
  * Sequential scan accelerated by GPU processors
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -110,11 +110,7 @@ typedef struct {
 	GpuScanSharedState *gs_sstate;
 	GpuScanRuntimeStat *gs_rtstat;
 	HeapTupleData	scan_tuple;		/* buffer to fetch tuple */
-#if PG_VERSION_NUM < 100000
-	List		   *dev_quals;		/* quals to be run on the device */
-#else
 	ExprState	   *dev_quals;		/* quals to be run on the device */
-#endif
 	bool			dev_projection;	/* true, if device projection is valid */
 	cl_uint			proj_tuple_sz;
 	cl_uint			proj_extra_sz;
@@ -308,7 +304,7 @@ gpuscan_add_scan_path(PlannerInfo *root,
 		return;
 
 	/* We already proved the relation empty, so nothing more to do */
-	if (IS_DUMMY_REL(baserel))
+	if (is_dummy_rel(baserel))
 		return;
 
 	/* It is the role of built-in Append node */
@@ -588,7 +584,7 @@ output:
 		"                   HeapTupleHeaderData *htup)\n"
 		"{\n"
 		"  void *addr __attribute__((unused));\n"
-		"%s\n"
+		"%s%s\n"
 		"  return %s;\n"
 		"}\n\n"
 		"DEVICE_FUNCTION(cl_bool)\n"
@@ -597,13 +593,15 @@ output:
 		"                         cl_uint row_index)\n"
 		"{\n"
 		"  void *addr __attribute__((unused));\n"
-		"%s\n"
+		"%s%s\n"
 		"  return %s;\n"
 		"}\n\n",
 		component,
+		context->decl_temp.data,
 		tfunc.data,
 		!expr_code ? "true" : psprintf("EVAL(%s)", expr_code),
 		component,
+		context->decl_temp.data,
 		cfunc.data,
 		!expr_code ? "true" : psprintf("EVAL(%s)", expr_code));
 }
@@ -700,7 +698,7 @@ codegen_gpuscan_projection(StringInfo kern,
 			}
 		}
 
-		appendStringInfoString(
+		appendStringInfo(
 			kern,
 			"DEVICE_FUNCTION(void)\n"
 			"gpuscan_projection_tuple(kern_context *kcxt,\n"
@@ -896,6 +894,7 @@ codegen_gpuscan_projection(StringInfo kern,
 	/*
 	 * step.5 - execution of expression node, then store the result.
 	 */
+	resetStringInfo(&context->decl_temp);
 	resetStringInfo(&temp);
 	foreach (lc, tlist_dev)
 	{
@@ -951,7 +950,7 @@ codegen_gpuscan_projection(StringInfo kern,
 		"                         Datum   *tup_values)\n"
 		"{\n"
 		"  void        *addr __attribute__((unused));\n"
-		"%s", decl.data);
+		"%s%s", decl.data, context->decl_temp.data);
 	pgstrom_union_type_declarations(kern, "temp", type_oid_list);
 	appendStringInfo(kern, "\n%s}\n\n", tbody.data);
 	appendStringInfo(
@@ -964,7 +963,7 @@ codegen_gpuscan_projection(StringInfo kern,
 		"                         Datum   *tup_values)\n"
 		"{\n"
 		"  void        *addr __attribute__((unused));\n"
-		"%s", decl.data);
+		"%s%s", decl.data, context->decl_temp.data);
 	pgstrom_union_type_declarations(kern, "temp", type_oid_list);
 	appendStringInfo(kern, "\n%s}\n\n", cbody.data);
 
@@ -1025,6 +1024,9 @@ build_gpuscan_projection_walker(Node *node, void *__context)
 {
 	build_gpuscan_projection_context *context = __context;
 	int			extra_sz;
+
+	if (!node)
+		return false;
 
 	if (IsA(node, Var))
 	{
@@ -1172,7 +1174,7 @@ build_gpuscan_projection(PlannerInfo *root,
 	 */
 	tuple_sz = offsetof(kern_tupitem,
 						htup.t_bits[BITMAPLEN(tupdesc->natts)]);
-	if (tupdesc->tdhasoid)
+	if (tupleDescHasOid(tupdesc))
 		tuple_sz += sizeof(Oid);
 	tuple_sz = MAXALIGN(tuple_sz);
 
@@ -1243,7 +1245,7 @@ build_gpuscan_projection(PlannerInfo *root,
 no_gpu_projection:
 	tuple_sz = offsetof(kern_tupitem,
 						htup.t_bits[BITMAPLEN(tupdesc->natts)]);
-	if (tupdesc->tdhasoid)
+	if (tupleDescHasOid(tupdesc))
 		tuple_sz += sizeof(Oid);
 	tuple_sz = MAXALIGN(tuple_sz);
 	for (j=0; j < tupdesc->natts; j++)
@@ -1328,7 +1330,7 @@ PlanGpuScanPath(PlannerInfo *root,
 	 * Code construction for the CUDA kernel code
 	 */
 	rte = planner_rt_fetch(baserel->relid, root);
-	relation = heap_open(rte->relid, NoLock);
+	relation = table_open(rte->relid, NoLock);
 
 	initStringInfo(&kern);
 	pgstrom_init_codegen_context(&context, root, baserel);
@@ -1358,7 +1360,7 @@ PlanGpuScanPath(PlannerInfo *root,
 							   relation,
 							   tlist_dev,
 							   varattnos);
-	heap_close(relation, NoLock);
+	table_close(relation, NoLock);
 
 	/* save the outer_refs for columnar optimization */
 	pull_varattnos((Node *)dev_quals, baserel->relid, &varattnos);
@@ -1553,14 +1555,8 @@ pgstrom_planstate_is_gpuscan(const PlanState *ps)
 Path *
 pgstrom_copy_gpuscan_path(const Path *pathnode)
 {
-	const CustomPath   *oldpath = (const CustomPath *) pathnode;
-	CustomPath		   *newpath;
-
 	Assert(pgstrom_path_is_gpuscan(pathnode));
-	newpath = palloc0(sizeof(CustomPath));
-	memcpy(newpath, oldpath, sizeof(CustomPath));
-
-	return &newpath->path;
+	return (Path *)pmemdup(pathnode, sizeof(CustomPath));
 }
 
 /*
@@ -1663,12 +1659,23 @@ ExecInitGpuScan(CustomScanState *node, EState *estate, int eflags)
 	if (cscan->custom_scan_tlist != NIL)
 	{
 		TupleDesc		scan_tupdesc
-			= ExecCleanTypeFromTL(cscan->custom_scan_tlist, false);
-		ExecInitScanTupleSlot(estate, &gss->gts.css.ss, scan_tupdesc);
+			= ExecCleanTypeFromTL(cscan->custom_scan_tlist);
+		ExecInitScanTupleSlot(estate, &gss->gts.css.ss, scan_tupdesc,
+							  &TTSOpsHeapTuple);
 		ExecAssignScanProjectionInfoWithVarno(&gss->gts.css.ss, INDEX_VAR);
 		/* valid @custom_scan_tlist means device projection is required */
 		gss->dev_projection = true;
 	}
+	else
+	{
+		TupleDesc		scan_tupdesc = RelationGetDescr(scan_rel);
+
+		ExecInitScanTupleSlot(estate, &gss->gts.css.ss, scan_tupdesc,
+							  &TTSOpsHeapTuple);
+		ExecAssignScanProjectionInfoWithVarno(&gss->gts.css.ss,
+											  cscan->scan.scanrelid);
+	}
+
 	/* setup common GpuTaskState fields */
 	pgstromInitGpuTaskState(&gss->gts,
 							gcontext,
@@ -1693,12 +1700,7 @@ ExecInitGpuScan(CustomScanState *node, EState *estate, int eflags)
 	dev_quals_raw = (List *)
 		fixup_varnode_to_origin((Node *)gs_info->dev_quals,
 								cscan->custom_scan_tlist);
-#if PG_VERSION_NUM < 100000
-	gss->dev_quals = (List *)ExecInitExpr((Expr *)dev_quals_raw,
-										  &gss->gts.css.ss.ps);
-#else
 	gss->dev_quals = ExecInitQual(dev_quals_raw, &gss->gts.css.ss.ps);
-#endif
 
 	foreach (lc, cscan->custom_scan_tlist)
 	{
@@ -1706,17 +1708,7 @@ ExecInitGpuScan(CustomScanState *node, EState *estate, int eflags)
 
 		if (tle->resjunk)
 			break;
-#if PG_VERSION_NUM < 100000
-		/*
-		 * Caution: before PG v10, the targetList was a list of ExprStates;
-		 * now it should be the planner-created targetlist.
-		 * See, ExecBuildProjectionInfo
-		 */
-		dev_tlist = lappend(dev_tlist, ExecInitExpr((Expr *) tle,
-													&gss->gts.css.ss.ps));
-#else
 		dev_tlist = lappend(dev_tlist, tle);
-#endif
 	}
 
 	/* device projection related resource consumption */
@@ -1725,7 +1717,8 @@ ExecInitGpuScan(CustomScanState *node, EState *estate, int eflags)
 	/* 'tableoid' should not change during relation scan */
 	gss->scan_tuple.t_tableOid = RelationGetRelid(scan_rel);
 	/* initialize resource for CPU fallback */
-	gss->base_slot = MakeSingleTupleTableSlot(RelationGetDescr(scan_rel));
+	gss->base_slot = MakeSingleTupleTableSlot(RelationGetDescr(scan_rel),
+											  &TTSOpsHeapTuple);
 	if (gss->dev_projection)
 	{
 		ExprContext	   *econtext = gss->gts.css.ss.ps.ps_ExprContext;
@@ -1742,7 +1735,8 @@ ExecInitGpuScan(CustomScanState *node, EState *estate, int eflags)
 	/* init BRIN-index support, if any */
 	pgstromExecInitBrinIndexMap(&gss->gts,
 								gs_info->index_oid,
-								gs_info->index_conds);
+								gs_info->index_conds,
+								gs_info->index_quals);
 
 	/* Get CUDA program and async build if any */
 	initStringInfo(&kern_define);
@@ -1767,11 +1761,11 @@ ExecInitGpuScan(CustomScanState *node, EState *estate, int eflags)
  * on ExecScan(), all we have to do here is recheck of device qualifier.
  */
 static bool
-ExecReCheckGpuScan(CustomScanState *node, TupleTableSlot *slot)
+ExecReCheckGpuScan(CustomScanState *node, TupleTableSlot *epq_slot)
 {
 	GpuScanState   *gss = (GpuScanState *) node;
 	ExprContext	   *econtext = node->ss.ps.ps_ExprContext;
-	HeapTuple		tuple = slot->tts_tuple;
+	HeapTuple		tuple = ExecFetchSlotHeapTuple(epq_slot, false, NULL);
 	TupleTableSlot *scan_slot	__attribute__((unused));
 	ExprDoneCond	is_done		__attribute__((unused));
 	bool			retval;
@@ -1782,15 +1776,11 @@ ExecReCheckGpuScan(CustomScanState *node, TupleTableSlot *slot)
 	 * because it may not be compatible with relations's definition
 	 * if device projection is valid.
 	 */
-	ExecStoreTuple(tuple, gss->base_slot, InvalidBuffer, false);
+	ExecStoreHeapTuple(tuple, gss->base_slot, false);
 	econtext->ecxt_scantuple = gss->base_slot;
 	ResetExprContext(econtext);
 
-#if PG_VERSION_NUM < 100000
-	retval = ExecQual(gss->dev_quals, econtext, false);
-#else
 	retval = ExecQual(gss->dev_quals, econtext);
-#endif
 	if (retval && gss->base_proj)
 	{
 		/*
@@ -1799,14 +1789,9 @@ ExecReCheckGpuScan(CustomScanState *node, TupleTableSlot *slot)
 		 * into ss_ScanTupleSlot, to fit tuple descriptor of the supplied
 		 * 'slot'.
 		 */
-		Assert(!slot->tts_shouldFree);
-		ExecClearTuple(slot);
-#if PG_VERSION_NUM < 100000
-		scan_slot = ExecProject(gss->base_proj, &is_done);
-#else
+		ExecClearTuple(epq_slot);
 		scan_slot = ExecProject(gss->base_proj);
-#endif
-		Assert(scan_slot == slot);
+		Assert(scan_slot == epq_slot);
 	}
 	return retval;
 }
@@ -1928,7 +1913,6 @@ ExecGpuScanInitWorker(CustomScanState *node,
 	pgstromInitWorkerGpuTaskState(&gss->gts, coordinate);
 }
 
-#if PG_VERSION_NUM >= 100000
 static void
 ExecGpuScanReInitializeDSM(CustomScanState *node,
 						   ParallelContext *pcxt, void *coordinate)
@@ -1970,7 +1954,6 @@ ExecShutdownGpuScan(CustomScanState *node)
 		gss->gs_rtstat = gs_rtstat_new;
 	}
 }
-#endif
 
 /*
  * ExplainGpuScan - EXPLAIN callback
@@ -1979,11 +1962,7 @@ static void
 ExplainGpuScan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	GpuScanState	   *gss = (GpuScanState *) node;
-#if PG_VERSION_NUM < 100000
-	GpuScanRuntimeStat *gs_rtstat = NULL;
-#else
 	GpuScanRuntimeStat *gs_rtstat = gss->gs_rtstat;
-#endif
 	CustomScan		   *cscan = (CustomScan *) gss->gts.css.ss.ps.plan;
 	GpuScanInfo		   *gs_info = deform_gpuscan_info(cscan);
 	List			   *dcontext;
@@ -2052,7 +2031,6 @@ createGpuScanSharedState(GpuScanState *gss,
 	GpuScanRuntimeStat *gs_rtstat;
 	size_t		ss_length = MAXALIGN(sizeof(GpuScanSharedState));
 
-	Assert(!IsParallelWorker());
 	if (dsm_addr)
 		gs_sstate = dsm_addr;
 	else
@@ -2063,20 +2041,7 @@ createGpuScanSharedState(GpuScanState *gss,
 
 	gs_rtstat = &gs_sstate->gs_rtstat;
 	SpinLockInit(&gs_rtstat->c.lock);
-#if PG_VERSION_NUM < 100000
-	/*
-	 * MEMO: PG9.6 does not support ShutdownCustomScan() callback, so we have
-	 * no way to reference own custom run-time statistics on EXPLAIN.
-	 * It is a restriction of the older version, and is a specification;
-	 * when parallel query in PG9.6, EXPLAIN ANALYZE shows incorrect values.
-	 */
-	if (dsm_addr)
-	{
-		gs_rtstat = MemoryContextAllocZero(estate->es_query_cxt,
-										   sizeof(GpuScanRuntimeStat));
-		SpinLockInit(&gs_rtstat->c.lock);
-	}
-#endif
+
 	gss->gs_sstate = gs_sstate;
 	gss->gs_rtstat = gs_rtstat;
 }
@@ -2130,7 +2095,7 @@ gpuscan_create_task(GpuScanState *gss,
 			Assert(pds_src->kds.nrows_per_block > 0);
 			ntuples *= 1.5 * (double)pds_src->kds.nrows_per_block;
 		}
-		length = KDS_calculateHeadSize(scan_tupdesc, false) +
+		length = KDS_calculateHeadSize(scan_tupdesc) +
 			STROMALIGN((Size)(sizeof(cl_uint) * ntuples)) +
 			STROMALIGN((Size)(1.2 * proj_tuple_sz * ntuples / 2));
 		length = Max3(length, pds_src->kds.length, 8<<20);
@@ -2205,10 +2170,10 @@ gpuscan_next_task(GpuTaskState *gts)
 }
 
 /*
- * gpuscan_next_tuple_suspended_row
+ * gpuscan_next_tuple_suspended_tuple
  */
 static bool
-gpuscan_next_tuple_suspended_row(GpuScanState *gss, GpuScanTask *gscan)
+gpuscan_next_tuple_suspended_tuple(GpuScanState *gss, GpuScanTask *gscan)
 {
 	pgstrom_data_store *pds_src = gscan->pds_src;
 	gpuscanSuspendContext *con;
@@ -2314,7 +2279,7 @@ gpuscan_next_tuple_suspended_block(GpuScanState *gss, GpuScanTask *gscan)
 				tuple->t_tableOid = pds_src->kds.table_oid;
 				tuple->t_data = (HeapTupleHeader)((char *)hpage +
 												  ItemIdGetOffset(lpp));
-				ExecStoreTuple(tuple, gss->base_slot, InvalidBuffer, false);
+				ExecStoreHeapTuple(tuple, gss->base_slot, false);
 
 				return true;
 			}
@@ -2355,8 +2320,9 @@ retry_next:
 	ExecClearTuple(gss->base_slot);
 	if (!gscan->kern.resume_context)
 		status = PDS_fetch_tuple(gss->base_slot, pds_src, &gss->gts);
-	else if (pds_src->kds.format == KDS_FORMAT_ROW)
-		status = gpuscan_next_tuple_suspended_row(gss, gscan);
+	else if (pds_src->kds.format == KDS_FORMAT_ROW ||
+			 pds_src->kds.format == KDS_FORMAT_ARROW)
+		status = gpuscan_next_tuple_suspended_tuple(gss, gscan);
 	else if (pds_src->kds.format == KDS_FORMAT_BLOCK)
 		status = gpuscan_next_tuple_suspended_block(gss, gscan);
 	else
@@ -2373,11 +2339,8 @@ retry_next:
 	if (gss->dev_quals)
 	{
 		bool		retval;
-#if PG_VERSION_NUM < 100000
-		retval = ExecQual(gss->dev_quals, econtext, false);
-#else
+
 		retval = ExecQual(gss->dev_quals, econtext);
-#endif
 		if (!retval)
 		{
 			pg_atomic_add_fetch_u64(&gs_rtstat->c.nitems_filtered, 1);
@@ -2391,19 +2354,8 @@ retry_next:
 	if (!gss->base_proj)
 		slot = gss->base_slot;
 	else
-	{
-#if PG_VERSION_NUM < 100000
-		ExprDoneCond		is_done;
-
-		slot = ExecProject(gss->base_proj, &is_done);
-		if (is_done == ExprMultipleResult)
-			gss->gts.css.ss.ps.ps_TupFromTlist = true;
-		else if (is_done != ExprEndResult)
-			gss->gts.css.ss.ps.ps_TupFromTlist = false;
-#else
 		slot = ExecProject(gss->base_proj);
-#endif
-	}
+
 	return slot;
 }
 
@@ -2446,7 +2398,7 @@ gpuscan_next_tuple(GpuTaskState *gts)
 											 &tuple->t_self,
 											 &tuple->t_len);
 			slot = gss->gts.css.ss.ss_ScanTupleSlot;
-			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(tuple, slot, false);
 		}
 	}
 	return slot;
@@ -2512,6 +2464,7 @@ gpuscan_process_task(GpuTask *gtask, CUmodule cuda_module)
 	CUdeviceptr		m_gpuscan = (CUdeviceptr)&gscan->kern;
 	CUdeviceptr		m_kds_src = 0UL;
 	CUdeviceptr		m_kds_dst = (pds_dst ? (CUdeviceptr)&pds_dst->kds : 0UL);
+	bool			m_kds_src_release = false;
 	const char	   *kern_fname;
 	void		   *kern_args[5];
 	void		   *last_suspend = NULL;
@@ -2559,7 +2512,9 @@ gpuscan_process_task(GpuTask *gtask, CUmodule cuda_module)
 		rc = gpuMemAllocIOMap(gcontext,
 							  &m_kds_src,
 							  pds_src->kds.length);
-		if (rc == CUDA_ERROR_OUT_OF_MEMORY)
+		if (rc == CUDA_SUCCESS)
+			m_kds_src_release = true;
+		else if (rc == CUDA_ERROR_OUT_OF_MEMORY)
 		{
 			gscan->with_nvme_strom = false;
 			if (pds_src->kds.format == KDS_FORMAT_BLOCK)
@@ -2569,9 +2524,11 @@ gpuscan_process_task(GpuTask *gtask, CUmodule cuda_module)
 				rc = gpuMemAlloc(gcontext,
 								 &m_kds_src,
 								 pds_src->kds.length);
-				if (rc == CUDA_ERROR_OUT_OF_MEMORY)
+				if (rc == CUDA_SUCCESS)
+					m_kds_src_release = true;
+				else if (rc == CUDA_ERROR_OUT_OF_MEMORY)
 					goto out_of_resource;
-				else if (rc != CUDA_SUCCESS)
+				else
 					werror("failed on gpuMemAlloc: %s", errorText(rc));
 			}
 			else
@@ -2582,7 +2539,7 @@ gpuscan_process_task(GpuTask *gtask, CUmodule cuda_module)
 				Assert(!pds_src->iovec);
 			}
 		}
-		else if (rc != CUDA_SUCCESS)
+		else
 			werror("failed on gpuMemAllocIOMap: %s", errorText(rc));
 	}
 	else
@@ -2770,6 +2727,8 @@ resume_kernel:
 			 * In case of KDS_FORMAT_BLOCK, we have to write back the buffer
 			 * to host-side, because its ItemIdData might be updated, and
 			 * blocks might not be loaded yet if NVMe-Strom mode.
+			 * Due to the same reason, KDS_FORMAT_ARROW with NVMe-Strom mode
+			 * needs to write back the device buffer to host-side.
 			 */
 			if (pds_src->kds.format == KDS_FORMAT_BLOCK)
 			{
@@ -2783,7 +2742,7 @@ resume_kernel:
 			else if (pds_src->kds.format == KDS_FORMAT_ARROW &&
 					 pds_src->iovec != NULL)
 			{
-				//to be implemented
+				gscan->pds_src = PDS_writeback_arrow(pds_src, m_kds_src);
 			}
 			memset(&gscan->task.kerror, 0, sizeof(kern_errorbuf));
 			gscan->task.cpu_fallback = true;
@@ -2798,9 +2757,7 @@ resume_kernel:
 		}
 	}
 out_of_resource:
-	if (m_kds_src != 0UL &&
-		((pds_src->kds.format == KDS_FORMAT_BLOCK) ||
-		 (pds_src->kds.format == KDS_FORMAT_ARROW && pds_src->iovec)))
+	if (m_kds_src_release)
 		gpuMemFree(gcontext, m_kds_src);
 	return retval;
 }
@@ -2867,10 +2824,8 @@ pgstrom_init_gpuscan(void)
 	gpuscan_exec_methods.EstimateDSMCustomScan = ExecGpuScanEstimateDSM;
 	gpuscan_exec_methods.InitializeDSMCustomScan = ExecGpuScanInitDSM;
 	gpuscan_exec_methods.InitializeWorkerCustomScan = ExecGpuScanInitWorker;
-#if PG_VERSION_NUM >= 100000
 	gpuscan_exec_methods.ReInitializeDSMCustomScan = ExecGpuScanReInitializeDSM;
 	gpuscan_exec_methods.ShutdownCustomScan	= ExecShutdownGpuScan;
-#endif
 	gpuscan_exec_methods.ExplainCustomScan  = ExplainGpuScan;
 
 	/* hook registration */

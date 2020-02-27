@@ -3,8 +3,8 @@
  *
  * Routines to collect GPU device information.
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -146,9 +146,7 @@ pgstrom_collect_gpu_device(void)
 
 			if (strcmp(tok_attr, "DEVICE_ID") == 0)
 			{
-				if (dindex != atoi(tok_val))
-					elog(ERROR, "incorrect gpuinfo -md format");
-				devAttrs[dindex].DEV_ID = dindex;
+				devAttrs[dindex].DEV_ID = atoi(tok_val);
 			}
 			else if (strcmp(tok_attr, "DEVICE_NAME") == 0)
 			{
@@ -450,7 +448,7 @@ pgstrom_device_info(PG_FUNCTION_ARGS)
 		fncxt = SRF_FIRSTCALL_INIT();
 		oldcxt = MemoryContextSwitchTo(fncxt->multi_call_memory_ctx);
 
-		tupdesc = CreateTemplateTupleDesc(4, false);
+		tupdesc = CreateTemplateTupleDesc(4);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "device_nr",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "aindex",

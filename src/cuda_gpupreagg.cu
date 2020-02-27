@@ -4,8 +4,8 @@
  * Preprocess of aggregate using GPU acceleration, to reduce number of
  * rows to be processed by CPU; including the Sort reduction.
  * --
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -1352,7 +1352,8 @@ gpupreagg_groupby_reduction(kern_context *kcxt,
 					dest_values = slot_values;
 					break;
 				}
-				assert(cur_slot.s.index < kds_slot->nitems);
+				assert(cur_slot.s.index < kds_slot->nitems &&
+					   cur_slot.s.index != kds_index);
 				if (cur_slot.s.hash == hash_value &&
 					gpupreagg_keymatch(kcxt,
 									   kds_slot, kds_index,

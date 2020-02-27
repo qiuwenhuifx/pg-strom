@@ -1,6 +1,7 @@
 ---
 --- Micro test cases for integer operators / functions
 ---
+SET pg_strom.regression_test_mode = on;
 SET client_min_messages = error;
 DROP SCHEMA IF EXISTS regtest_dtype_int_temp CASCADE;
 CREATE SCHEMA regtest_dtype_int_temp;
@@ -19,7 +20,7 @@ CREATE TABLE rt_int (
   y    float4,
   z    float8
 );
-SELECT setseed(0.20190608);
+SELECT pgstrom.random_setseed(20190608);
 INSERT INTO rt_int (
   SELECT x, pgstrom.random_int(1,  -3200,  3200),
             pgstrom.random_int(1,  -3200,  3200),

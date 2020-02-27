@@ -3,8 +3,8 @@
  *
  * Routines related to NVME-SSD devices
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -59,7 +59,9 @@ static bool			nvme_strom_enabled;			/* GUC */
 static int			nvme_strom_threshold_kb;	/* GUC */
 static char		   *nvme_manual_distance_map;	/* GUC */
 static void			apply_nvme_manual_distance_map(void);
-
+static bool			sysfs_read_pcie_root_complex(const char *dirname,
+												 const char *my_name,
+												 List **p_pcie_root);
 /*
  * nvme_strom_threshold
  */
@@ -184,7 +186,7 @@ sysfs_read_nvme_attrs(const char *dirname, const char *nvme_name)
 			pos++;
 		else
 			pos = linebuf;
-		if (sscanf(pos, "%04x:%02x:%02x.%d",
+		if (sscanf(pos, "%x:%02x:%02x.%d",
 				   &nvmeAttr->nvme_pcie_domain,
 				   &nvmeAttr->nvme_pcie_bus_id,
 				   &nvmeAttr->nvme_pcie_dev_id,
@@ -212,7 +214,8 @@ sysfs_read_nvme_attrs(const char *dirname, const char *nvme_name)
  */
 static PCIDevEntry *
 sysfs_read_pcie_attrs(const char *dirname, const char *my_name,
-					  PCIDevEntry *parent, int depth)
+					  PCIDevEntry *parent, int depth,
+					  List **p_pcie_root)
 {
 	PCIDevEntry *entry;
 	DIR		   *dir;
@@ -224,11 +227,8 @@ sysfs_read_pcie_attrs(const char *dirname, const char *my_name,
 	entry->parent = parent;
 	if (!parent)
 	{
-		if (my_name[0] != 'p' ||
-			my_name[1] != 'c' ||
-			my_name[2] != 'i')
-			elog(ERROR, "unexpected sysfs entry: %s/%s", dirname, my_name);
-		if (sscanf(my_name+3, "%04x:%02x",
+		Assert(strncmp("pci", my_name, 3) == 0);
+		if (sscanf(my_name+3, "%x:%02x",
 				   &entry->domain,
 				   &entry->bus_id) != 2)
 			elog(ERROR, "unexpected sysfs entry: %s/%s", dirname, my_name);
@@ -238,7 +238,7 @@ sysfs_read_pcie_attrs(const char *dirname, const char *my_name,
 	}
 	else
 	{
-		if (sscanf(my_name, "%04x:%02x:%02x.%d",
+		if (sscanf(my_name, "%x:%02x:%02x.%d",
 				   &entry->domain,
 				   &entry->bus_id,
 				   &entry->dev_id,
@@ -290,31 +290,29 @@ sysfs_read_pcie_attrs(const char *dirname, const char *my_name,
 	while ((dent = readdir(dir)) != NULL)
 	{
 		PCIDevEntry *temp;
+		const char *delim = "::.";
+		char	   *pos;
 
-		/* my_name should be xxxx:xx:xx.x */
-		if (!isxdigit(dent->d_name[0]) ||
-			!isxdigit(dent->d_name[1]) ||
-			!isxdigit(dent->d_name[2]) ||
-			!isxdigit(dent->d_name[3]) ||
-			dent->d_name[4] != ':' ||
-			!isxdigit(dent->d_name[5]) ||
-            !isxdigit(dent->d_name[6]) ||
-			dent->d_name[7] != ':' ||
-			!isxdigit(dent->d_name[8]) ||
-            !isxdigit(dent->d_name[9]) ||
-			dent->d_name[10] != '.')
+		/* pcixxxx:xx sub-root? */
+		if (sysfs_read_pcie_root_complex(path, dent->d_name,
+										 p_pcie_root))
 			continue;
-		for (index=11; dent->d_name[index] != '\0'; index++)
+
+		/* elsewhere, xxxx:xx:xx.x? */
+		for (pos = dent->d_name; *pos != '\0'; pos++)
 		{
-			if (!isxdigit(dent->d_name[index]))
+			if (*pos == *delim)
+				delim++;
+			else if (*delim != '\0' ? !isxdigit(*pos) : !isdigit(*pos))
 				break;
 		}
-		if (dent->d_name[index] != '\0')
-			continue;
-
-		temp = sysfs_read_pcie_attrs(path, dent->d_name, entry, depth+1);
-		if (temp != NULL)
-			entry->children = lappend(entry->children, temp);
+		if (*pos == '\0' && *delim == '\0')
+		{
+			temp = sysfs_read_pcie_attrs(path, dent->d_name, entry, depth+1,
+										 p_pcie_root);
+			if (temp != NULL)
+				entry->children = lappend(entry->children, temp);
+		}
 	}
 	closedir(dir);
 
@@ -326,6 +324,39 @@ sysfs_read_pcie_attrs(const char *dirname, const char *my_name,
 		return NULL;
 	}
 	return entry;
+}
+
+/*
+ * sysfs_read_pcie_root_complex
+ */
+static bool
+sysfs_read_pcie_root_complex(const char *dirname,
+							 const char *my_name,
+							 List **p_pcie_root)
+{
+	const char	   *delim = ":";
+	const char	   *pos = my_name;
+	PCIDevEntry	   *entry;
+
+	if (strncmp("pci", my_name, 3) == 0)
+	{
+		for (pos = my_name+3; *pos != '\0'; pos++)
+		{
+			if (*pos == *delim)
+				delim++;
+			else if (!isxdigit(*pos))
+				break;
+		}
+		if (*pos == '\0' && *delim == '\0')
+		{
+			entry = sysfs_read_pcie_attrs(dirname, my_name, NULL, 0,
+										  p_pcie_root);
+			if (entry)
+				*p_pcie_root = lappend(*p_pcie_root, entry);
+			return true;
+		}
+	}
+	return false;
 }
 
 /*
@@ -524,13 +555,7 @@ setup_nvme_distance_map(void)
 		elog(ERROR, "failed on opendir('%s'): %m", dirname);
 	while ((dent = readdir(dir)) != NULL)
 	{
-		PCIDevEntry *pcie_item;
-
-		if (strncmp("pci", dent->d_name, 3) != 0)
-			continue;
-		pcie_item = sysfs_read_pcie_attrs(dirname, dent->d_name, NULL, 0);
-		if (pcie_item)
-			pcie_root = lappend(pcie_root, pcie_item);
+		sysfs_read_pcie_root_complex(dirname, dent->d_name, &pcie_root);
 	}
 
 	/*
@@ -607,9 +632,9 @@ setup_nvme_distance_map(void)
 				int		dist = nvme->nvme_distances[i];
 
 				if (nvme->nvme_optimal_gpu == i)
-					appendStringInfo(&str, "  (% 4d)", dist);
+					appendStringInfo(&str, "  (%4d)", dist);
 				else
-					appendStringInfo(&str, "   % 4d ", dist);
+					appendStringInfo(&str, "   %4d ", dist);
 			}
 			elog(LOG, "%s", str.data);
 		}
@@ -629,17 +654,6 @@ setup_nvme_distance_map(void)
 /*
  * apply_nvme_manual_distance_map
  */
-static inline char *__trim(char *token)
-{
-	char   *tail = token + strlen(token) - 1;
-
-	while (*token == ' ' || *token == '\t')
-		token++;
-	while (tail >= token && (*tail == ' ' || *tail == '\t'))
-		*tail-- = '\0';
-	return token;
-}
-
 static void
 apply_nvme_manual_distance_map(void)
 {
@@ -725,7 +739,7 @@ vfs_nvme_cache_callback(Datum arg, int cacheid, uint32 hashvalue)
  * GetOptimalGpuForFile
  */
 int
-GetOptimalGpuForFile(const char *fname, File fdesc)
+GetOptimalGpuForFile(File fdesc)
 {
 	StromCmd__CheckFile *uarg
 		= alloca(offsetof(StromCmd__CheckFile, rawdisks[100]));
@@ -741,7 +755,8 @@ retry:
 	{
 		ereport(DEBUG1,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("nvme_strom does not support file '%s'", fname)));
+				 errmsg("nvme_strom does not support file '%s'",
+						FilePathName(fdesc))));
 		return -1;
 	}
 	else if (uarg->ndisks > nrooms)
@@ -789,7 +804,7 @@ GetOptimalGpuForTablespace(Oid tablespace_oid)
 	bool	found;
 
 	if (!nvme_strom_enabled)
-		return false;	/* nvme_strom is not configured or disabled */
+		return -1;		/* nvme_strom is not configured or disabled */
 
 	if (!OidIsValid(tablespace_oid))
 		tablespace_oid = MyDatabaseTableSpace;
@@ -826,7 +841,7 @@ GetOptimalGpuForTablespace(Oid tablespace_oid)
 		}
 		else
 		{
-			entry->nvme_optimal_gpu = GetOptimalGpuForFile(pathname, fdesc);
+			entry->nvme_optimal_gpu = GetOptimalGpuForFile(fdesc);
 			FileClose(fdesc);
 		}
 	}

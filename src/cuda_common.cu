@@ -3,8 +3,8 @@
  *
  * Core implementation of GPU device code.
  * ----
- * Copyright 2011-2019 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2019 (C) The PG-Strom Development Team
+ * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2014-2020 (C) The PG-Strom Development Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -825,6 +825,7 @@ kern_get_datum_tuple(kern_colmeta *colmeta,
 				offset = TYPEALIGN(cmeta.attalign, offset);
 			else if (!VARATT_NOT_PAD_BYTE((char *)htup + offset))
 				offset = TYPEALIGN(cmeta.attalign, offset);
+
 			/* TODO: overrun checks here */
 			addr = ((char *) htup + offset);
 			if (i == colidx)
@@ -1004,19 +1005,77 @@ pg_datum_fetch_arrow(kern_context *kcxt,
 		{
 			case ArrowTimeUnit__Second:
 				result.isnull = false;
-				result.value = *aval * 1000000L;
+				result.value = *aval * 1000000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
 				break;
 			case ArrowTimeUnit__MilliSecond:
 				result.isnull = false;
-				result.value = *aval * 1000L;
+				result.value = *aval * 1000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
 				break;
 			case ArrowTimeUnit__MicroSecond:
 				result.isnull = false;
-				result.value = *aval;
+				result.value = *aval -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
 				break;
 			case ArrowTimeUnit__NanoSecond:
 				result.isnull = false;
-				result.value = *aval / 1000L;
+				result.value = *aval / 1000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+				break;
+			default:
+				result.isnull = true;
+				STROM_EREPORT(kcxt, ERRCODE_DATA_CORRUPTED,
+							  "corrupted unit-size of Arrow::Timestamp");
+				return;
+		}
+	}
+}
+
+DEVICE_FUNCTION(void)
+pg_datum_fetch_arrow(kern_context *kcxt,
+					 pg_timestamptz_t &result,
+					 kern_colmeta *cmeta,
+					 char *base, cl_uint rowidx)
+{
+	cl_ulong	   *aval = (cl_ulong *)
+		kern_fetch_simple_datum_arrow(cmeta,
+									  base,
+									  rowidx,
+									  sizeof(cl_ulong));
+	if (!aval)
+		result.isnull = true;
+	else
+	{
+		switch (cmeta->attopts.time.unit)
+		{
+			case ArrowTimeUnit__Second:
+				result.isnull = false;
+				result.value = *aval * 1000000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+				if (cmeta->attopts.timestamp.tz_offset != 0)
+					result.value += cmeta->attopts.timestamp.tz_offset;
+				break;
+			case ArrowTimeUnit__MilliSecond:
+				result.isnull = false;
+				result.value = *aval * 1000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+				if (cmeta->attopts.timestamp.tz_offset != 0)
+					result.value += cmeta->attopts.timestamp.tz_offset * 1000;
+				break;
+			case ArrowTimeUnit__MicroSecond:
+				result.isnull = false;
+				result.value = *aval -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+				if (cmeta->attopts.timestamp.tz_offset != 0)
+					result.value += cmeta->attopts.timestamp.tz_offset * 1000000L;
+				break;
+			case ArrowTimeUnit__NanoSecond:
+				result.isnull = false;
+				result.value = *aval / 1000L -
+					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
+				if (cmeta->attopts.timestamp.tz_offset != 0)
+					result.value += cmeta->attopts.timestamp.tz_offset * 1000000000L;
 				break;
 			default:
 				result.isnull = true;
@@ -1573,6 +1632,7 @@ STROMCL_EXTERNAL_PGARRAY_TEMPLATE(numeric)
 STROMCL_SIMPLE_PGARRAY_TEMPLATE(date)
 STROMCL_SIMPLE_PGARRAY_TEMPLATE(time)
 STROMCL_SIMPLE_PGARRAY_TEMPLATE(timestamp)
+STROMCL_SIMPLE_PGARRAY_TEMPLATE(timestamptz)
 STROMCL_SIMPLE_PGARRAY_TEMPLATE(interval)
 STROMCL_VARLENA_PGARRAY_TEMPLATE(bytea)
 STROMCL_VARLENA_PGARRAY_TEMPLATE(text)
@@ -1629,6 +1689,9 @@ __pg_array_from_arrow(kern_context *kcxt, char *dest, Datum datum)
 			break;
 		case PG_TIMESTAMPOID:
 			sz = pg_timestamp_array_from_arrow(kcxt,dest,smeta,base,start,end);
+			break;
+		case PG_TIMESTAMPTZOID:
+			sz = pg_timestamptz_array_from_arrow(kcxt,dest,smeta,base,start,end);
 			break;
 		case PG_INTERVALOID:
 			sz = pg_interval_array_from_arrow(kcxt,dest,smeta,base,start,end);
@@ -1880,6 +1943,7 @@ __pg_composite_from_arrow(kern_context *kcxt,
 				ELEMENT_ENTRY(date, PG_DATEOID);
 				ELEMENT_ENTRY(time, PG_TIMEOID);
 				ELEMENT_ENTRY(timestamp, PG_TIMESTAMPOID);
+				ELEMENT_ENTRY(timestamptz, PG_TIMESTAMPTZOID);
 				ELEMENT_ENTRY(interval, PG_INTERVALOID);
 				ELEMENT_ENTRY(bpchar, PG_BPCHAROID);
 				ELEMENT_ENTRY(text, PG_TEXTOID);
