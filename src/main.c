@@ -3,17 +3,11 @@
  *
  * Entrypoint of PG-Strom extension, and misc uncategolized functions.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
@@ -23,7 +17,6 @@ PG_MODULE_MAGIC;
  * miscellaneous GUC parameters
  */
 bool		pgstrom_enabled;
-bool		pgstrom_debug_kernel_source;
 bool		pgstrom_cpu_fallback_enabled;
 bool		pgstrom_regression_test_mode;
 static int	pgstrom_chunk_size_kb;
@@ -34,7 +27,8 @@ double		pgstrom_gpu_dma_cost;
 double		pgstrom_gpu_operator_cost;
 
 /* misc static variables */
-static planner_hook_type	planner_hook_next;
+static HTAB				   *gpu_path_htable = NULL;
+static planner_hook_type	planner_hook_next = NULL;
 static CustomPathMethods	pgstrom_dummy_path_methods;
 static CustomScanMethods	pgstrom_dummy_plan_methods;
 
@@ -43,9 +37,8 @@ long		PAGE_SIZE;
 long		PAGE_MASK;
 int			PAGE_SHIFT;
 long		PHYS_PAGES;
-
-/* SQL function declarations */
-Datum pgstrom_license_query(PG_FUNCTION_ARGS);
+int			pgstrom_num_users_extra = 0;
+pgstromUsersExtraDescriptor pgstrom_users_extra_desc[8];
 
 /* pg_strom.chunk_size */
 Size
@@ -71,15 +64,6 @@ pgstrom_init_common_guc(void)
 							 "Enables CPU fallback if GPU required re-run",
 							 NULL,
 							 &pgstrom_cpu_fallback_enabled,
-							 false,
-							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
-							 NULL, NULL, NULL);
-	/* turn on/off cuda kernel source saving */
-	DefineCustomBoolVariable("pg_strom.debug_kernel_source",
-							 "Turn on/off to display the kernel source path",
-							 NULL,
-							 &pgstrom_debug_kernel_source,
 							 false,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
@@ -135,8 +119,136 @@ pgstrom_init_common_guc(void)
 							 &pgstrom_regression_test_mode,
 							 false,
 							 PGC_USERSET,
-							 GUC_NOT_IN_SAMPLE,
+							 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
+}
+
+/*
+ * GPU-aware path tracker
+ *
+ * motivation: add_path() and add_partial_path() keeps only cheapest paths.
+ * Once some other dominates GpuXXX paths, it shall be wiped out, even if
+ * it potentially has a chance for more optimization (e.g, GpuJoin outer
+ * pull-up, GpuPreAgg + GpuJoin combined mode).
+ * So, we preserve PG-Strom related Path-nodes for the later referenced.
+ */
+typedef struct
+{
+	PlannerInfo	   *root;
+	Relids			relids;
+	bool			outer_parallel;
+	bool			inner_parallel;
+	const Path	   *cheapest_gpu_path;
+} gpu_path_entry;
+
+static uint32
+gpu_path_entry_hashvalue(const void *key, Size keysize)
+{
+	gpu_path_entry *gent = (gpu_path_entry *)key;
+	uint32		hash;
+	uint32		flags = 0;
+
+	Assert(keysize == 0);
+	hash = hash_uint32(((uintptr_t)gent->root & 0xffffffffUL) ^
+					   ((uintptr_t)gent->root >> 32));
+	if (gent->relids != NULL)
+	{
+		Bitmapset  *relids = gent->relids;
+		
+		hash ^= hash_any((unsigned char *)relids,
+						 offsetof(Bitmapset, words[relids->nwords]));
+	}
+	if (gent->outer_parallel)
+		flags |= 0x01;
+	if (gent->inner_parallel)
+		flags |= 0x02;
+	hash ^= hash_uint32(flags);
+
+	return hash;
+}
+
+static int
+gpu_path_entry_compare(const void *key1, const void *key2, Size keysize)
+{
+	gpu_path_entry *gent1 = (gpu_path_entry *)key1;
+	gpu_path_entry *gent2 = (gpu_path_entry *)key2;
+
+	Assert(keysize == 0);
+
+	if (gent1->root == gent2->root &&
+		bms_equal(gent1->relids, gent2->relids) &&
+		gent1->outer_parallel == gent2->outer_parallel &&
+		gent1->inner_parallel == gent2->inner_parallel)
+		return 0;
+	/* not equal */
+	return 1;
+}
+
+static void *
+gpu_path_entry_keycopy(void *dest, const void *src, Size keysize)
+{
+	gpu_path_entry *dent = (gpu_path_entry *)dest;
+	const gpu_path_entry *sent = (const gpu_path_entry *)src;
+
+	Assert(keysize == 0);
+	dent->root = sent->root;
+	dent->relids = bms_copy(sent->relids);
+	dent->outer_parallel = sent->outer_parallel;
+	dent->inner_parallel = sent->inner_parallel;
+
+	return dest;
+}
+
+const Path *
+gpu_path_find_cheapest(PlannerInfo *root, RelOptInfo *rel,
+					   bool outer_parallel,
+					   bool inner_parallel)
+{
+	gpu_path_entry	hkey;
+	gpu_path_entry *gent;
+
+	memset(&hkey, 0, sizeof(gpu_path_entry));
+	hkey.root = root;
+	hkey.relids = rel->relids;
+	hkey.outer_parallel = outer_parallel;
+	hkey.inner_parallel = inner_parallel;
+
+	gent = hash_search(gpu_path_htable, &hkey, HASH_FIND, NULL);
+	if (!gent)
+		return NULL;
+	return gent->cheapest_gpu_path;
+}
+
+bool
+gpu_path_remember(PlannerInfo *root, RelOptInfo *rel,
+				  bool outer_parallel,
+				  bool inner_parallel,
+				  const Path *gpu_path)
+{
+	gpu_path_entry	hkey;
+	gpu_path_entry *gent;
+	bool			found;
+
+	memset(&hkey, 0, sizeof(gpu_path_entry));
+	hkey.root = root;
+	hkey.relids = rel->relids;
+	hkey.outer_parallel = outer_parallel;
+	hkey.inner_parallel = inner_parallel;
+
+	gent = hash_search(gpu_path_htable, &hkey, HASH_ENTER, &found);
+	if (found)
+	{
+		/* new path is more expensive than prior one! */
+		if (gent->cheapest_gpu_path->total_cost < gpu_path->total_cost)
+			return false;
+	}
+	Assert(gent->root == root &&
+		   bms_equal(gent->relids, rel->relids) &&
+		   gent->outer_parallel == outer_parallel &&
+		   gent->inner_parallel == inner_parallel);
+	gent->cheapest_gpu_path = pgstrom_copy_pathnode(gpu_path);
+
+	return true;
 }
 
 /*
@@ -348,16 +460,52 @@ pgstrom_post_planner_recurse(PlannedStmt *pstmt, Plan **p_plan)
 
 static PlannedStmt *
 pgstrom_post_planner(Query *parse,
+#if PG_VERSION_NUM >= 130000
+					 const char *query_string,
+#endif
 					 int cursorOptions,
 					 ParamListInfo boundParams)
 {
+	HTAB		   *gpu_path_htable_saved = gpu_path_htable;
 	PlannedStmt	   *pstmt;
 	ListCell	   *lc;
 
-	if (planner_hook_next)
-		pstmt = planner_hook_next(parse, cursorOptions, boundParams);
-	else
-		pstmt = standard_planner(parse, cursorOptions, boundParams);
+	PG_TRY();
+	{
+		HASHCTL		hctl;
+
+		/* make hash-table to preserve GPU-aware path-nodes */
+		memset(&hctl, 0, sizeof(HASHCTL));
+		hctl.hcxt = CurrentMemoryContext;
+		hctl.keysize = 0;
+		hctl.entrysize = sizeof(gpu_path_entry);
+		hctl.hash = gpu_path_entry_hashvalue;
+		hctl.match = gpu_path_entry_compare;
+		hctl.keycopy = gpu_path_entry_keycopy;
+		gpu_path_htable = hash_create("GPU-aware Path-nodes table",
+									  512,
+									  &hctl,
+									  HASH_CONTEXT |
+									  HASH_ELEM |
+									  HASH_FUNCTION |
+									  HASH_COMPARE |
+									  HASH_KEYCOPY);
+		pstmt = planner_hook_next(parse,
+#if PG_VERSION_NUM >= 130000
+								  query_string,
+#endif
+								  cursorOptions,
+								  boundParams);
+	}
+	PG_CATCH();
+	{
+		hash_destroy(gpu_path_htable);
+		gpu_path_htable = gpu_path_htable_saved;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	hash_destroy(gpu_path_htable);
+	gpu_path_htable = gpu_path_htable_saved;
 
 	pgstrom_post_planner_recurse(pstmt, &pstmt->planTree);
 	foreach (lc, pstmt->subplans)
@@ -367,169 +515,34 @@ pgstrom_post_planner(Query *parse,
 }
 
 /*
- * commercial_license_expired_at
+ * Routines to support user's extra GPU logic
  */
-static TimestampTz	commercial_license_expired_timestamp = MIN_TIMESTAMP - 1;
-
-TimestampTz
-commercial_license_expired_at(void)
+uint32
+pgstrom_register_users_extra(const pgstromUsersExtraDescriptor *__desc)
 {
-	return commercial_license_expired_timestamp;
-}
+	pgstromUsersExtraDescriptor *desc;
+	const char *extra_name;
+	uint32		extra_flags;
 
-/*
- * pgstrom_license_query
- */
-static bool
-commercial_license_query(StringInfo buf)
-{
-	StromCmd__LicenseInfo *cmd;
-	size_t		buffer_sz = 10000;
-	int			fdesc;
-	int			i_year, i_mon, i_day;
-	int			e_year, e_mon, e_day;
-	int			i;
-	struct tm	tm;
-	TimestampTz	tv;
+	if (pgstrom_num_users_extra >= 7)
+		elog(ERROR, "too much PG-Strom users' extra module is registered");
+	if (__desc->magic != PGSTROM_USERS_EXTRA_MAGIC_V1)
+		elog(ERROR, "magic number of pgstromUsersExtraDescriptor mismatch");
+	if (__desc->pg_version / 100 != PG_MAJOR_VERSION)
+		elog(ERROR, "PG-Strom Users Extra is built for %u", __desc->pg_version);
 
-	cmd = alloca(sizeof(StromCmd__LicenseInfo) + buffer_sz);
-	memset(cmd, 0, sizeof(StromCmd__LicenseInfo));
-	cmd->buffer_sz = buffer_sz;
+	extra_name = strdup(__desc->extra_name);
+	if (!extra_name)
+		elog(ERROR, "out of memory");
+	extra_flags = (1U << (pgstrom_num_users_extra + 24));
 
-	fdesc = open(NVME_STROM_IOCTL_PATHNAME, O_RDONLY);
-	if (fdesc < 0)
-	{
-		if (errno == ENOENT)
-			elog(LOG, "PG-Strom: nvme_strom driver is not installed");
-		else
-			elog(LOG, "failed to open \"%s\": %m", NVME_STROM_IOCTL_PATHNAME);
-		return false;
-	}
-	if (ioctl(fdesc, STROM_IOCTL__LICENSE_QUERY, cmd) != 0)
-	{
-		if (errno == EINVAL)
-			elog(LOG, "PG-Strom: no valid commercial license is installed");
-		else if (errno == EKEYEXPIRED)
-			elog(LOG, "PG-Strom: commercial license is expired");
-		else
-			elog(LOG, "PG-Strom: failed on STROM_IOCTL__LICENSE_QUERY: %m");
-		close(fdesc);
-		return false;
-	}
-	/* convert to text */
-	i_year = (cmd->issued_at / 10000);
-	i_mon  = (cmd->issued_at / 100) % 100;
-	i_day  = (cmd->issued_at % 100);
-	e_year = (cmd->expired_at / 10000);
-	e_mon  = (cmd->expired_at / 100) % 100;
-	e_day  = (cmd->expired_at % 100);
-
-	if (i_year < 2000 || i_year > 9999 || i_mon < 1 || i_mon > 12)
-	{
-		elog(LOG, "Strange date in the ISSUED_AT field: %08d",
-			 cmd->issued_at);
-		close(fdesc);
-		return false;
-	}
-	if (e_year < 2000 || e_year > 9999 || e_mon < 1 || e_mon > 12)
-	{
-		elog(LOG, "Strange date in the EXPIRED_AT_AT field: %08d",
-			 cmd->expired_at);
-		close(fdesc);
-		return false;
-	}
-
-	/* update expired timestamp */
-	memset(&tm, 0, sizeof(struct tm));
-	tm.tm_year = e_year;
-	tm.tm_mon  = e_mon;
-	tm.tm_mday = e_day;
-	tv = (TimestampTz) mktime(&tm) -
-		((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
-	tv = (tv + SECS_PER_DAY - 1) * USECS_PER_SEC;
-	if (!IS_VALID_TIMESTAMP(commercial_license_expired_timestamp) ||
-		tv > commercial_license_expired_timestamp)
-		commercial_license_expired_timestamp = tv;
-
-	/* make a JSON string  */
-	appendStringInfo(buf,
-					 "{ \"version\" : %u",
-					 cmd->version);
-	if (cmd->serial_nr)
-		appendStringInfo(buf,
-						 ", \"serial_nr\" : %s",
-						 quote_identifier(cmd->serial_nr));
-	appendStringInfo(buf,
-					 ", \"issued_at\" : \"%d-%s-%d\""
-					 ", \"expired_at\" : \"%d-%s-%d\"",
-					 i_day, months[i_mon-1], i_year,
-					 e_day, months[e_mon-1], e_year);
-	if (cmd->licensee_org)
-		appendStringInfo(buf,
-						 ", \"licensee_org\" : %s",
-						 quote_identifier(cmd->licensee_org));
-	if (cmd->licensee_name)
-		appendStringInfo(buf,
-						 ", \"licensee_name\" : %s",
-						 quote_identifier(cmd->licensee_name));
-	if (cmd->licensee_mail)
-		appendStringInfo(buf,
-						 ", \"licensee_mail\" : %s",
-						 quote_identifier(cmd->licensee_mail));
-	if (cmd->description)
-		appendStringInfo(buf,
-						 ", \"description\" : %s",
-						 quote_identifier(cmd->description));
-	if (cmd->nr_gpus > 0)
-	{
-		appendStringInfo(buf, ", \"gpus\" : [");
-		for (i=0; i < cmd->nr_gpus; i++)
-		{
-			appendStringInfo(
-				buf,
-				"%s{ \"uuid\" : \"%s\", \"pci_id\" : \"%04x:%02x:%02x.%d\" }",
-				(i == 0 ? " " : " , "),
-				cmd->u.gpus[i].uuid,
-				cmd->u.gpus[i].domain,
-				cmd->u.gpus[i].bus_id,
-				cmd->u.gpus[i].dev_id,
-				cmd->u.gpus[i].func_id);
-		}
-		appendStringInfo(buf, " ]");
-	}
-	appendStringInfo(buf, " }");
-
-	return true;
-}
-
-Datum
-pgstrom_license_query(PG_FUNCTION_ARGS)
-{
-	StringInfoData	buf;
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("only superuser can query commercial license"))));
-	initStringInfo(&buf);
-	if (!commercial_license_query(&buf))
-		PG_RETURN_NULL();
-	PG_RETURN_POINTER(DirectFunctionCall1(json_in, PointerGetDatum(buf.data)));
-}
-PG_FUNCTION_INFO_V1(pgstrom_license_query);
-
-/*
- * check_heterodb_license
- */
-static void
-check_heterodb_license(void)
-{
-	StringInfoData	buf;
-
-	initStringInfo(&buf);
-	if (commercial_license_query(&buf))
-		elog(LOG, "HeteroDB License: %s", buf.data);
-	pfree(buf.data);
+	desc = &pgstrom_users_extra_desc[pgstrom_num_users_extra++];
+	memcpy(desc, __desc, sizeof(pgstromUsersExtraDescriptor));
+	desc->extra_flags = extra_flags;
+	desc->extra_name  = extra_name;
+	elog(LOG, "PG-Strom users's extra [%s] registered", extra_name);
+	
+	return extra_flags;
 }
 
 /*
@@ -550,8 +563,15 @@ _PG_init(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 		errmsg("PG-Strom must be loaded via shared_preload_libraries")));
 
-	/* link nvrtc library according to the current CUDA version */
+	/* init misc variables */
+	PAGE_SIZE = sysconf(_SC_PAGESIZE);
+	PAGE_MASK = PAGE_SIZE - 1;
+	PAGE_SHIFT = get_next_log2(PAGE_SIZE);
+	PHYS_PAGES = sysconf(_SC_PHYS_PAGES);
+
+	/* load NVIDIA/HeteroDB related stuff, if any */
 	pgstrom_init_nvrtc();
+	pgstrom_init_extra();
 
 	/* dump version number */
 #ifdef PGSTROM_VERSION
@@ -560,12 +580,6 @@ _PG_init(void)
 #else
 	elog(LOG, "PG-Strom built for PostgreSQL %s", PG_MAJORVERSION);
 #endif
-	/* init misc variables */
-	PAGE_SIZE = sysconf(_SC_PAGESIZE);
-	PAGE_MASK = PAGE_SIZE - 1;
-	PAGE_SHIFT = get_next_log2(PAGE_SIZE);
-	PHYS_PAGES = sysconf(_SC_PHYS_PAGES);
-
 	/* init GPU/CUDA infrastracture */
 	pgstrom_init_common_guc();
 	pgstrom_init_shmbuf();
@@ -573,20 +587,16 @@ _PG_init(void)
 	pgstrom_init_gpu_mmgr();
 	pgstrom_init_gpu_context();
 	pgstrom_init_cuda_program();
-	pgstrom_init_nvme_strom();
 	pgstrom_init_codegen();
 
 	/* init custom-scan providers/FDWs */
 	pgstrom_init_gputasks();
 	pgstrom_init_gpuscan();
 	pgstrom_init_gpujoin();
-	pgstrom_init_inners();
 	pgstrom_init_gpupreagg();
 	pgstrom_init_relscan();
 	pgstrom_init_arrow_fdw();
-
-	/* check commercial license, if any */
-	check_heterodb_license();
+	pgstrom_init_gpu_cache();
 
 	/* dummy custom-scan node */
 	memset(&pgstrom_dummy_path_methods, 0, sizeof(CustomPathMethods));
@@ -600,6 +610,6 @@ _PG_init(void)
 		= pgstrom_dummy_create_scan_state;
 
 	/* planner hook registration */
-	planner_hook_next = planner_hook;
+	planner_hook_next = (planner_hook ? planner_hook : standard_planner);
 	planner_hook = pgstrom_post_planner;
 }

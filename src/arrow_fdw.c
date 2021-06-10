@@ -3,17 +3,11 @@
  *
  * Routines to map Apache Arrow files as PG's Foreign-Table.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 #include "arrow_defs.h"
@@ -43,6 +37,7 @@ typedef struct RecordBatchFieldState
 typedef struct RecordBatchState
 {
 	File		fdesc;
+	GPUDirectFileDesc *dfile;
 	struct stat	stat_buf;
 	int			rb_index;	/* index number in a file */
 	off_t		rb_offset;	/* offset from the head */
@@ -98,6 +93,18 @@ typedef struct
 	dlist_head	gpubuf_slots[ARROW_GPUBUF_HASH_NSLOTS];
 } arrowMetadataState;
 
+/* setup of MetadataCacheKey */
+static inline int
+initMetadataCacheKey(MetadataCacheKey *mkey, dev_t st_dev, ino_t st_ino)
+{
+	memset(mkey, 0, sizeof(MetadataCacheKey));
+	mkey->st_dev	= st_dev;
+	mkey->st_ino	= st_ino;
+	mkey->hash		= hash_any((unsigned char *)mkey,
+							   offsetof(MetadataCacheKey, hash));
+	return mkey->hash % ARROW_METADATA_HASH_NSLOTS;
+}
+
 /*
  * MVCC state for the pending writes
  */
@@ -138,7 +145,6 @@ typedef struct
 	File		file;
 	MetadataCacheKey key;
 	uint32		hash;
-	bool		redo_log_written;
 	SQLtable	sql_table;
 } arrowWriteState;
 
@@ -147,7 +153,9 @@ typedef struct
  */
 struct ArrowFdwState
 {
-	List	   *fdescList;
+	GpuContext *gcontext;			/* valid if owned by GpuXXX plan */
+	List	   *gpuDirectFileDescList;	/* list of GPUDirectFileDesc */
+	List	   *fdescList;				/* list of File (buffered i/o) */
 	Bitmapset  *referenced;
 	pg_atomic_uint32   *rbatch_index;
 	pg_atomic_uint32	__rbatch_index_local;	/* if single process exec */
@@ -222,9 +230,9 @@ static void		pg_datum_arrow_ref(kern_data_store *kds,
 								   Datum *p_datum,
 								   bool *p_isnull);
 /* routines for writable arrow_fdw foreign tables */
-static arrowWriteState *createArrowWriteState(Relation frel, File file,
-											  bool redo_log_written);
-static void createArrowWriteRedoLog(File filp, bool is_newfile);
+static void	setupArrowSQLbufferSchema(SQLtable *table, TupleDesc tupdesc);
+static void setupArrowSQLbufferBatches(SQLtable *table);
+static loff_t createArrowWriteRedoLog(File filp, bool is_newfile);
 static void writeOutArrowRecordBatch(arrowWriteState *aw_state,
 									 bool with_footer);
 
@@ -236,6 +244,7 @@ Datum	pgstrom_arrow_fdw_export_cupy(PG_FUNCTION_ARGS);
 Datum	pgstrom_arrow_fdw_export_cupy_pinned(PG_FUNCTION_ARGS);
 Datum	pgstrom_arrow_fdw_unpin_gpu_buffer(PG_FUNCTION_ARGS);
 Datum	pgstrom_arrow_fdw_put_gpu_buffer(PG_FUNCTION_ARGS);
+Datum	pgstrom_arrow_fdw_import_file(PG_FUNCTION_ARGS);
 
 /*
  * timespec_comp - compare timespec values
@@ -274,6 +283,23 @@ baseRelIsArrowFdw(RelOptInfo *baserel)
 }
 
 /*
+ * RelationIsArrowFdw
+ */
+bool
+RelationIsArrowFdw(Relation frel)
+{
+	if (RelationGetForm(frel)->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		FdwRoutine *routine = GetFdwRoutineForRelation(frel, false);
+
+		if (memcmp(routine, &pgstrom_arrow_fdw_routine,
+				   sizeof(FdwRoutine)) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
  * RecordBatchFieldCount
  */
 static int
@@ -304,16 +330,12 @@ RecordBatchFieldCount(RecordBatchState *rbstate)
 static size_t
 RecordBatchFieldLength(RecordBatchFieldState *fstate)
 {
-	size_t	len = 0;
+	size_t	len;
 	int		j;
 
-	if (fstate->nullmap_offset > 0)
-		len += fstate->nullmap_length;
-	if (fstate->values_offset > 0)
-		len += fstate->values_length;
-	if (fstate->extra_offset > 0)
-		len += fstate->extra_length;
-	len = BLCKALIGN(len);
+	len = BLCKALIGN(fstate->nullmap_length +
+					fstate->values_length +
+					fstate->extra_length);
 	for (j=0; j < fstate->num_children; j++)
 		len += RecordBatchFieldLength(&fstate->children[j]);
 	return len;
@@ -431,7 +453,6 @@ ArrowGetForeignRelSize(PlannerInfo *root,
 			optimal_gpu = k;
 		else if (optimal_gpu != k)
 			optimal_gpu = -1;
-
 		rb_cached = arrowLookupOrBuildMetadataCache(fdesc);
 		foreach (cell, rb_cached)
 		{
@@ -466,7 +487,7 @@ ArrowGetForeignRelSize(PlannerInfo *root,
 
 	if (optimal_gpu < 0 || optimal_gpu >= numDevAttrs)
 		optimal_gpu = -1;
-	else if (filesSizeTotal < nvme_strom_threshold())
+	else if (filesSizeTotal < pgstrom_gpudirect_threshold())
 		optimal_gpu = -1;
 
 	baserel->rel_parallel_workers = parallel_nworkers;
@@ -678,61 +699,6 @@ ArrowGetForeignPlan(PlannerInfo *root,
 							outer_plan);
 }
 
-/*
- * getTimezoneOffset - returns timezone offset in second
- */
-static int64_t
-getTimezoneOffset(const char *timezone)
-{
-	char		tzname[TZ_STRLEN_MAX + 1];
-	char	   *lowzone;
-	int			tz;
-	int			type, val;
-	pg_tz	   *tzp;
-
-	if (!timezone)
-		return 0;	/* no timezone adjustment */
-
-	strncpy(tzname, timezone, sizeof(tzname));
-	lowzone = downcase_truncate_identifier(tzname, strlen(tzname), false);
-	type = DecodeTimezoneAbbrev(0, lowzone, &val, &tzp);
-	if (type == TZ || type == DTZ)
-	{
-		/* fixed-offset abbreviation */
-		tz = -val;
-	}
-	else if (type == DYNTZ)
-	{
-		/* dynamic-offset abbreviation, resolve using current time */
-		pg_time_t	now = (pg_time_t) time(NULL);
-		struct pg_tm *tm;
-
-		tm = pg_localtime(&now, tzp);
-		tz = DetermineTimeZoneAbbrevOffset(tm, tzname, tzp);
-	}
-	else
-	{
-		/* try it as a full zone name */
-		tzp = pg_tzset(tzname);
-		if (tzp)
-		{
-			pg_time_t	now = (pg_time_t) time(NULL);
-			struct pg_tm *tm;
-
-			tm = pg_localtime(&now, tzp);
-			tz = -tm->tm_gmtoff;
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("time zone \"%s\" not recognized", timezone)));
-		}
-	}
-//	elog(INFO, "getTimezoneOffset: timezone=[%s] tz_offset=%d", timezone, tz);
-	return tz;
-}
-
 typedef struct
 {
 	ArrowBuffer    *buffer_curr;
@@ -781,8 +747,6 @@ assignArrowTypeOptions(ArrowTypeOptions *attopts, const ArrowType *atype)
 				attopts->timestamp.unit = atype->Timestamp.unit;
 			else
 				elog(ERROR, "unknown unit of Timestamp");
-			attopts->timestamp.tz_offset
-				= getTimezoneOffset(atype->Timestamp.timezone);
 			break;
 		case ArrowNodeTag__Interval:
 			if (atype->Interval.unit == ArrowIntervalUnit__Year_Month ||
@@ -790,6 +754,9 @@ assignArrowTypeOptions(ArrowTypeOptions *attopts, const ArrowType *atype)
 				attopts->interval.unit = atype->Interval.unit;
 			else
 				elog(ERROR, "unknown unit of Interval");
+			break;
+		case ArrowNodeTag__FixedSizeBinary:
+			attopts->fixed_size_binary.byteWidth = atype->FixedSizeBinary.byteWidth;
 			break;
 		default:
 			/* no extra attributes */
@@ -834,8 +801,7 @@ setupRecordBatchField(setupRecordBatchContext *con,
 				fstate->nullmap_length = buffer_curr->length;
 				if (fstate->nullmap_length < BITMAPLEN(fstate->nitems))
 					elog(ERROR, "nullmap length is smaller than expected");
-				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-					(fstate->nullmap_length & (MAXIMUM_ALIGNOF - 1)) != 0)
+				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
 					elog(ERROR, "nullmap is not aligned well");
 			}
 			buffer_curr = con->buffer_curr++;
@@ -843,8 +809,7 @@ setupRecordBatchField(setupRecordBatchContext *con,
 			fstate->values_length = buffer_curr->length;
 			if (fstate->values_length < arrowFieldLength(field,fstate->nitems))
 				elog(ERROR, "values array is smaller than expected");
-			if ((fstate->values_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-				(fstate->values_length & (MAXIMUM_ALIGNOF - 1)) != 0)
+			if ((fstate->values_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
 				elog(ERROR, "values array is not aligned well");
 			break;
 
@@ -863,8 +828,7 @@ setupRecordBatchField(setupRecordBatchContext *con,
 				fstate->nullmap_length = buffer_curr->length;
 				if (fstate->nullmap_length < BITMAPLEN(fstate->nitems))
 					elog(ERROR, "nullmap length is smaller than expected");
-				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-					(fstate->nullmap_length & (MAXIMUM_ALIGNOF - 1)) != 0)
+				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
 					elog(ERROR, "nullmap is not aligned well");
 			}
 			/* offset values */
@@ -873,8 +837,7 @@ setupRecordBatchField(setupRecordBatchContext *con,
 			fstate->values_length = buffer_curr->length;
 			if (fstate->values_length < arrowFieldLength(field,fstate->nitems))
 				elog(ERROR, "offset array is smaller than expected");
-			if ((fstate->values_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-				(fstate->values_length & (MAXIMUM_ALIGNOF - 1)) != 0)
+			if ((fstate->values_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
 				elog(ERROR, "offset array is not aligned well");
 			/* setup array element */
 			fstate->children = palloc0(sizeof(RecordBatchFieldState));
@@ -897,8 +860,7 @@ setupRecordBatchField(setupRecordBatchContext *con,
 				fstate->nullmap_length = buffer_curr->length;
 				if (fstate->nullmap_length < BITMAPLEN(fstate->nitems))
 					elog(ERROR, "nullmap length is smaller than expected");
-				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-					(fstate->nullmap_length & (MAXIMUM_ALIGNOF - 1)) != 0)
+				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
 					elog(ERROR, "nullmap is not aligned well");
 			}
 
@@ -907,15 +869,13 @@ setupRecordBatchField(setupRecordBatchContext *con,
 			fstate->values_length = buffer_curr->length;
 			if (fstate->values_length < arrowFieldLength(field,fstate->nitems))
 				elog(ERROR, "offset array is smaller than expected");
-			if ((fstate->values_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-				(fstate->values_length & (MAXIMUM_ALIGNOF - 1)) != 0)
-				elog(ERROR, "offset array is not aligned well");
+			if ((fstate->values_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
+				elog(ERROR, "offset array is not aligned well (%lu %lu)", fstate->values_offset, fstate->values_length);
 
 			buffer_curr = con->buffer_curr++;
 			fstate->extra_offset = buffer_curr->offset;
 			fstate->extra_length = buffer_curr->length;
-			if ((fstate->extra_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-				(fstate->extra_length & (MAXIMUM_ALIGNOF - 1)) != 0)
+			if ((fstate->extra_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
 				elog(ERROR, "extra buffer is not aligned well");
 			break;
 
@@ -932,8 +892,7 @@ setupRecordBatchField(setupRecordBatchContext *con,
 				fstate->nullmap_length = buffer_curr->length;
 				if (fstate->nullmap_length < BITMAPLEN(fstate->nitems))
 					elog(ERROR, "nullmap length is smaller than expected");
-				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0 ||
-					(fstate->nullmap_length & (MAXIMUM_ALIGNOF - 1)) != 0)
+				if ((fstate->nullmap_offset & (MAXIMUM_ALIGNOF - 1)) != 0)
 					elog(ERROR, "nullmap is not aligned well");
 			}
 
@@ -999,12 +958,13 @@ makeRecordBatchState(ArrowSchema *schema,
  * ExecInitArrowFdw
  */
 ArrowFdwState *
-ExecInitArrowFdw(Relation relation, Bitmapset *outer_refs)
+ExecInitArrowFdw(GpuContext *gcontext, Relation relation, Bitmapset *outer_refs)
 {
 	TupleDesc		tupdesc = RelationGetDescr(relation);
 	ForeignTable   *ft = GetForeignTable(RelationGetRelid(relation));
 	List		   *filesList = NIL;
 	List		   *fdescList = NIL;
+	List		   *gpuDirectFileDescList = NIL;
 	Bitmapset	   *referenced = NULL;
 	bool			whole_row_ref = false;
 	ArrowFdwState  *af_state;
@@ -1039,6 +999,7 @@ ExecInitArrowFdw(Relation relation, Bitmapset *outer_refs)
 		File		fdesc;
 		List	   *rb_cached = NIL;
 		ListCell   *cell;
+		GPUDirectFileDesc *dfile = NULL;
 
 		fdesc = PathNameOpenFile(fname, O_RDONLY | PG_BINARY);
 		if (fdesc < 0)
@@ -1050,6 +1011,22 @@ ExecInitArrowFdw(Relation relation, Bitmapset *outer_refs)
 		}
 		fdescList = lappend_int(fdescList, fdesc);
 
+		/*
+		 * Open file for GPUDirect I/O
+		 */
+		if (gcontext)
+		{
+			dfile = palloc0(sizeof(GPUDirectFileDesc));
+
+			gpuDirectFileDescOpen(dfile, fdesc);
+			if (!trackRawFileDesc(gcontext, dfile, __FILE__, __LINE__))
+			{
+				gpuDirectFileDescClose(dfile);
+				elog(ERROR, "out of memory");
+			}
+			gpuDirectFileDescList = lappend(gpuDirectFileDescList, dfile);
+		}
+
 		rb_cached = arrowLookupOrBuildMetadataCache(fdesc);
 		/* check schema compatibility */
 		foreach (cell, rb_cached)
@@ -1059,11 +1036,15 @@ ExecInitArrowFdw(Relation relation, Bitmapset *outer_refs)
 			if (!arrowSchemaCompatibilityCheck(tupdesc, rb_state))
 				elog(ERROR, "arrow file '%s' on behalf of foreign table '%s' has incompatible schema definition",
 					 fname, RelationGetRelationName(relation));
+			/* GPUDirect I/O state, if any */
+			rb_state->dfile = dfile;
 		}
 		rb_state_list = list_concat(rb_state_list, rb_cached);
 	}
 	num_rbatches = list_length(rb_state_list);
 	af_state = palloc0(offsetof(ArrowFdwState, rbatches[num_rbatches]));
+	af_state->gcontext = gcontext;
+	af_state->gpuDirectFileDescList = gpuDirectFileDescList;
 	af_state->fdescList = fdescList;
 	af_state->referenced = referenced;
 	af_state->rbatch_index = &af_state->__rbatch_index_local;
@@ -1095,7 +1076,7 @@ ArrowBeginForeignScan(ForeignScanState *node, int eflags)
 			referenced = bms_add_member(referenced, j -
 										FirstLowInvalidHeapAttributeNumber);
 	}
-	node->fdw_state = ExecInitArrowFdw(relation, referenced);
+	node->fdw_state = ExecInitArrowFdw(NULL, relation, referenced);
 }
 
 typedef struct
@@ -1111,7 +1092,7 @@ typedef struct
 /*
  * arrowFdwSetupIOvectorField
  */
-static inline void
+static void
 __setupIOvectorField(arrowFdwSetupIOContext *con,
 					 off_t chunk_offset,
 					 size_t chunk_length,
@@ -1119,19 +1100,48 @@ __setupIOvectorField(arrowFdwSetupIOContext *con,
 					 cl_uint *p_cmeta_length)
 {
 	off_t		f_pos = con->rb_offset + chunk_offset;
+	size_t		__length = MAXALIGN(chunk_length);
 
-	if (f_pos == con->f_offset &&
-		con->m_offset == MAXALIGN(con->m_offset))
+	Assert((con->m_offset & (MAXIMUM_ALIGNOF - 1)) == 0);
+
+	if (f_pos == con->f_offset)
 	{
-		/* good, buffer is continuous */
+		/* good, buffer is fully continuous */
 		*p_cmeta_offset = __kds_packed(con->m_offset);
-		*p_cmeta_length = __kds_packed(chunk_length);
+		*p_cmeta_length = __kds_packed(__length);
 
-		con->m_offset += chunk_length;
-		con->f_offset += chunk_length;
+		con->m_offset += __length;
+		con->f_offset += __length;
+	}
+	else if (f_pos > con->f_offset &&
+			 (f_pos & ~PAGE_MASK) == (con->f_offset & ~PAGE_MASK) &&
+			 ((f_pos - con->f_offset) & (MAXIMUM_ALIGNOF-1)) == 0)
+	{
+		/*
+		 * we can also consolidate the i/o of two chunks, if file position
+		 * of the next chunk (f_pos) and the current file tail position
+		 * (con->f_offset) locate within the same file page, and if gap bytes
+		 * on the file does not break alignment.
+		 */
+		size_t	__gap = (f_pos - con->f_offset);
+
+		/* put gap bytes */
+		Assert(__gap < PAGE_SIZE);
+		con->m_offset += __gap;
+		con->f_offset += __gap;
+
+		*p_cmeta_offset = __kds_packed(con->m_offset);
+		*p_cmeta_length = __kds_packed(__length);
+
+		con->m_offset += __length;
+		con->f_offset += __length;
 	}
 	else
 	{
+		/*
+		 * Elsewhere, we have no chance to consolidate this chunk to
+		 * the previous i/o-chunk. So, make a new i/o-chunk.
+		 */
 		off_t		f_base = TYPEALIGN_DOWN(PAGE_SIZE, f_pos);
 		off_t		f_tail;
 		off_t		shift = f_pos - f_base;
@@ -1155,10 +1165,10 @@ __setupIOvectorField(arrowFdwSetupIOContext *con,
 		ioc->fchunk_id  = f_base / PAGE_SIZE;
 
 		*p_cmeta_offset = __kds_packed(con->m_offset + shift);
-		*p_cmeta_length = __kds_packed(chunk_length);
+		*p_cmeta_length = __kds_packed(__length);
 
-		con->m_offset  += shift + chunk_length;
-		con->f_offset   = f_pos + chunk_length;
+		con->m_offset  += shift + __length;
+		con->f_offset   = f_pos + __length;
 	}
 }
 
@@ -1247,6 +1257,8 @@ arrowFdwSetupIOvector(kern_data_store *kds,
 
 		if (referenced && bms_is_member(attidx, referenced))
 			arrowFdwSetupIOvectorField(con, fstate, kds, cmeta);
+		else
+			cmeta->atttypkind = TYPE_KIND__NULL;	/* unreferenced */
 	}
 	if (con->io_index >= 0)
 	{
@@ -1312,6 +1324,42 @@ __dump_kds_and_iovec(kern_data_store *kds, strom_io_vector *iovec)
 /*
  * arrowFdwLoadRecordBatch
  */
+static void
+__arrowFdwAssignTypeOptions(kern_data_store *kds,
+							int base, int ncols,
+							RecordBatchFieldState *rb_fstate)
+{
+	int		i;
+
+	for (i=0; i < ncols; i++)
+	{
+		kern_colmeta   *cmeta = &kds->colmeta[base+i];
+
+		cmeta->attopts = rb_fstate[i].attopts;
+		if (cmeta->atttypkind == TYPE_KIND__ARRAY)
+		{
+			Assert(cmeta->idx_subattrs >= kds->ncols &&
+				   cmeta->num_subattrs == 1 &&
+				   cmeta->idx_subattrs + cmeta->num_subattrs <= kds->nr_colmeta);
+			Assert(rb_fstate[i].num_children == 1);
+			__arrowFdwAssignTypeOptions(kds,
+										cmeta->idx_subattrs,
+										cmeta->num_subattrs,
+										rb_fstate[i].children);
+		}
+		else if (cmeta->atttypkind == TYPE_KIND__COMPOSITE)
+		{
+			Assert(cmeta->idx_subattrs >= kds->ncols &&
+				   cmeta->idx_subattrs + cmeta->num_subattrs <= kds->nr_colmeta);
+			Assert(rb_fstate[i].num_children == cmeta->num_subattrs);
+			__arrowFdwAssignTypeOptions(kds,
+										cmeta->idx_subattrs,
+										cmeta->num_subattrs,
+										rb_fstate[i].children);
+		}
+	}
+}
+
 static pgstrom_data_store *
 __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 						  Relation relation,
@@ -1325,7 +1373,6 @@ __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 	kern_data_store	   *kds;
 	strom_io_vector	   *iovec;
 	size_t				head_sz;
-	int					j, fdesc;
 	CUresult			rc;
 
 	/* setup KDS and I/O-vector */
@@ -1336,12 +1383,11 @@ __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 	kds->nrooms = rb_state->rb_nitems;
 	kds->table_oid = RelationGetRelid(relation);
 	Assert(head_sz == KERN_DATA_STORE_HEAD_LENGTH(kds));
-	for (j=0; j < kds->nr_colmeta; j++)
-		kds->colmeta[j].attopts = rb_state->columns[j].attopts;
+	Assert(kds->ncols == rb_state->ncols);
+	__arrowFdwAssignTypeOptions(kds, 0, kds->ncols, rb_state->columns);
 	iovec = arrowFdwSetupIOvector(kds, rb_state, referenced);
 	__dump_kds_and_iovec(kds, iovec);
 
-	fdesc = FileGetRawDesc(rb_state->fdesc);
 	/*
 	 * If SSD-to-GPU Direct SQL is available on the arrow file, setup a small
 	 * PDS on host-pinned memory, with strom_io_vector.
@@ -1349,7 +1395,8 @@ __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 	if (gcontext &&
 		gcontext->cuda_dindex == optimal_gpu &&
 		iovec->nr_chunks > 0 &&
-		kds->length <= gpuMemAllocIOMapMaxLength())
+		kds->length <= gpuMemAllocIOMapMaxLength() &&
+		rb_state->dfile != NULL)
 	{
 		size_t	iovec_sz = offsetof(strom_io_vector, ioc[iovec->nr_chunks]);
 
@@ -1362,7 +1409,7 @@ __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 		pds->gcontext = gcontext;
 		pg_atomic_init_u32(&pds->refcnt, 1);
 		pds->nblocks_uncached = 0;
-		pds->filedesc = fdesc;
+		memcpy(&pds->filedesc, rb_state->dfile, sizeof(GPUDirectFileDesc));
 		pds->iovec = (strom_io_vector *)((char *)&pds->kds + head_sz);
 		memcpy(&pds->kds, kds, head_sz);
 		memcpy(pds->iovec, iovec, iovec_sz);
@@ -1370,6 +1417,8 @@ __arrowFdwLoadRecordBatch(RecordBatchState *rb_state,
 	else
 	{
 		/* Elsewhere, load RecordBatch by filesystem */
+		int		fdesc = FileGetRawDesc(rb_state->fdesc);
+
 		if (gcontext)
 		{
 			rc = gpuMemAllocManaged(gcontext,
@@ -1496,6 +1545,13 @@ ExecEndArrowFdw(ArrowFdwState *af_state)
 
 	foreach (lc, af_state->fdescList)
 		FileClose((File)lfirst_int(lc));
+	foreach (lc, af_state->gpuDirectFileDescList)
+	{
+		GPUDirectFileDesc *dfile = lfirst(lc);
+
+		untrackRawFileDesc(af_state->gcontext, dfile);
+		gpuDirectFileDescClose(dfile);
+	}
 }
 
 static void
@@ -1543,41 +1599,20 @@ ExplainArrowFdw(ArrowFdwState *af_state, Relation frel, ExplainState *es)
 		File		fdesc = (File)lfirst_int(lc);
 		const char *fname = FilePathName(fdesc);
 		int			rbcount = 0;
+		size_t		read_sz = 0;
 		char	   *pos = label;
 		struct stat	st_buf;
 
 		pos += snprintf(label, sizeof(label), "files%d", fcount++);
 		if (fstat(FileGetRawDesc(fdesc), &st_buf) != 0)
 			memset(&st_buf, 0, sizeof(struct stat));
-		if (es->format == EXPLAIN_FORMAT_TEXT)
-		{
-			resetStringInfo(&buf);
-			if (st_buf.st_size == 0)
-				appendStringInfoString(&buf, fname);
-			else
-				appendStringInfo(&buf, "%s (size: %s)",
-								 fname,
-								 format_bytesz(st_buf.st_size));
-			ExplainPropertyText(label, buf.data, es);
-		}
-		else
-		{
-			ExplainPropertyText(label, fname, es);
 
-			if (st_buf.st_size > 0)
-			{
-				sprintf(pos, "-size");
-				ExplainPropertyText(label, format_bytesz(st_buf.st_size), es);
-			}
-		}
-		if (!es->verbose)
-			continue;
-
-		/* below only verbose mode */
+		/* size count per chunk */
 		memset(chunk_sz, 0, sizeof(size_t) * tupdesc->natts);
 		for (i=0; i < af_state->num_rbatches; i++)
 		{
 			RecordBatchState *rb_state = af_state->rbatches[i];
+			size_t		sz;
 
 			if (rb_state->fdesc != fdesc)
 				continue;
@@ -1589,12 +1624,39 @@ ExplainArrowFdw(ArrowFdwState *af_state, Relation frel, ExplainState *es)
 				j = k + FirstLowInvalidHeapAttributeNumber - 1;
 				if (j < 0 || j >= tupdesc->natts)
 					continue;
-				chunk_sz[j] += RecordBatchFieldLength(&rb_state->columns[j]);
+				sz = RecordBatchFieldLength(&rb_state->columns[j]);
+				read_sz += sz;
+				chunk_sz[j] += sz;
 			}
 			rbcount++;
 		}
 
-		if (rbcount >= 0)
+		/* file size and read size */
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			resetStringInfo(&buf);
+			if (st_buf.st_size == 0)
+				appendStringInfoString(&buf, fname);
+			else
+				appendStringInfo(&buf, "%s (read: %s, size: %s)",
+								 fname,
+								 format_bytesz(read_sz),
+								 format_bytesz(st_buf.st_size));
+			ExplainPropertyText(label, buf.data, es);
+		}
+		else
+		{
+			ExplainPropertyText(label, fname, es);
+
+			sprintf(pos, "-size");
+			ExplainPropertyText(label, format_bytesz(st_buf.st_size), es);
+
+			sprintf(pos, "-read");
+			ExplainPropertyText(label, format_bytesz(read_sz), es);
+		}
+
+		/* read-size per column (verbose mode only)  */
+		if (es->verbose && rbcount >= 0)
 		{
 			for (k = bms_next_member(af_state->referenced, -1);
                  k >= 0;
@@ -1840,10 +1902,13 @@ ArrowImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			break;
 		case FDW_IMPORT_SCHEMA_LIMIT_TO:
 			elog(ERROR, "arrow_fdw does not support LIMIT TO clause");
+			break;
 		case FDW_IMPORT_SCHEMA_EXCEPT:
 			elog(ERROR, "arrow_fdw does not support EXCEPT clause");
+			break;
 		default:
 			elog(ERROR, "arrow_fdw: Bug? unknown list-type");
+			break;
 	}
 	filesList = arrowFdwExtractFilesList(stmt->options);
 	if (filesList == NIL)
@@ -1923,6 +1988,158 @@ ArrowImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 }
 
 /*
+ * pgstrom_arrow_fdw_import_file
+ *
+ * NOTE: Due to historical reason, PostgreSQL does not allow to define
+ * columns more than MaxHeapAttributeNumber (1600) for foreign-tables also,
+ * not only heap-tables. This restriction comes from NULL-bitmap length
+ * in HeapTupleHeaderData and width of t_hoff.
+ * However, it is not a reasonable restriction for foreign-table, because
+ * it does not use heap-format internally.
+ */
+Datum
+pgstrom_arrow_fdw_import_file(PG_FUNCTION_ARGS)
+{
+	CreateForeignTableStmt stmt;
+	ArrowSchema	schema;
+	List	   *tableElts = NIL;
+	char	   *ftable_name;
+	char	   *file_name;
+	char	   *namespace_name;
+	DefElem	   *defel;
+	int			j, nfields;
+	Oid			ftable_oid;
+	Oid			type_oid;
+	int			type_mod;
+	ObjectAddress myself, referenced;
+	ArrowFileInfo af_info;
+
+	/* read schema of the file */
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "foreign table name is not supplied");
+	ftable_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "arrow filename is not supplied");
+	file_name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	defel = makeDefElem("file", (Node *)makeString(file_name), -1);
+
+	if (PG_ARGISNULL(2))
+		namespace_name = NULL;
+	else
+		namespace_name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+	readArrowFile(file_name, &af_info, false);
+	copyArrowNode(&schema.node, &af_info.footer.schema.node);
+	if (schema._num_fields > SHRT_MAX)
+		Elog("Arrow file '%s' has too much fields: %d",
+			 file_name, schema._num_fields);
+
+	/* setup CreateForeignTableStmt */
+	memset(&stmt, 0, sizeof(CreateForeignTableStmt));
+	NodeSetTag(&stmt, T_CreateForeignTableStmt);
+	stmt.base.relation = makeRangeVar(namespace_name, ftable_name, -1);
+
+	nfields = Min(schema._num_fields, 100);
+	for (j=0; j < nfields; j++)
+	{
+		ColumnDef  *cdef;
+
+		type_oid = arrowTypeToPGTypeOid(&schema.fields[j], &type_mod);
+		cdef = makeColumnDef(schema.fields[j].name,
+							 type_oid,
+							 type_mod,
+							 InvalidOid);
+		tableElts = lappend(tableElts, cdef);
+	}
+	stmt.base.tableElts = tableElts;
+	stmt.base.oncommit = ONCOMMIT_NOOP;
+	stmt.servername = "arrow_fdw";
+	stmt.options = list_make1(defel);
+
+	myself = DefineRelation(&stmt.base,
+							RELKIND_FOREIGN_TABLE,
+							InvalidOid,
+							NULL,
+							__FUNCTION__);
+	ftable_oid = myself.objectId;
+	CreateForeignTable(&stmt, ftable_oid);
+
+	if (nfields < schema._num_fields)
+	{
+		Relation	c_rel = table_open(RelationRelationId, RowExclusiveLock);
+		Relation	a_rel = table_open(AttributeRelationId, RowExclusiveLock);
+		CatalogIndexState c_index = CatalogOpenIndexes(c_rel);
+		CatalogIndexState a_index = CatalogOpenIndexes(a_rel);
+		HeapTuple	tup;
+
+		tup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(ftable_oid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for relation %u", ftable_oid);
+		
+		for (j=nfields; j < schema._num_fields; j++)
+		{
+			FormData_pg_attribute attr;
+			const char *name = schema.fields[j].name;
+			bool		nullable = schema.fields[j].nullable;
+			Oid			type_oid;
+			int			type_mod;
+			int16		type_len;
+			bool		type_byval;
+			char		type_align;
+
+			type_oid = arrowTypeToPGTypeOid(&schema.fields[j], &type_mod);
+			get_typlenbyvalalign(type_oid,
+								 &type_len,
+								 &type_byval,
+								 &type_align);
+
+			memset(&attr, 0, sizeof(FormData_pg_attribute));
+			attr.attrelid = ftable_oid;
+			strncpy(NameStr(attr.attname), name, NAMEDATALEN);
+			attr.atttypid = type_oid;
+			attr.attstattarget = -1;
+			attr.attlen = type_len;
+			attr.atttypmod = type_mod;
+			attr.attnum = j + 1;
+			attr.attbyval = type_byval;
+			attr.attndims = (type_is_array(type_oid) ? 1 : 0);
+			attr.attstorage = get_typstorage(type_oid);
+			attr.attalign = type_align;
+			attr.attnotnull = !nullable;
+			attr.attislocal = true;
+			/*
+			 * The above setup omits initializations by zero, to simplify 
+			 * multi-versions compilation, even if pg_attribute is extended
+			 * in the future version.
+			 */
+			InsertPgAttributeTuple(a_rel, &attr, (Datum) 0, a_index);
+
+			/* add dependency */
+			myself.classId = RelationRelationId;
+			myself.objectId = ftable_oid;
+			myself.objectSubId = attr.attnum;
+			referenced.classId = TypeRelationId;
+			referenced.objectId = type_oid;
+			referenced.objectSubId = 0;
+			recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+		}
+		/* update relnatts also */
+		((Form_pg_class) GETSTRUCT(tup))->relnatts = schema._num_fields;
+		CatalogTupleUpdate(c_rel, &tup->t_self, tup);
+		
+		CatalogCloseIndexes(a_index);
+		CatalogCloseIndexes(c_index);
+		table_close(a_rel, RowExclusiveLock);
+		table_close(c_rel, RowExclusiveLock);
+
+		CommandCounterIncrement();
+	}	
+	PG_RETURN_VOID();
+}
+PG_FUNCTION_INFO_V1(pgstrom_arrow_fdw_import_file);
+
+/*
  * ArrowIsForeignScanParallelSafe
  */
 static bool
@@ -1940,18 +2157,23 @@ static Size
 ArrowEstimateDSMForeignScan(ForeignScanState *node,
 							ParallelContext *pcxt)
 {
-	//elog(INFO, "pid=%u ArrowEstimateDSMForeignScan", getpid());
 	return MAXALIGN(sizeof(pg_atomic_uint32));
 }
 
 /*
  * ArrowInitializeDSMForeignScan
  */
-void
-ExecInitDSMArrowFdw(ArrowFdwState *af_state, pg_atomic_uint32 *rbatch_index)
+static inline void
+__ExecInitDSMArrowFdw(ArrowFdwState *af_state, pg_atomic_uint32 *rbatch_index)
 {
 	pg_atomic_init_u32(rbatch_index, 0);
 	af_state->rbatch_index = rbatch_index;
+}
+
+void
+ExecInitDSMArrowFdw(ArrowFdwState *af_state, GpuTaskSharedState *gtss)
+{
+	__ExecInitDSMArrowFdw(af_state, &gtss->af_rbatch_index);
 }
 
 static void
@@ -1959,17 +2181,23 @@ ArrowInitializeDSMForeignScan(ForeignScanState *node,
 							  ParallelContext *pcxt,
 							  void *coordinate)
 {
-	ExecInitDSMArrowFdw((ArrowFdwState *)node->fdw_state,
-						(pg_atomic_uint32 *) coordinate);
+	__ExecInitDSMArrowFdw((ArrowFdwState *)node->fdw_state,
+						  (pg_atomic_uint32 *)coordinate);
 }
 
 /*
  * ArrowReInitializeDSMForeignScan
  */
+static void
+__ExecReInitDSMArrowFdw(ArrowFdwState *af_state)
+{
+	pg_atomic_write_u32(af_state->rbatch_index, 0);
+}
+
 void
 ExecReInitDSMArrowFdw(ArrowFdwState *af_state)
 {
-	pg_atomic_write_u32(af_state->rbatch_index, 0);
+	__ExecReInitDSMArrowFdw(af_state);
 }
 
 
@@ -1978,17 +2206,24 @@ ArrowReInitializeDSMForeignScan(ForeignScanState *node,
 								ParallelContext *pcxt,
 								void *coordinate)
 {
-	ExecReInitDSMArrowFdw((ArrowFdwState *)node->fdw_state);
+	__ExecReInitDSMArrowFdw((ArrowFdwState *)node->fdw_state);
 }
 
 /*
  * ArrowInitializeWorkerForeignScan
  */
-void
-ExecInitWorkerArrowFdw(ArrowFdwState *af_state,
-					   pg_atomic_uint32 *rbatch_index)
+static inline void
+__ExecInitWorkerArrowFdw(ArrowFdwState *af_state,
+						 pg_atomic_uint32 *rbatch_index)
 {
 	af_state->rbatch_index = rbatch_index;
+}
+
+void
+ExecInitWorkerArrowFdw(ArrowFdwState *af_state,
+					   GpuTaskSharedState *gtss)
+{
+	__ExecInitWorkerArrowFdw(af_state, &gtss->af_rbatch_index);
 }
 
 static void
@@ -1996,23 +2231,29 @@ ArrowInitializeWorkerForeignScan(ForeignScanState *node,
 								 shm_toc *toc,
 								 void *coordinate)
 {
-	ExecInitWorkerArrowFdw((ArrowFdwState *)node->fdw_state,
-						   (pg_atomic_uint32 *) coordinate);
+	__ExecInitWorkerArrowFdw((ArrowFdwState *)node->fdw_state,
+							 (pg_atomic_uint32 *) coordinate);
 }
 
 /*
  * ArrowShutdownForeignScan
  */
+static inline void
+__ExecShutdownArrowFdw(ArrowFdwState *af_state)
+{
+	/* nothing to do */
+}
+
 void
 ExecShutdownArrowFdw(ArrowFdwState *af_state)
 {
-	/* nothing to do */
+	__ExecShutdownArrowFdw(af_state);
 }
 
 static void
 ArrowShutdownForeignScan(ForeignScanState *node)
 {
-	ExecShutdownArrowFdw((ArrowFdwState *)node->fdw_state);
+	__ExecShutdownArrowFdw((ArrowFdwState *)node->fdw_state);
 }
 
 /*
@@ -2026,7 +2267,7 @@ ArrowPlanForeignModify(PlannerInfo *root,
 {
 	RangeTblEntry  *rte = planner_rt_fetch(resultRelation, root);
 	ForeignTable   *ft = GetForeignTable(rte->relid);
-	List		   *filesList;
+	List		   *filesList	__attribute__((unused));
 	bool			writable;
 
 	if (plan->operation != CMD_INSERT)
@@ -2047,41 +2288,47 @@ ArrowPlanForeignModify(PlannerInfo *root,
  * ArrowBeginForeignModify
  */
 static void
-ArrowBeginForeignModify(ModifyTableState *mtstate,
-						ResultRelInfo *rrinfo,
-						List *fdw_private,
-						int subplan_index,
-						int eflags)
+__ArrowBeginForeignModify(ResultRelInfo *rrinfo, int eflags)
 {
 	Relation		frel = rrinfo->ri_RelationDesc;
+	TupleDesc		tupdesc = RelationGetDescr(frel);
 	ForeignTable   *ft = GetForeignTable(RelationGetRelid(frel));
 	List		   *filesList = arrowFdwExtractFilesList(ft->options);
 	const char	   *fname;
 	File			filp;
-	bool			redo_log_written = false;
+	struct stat		stat_buf;
+	arrowWriteState *aw_state;
+	SQLtable	   *table;
+	MetadataCacheKey key;
+	off_t			f_pos;
+	bool			is_newfile = false;
 
 	Assert(list_length(filesList) == 1);
 	fname = strVal(linitial(filesList));
 
 	LockRelation(frel, ShareRowExclusiveLock);
-
 	filp = PathNameOpenFile(fname, O_RDWR | PG_BINARY);
-	if (filp < 0)
+	if (filp >= 0)
 	{
-		if (errno != ENOENT)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m", fname)));
-
+		f_pos = createArrowWriteRedoLog(filp, false);
+	}
+	else if (errno != ENOENT)
+	{
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\": %m", fname)));
+	}
+	else
+	{
 		filp = PathNameOpenFile(fname, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
 		if (filp < 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", fname)));
+		is_newfile = true;
 		PG_TRY();
 		{
-			createArrowWriteRedoLog(filp, true);
-			redo_log_written = true;
+			f_pos = createArrowWriteRedoLog(filp, true);
 		}
 		PG_CATCH();
 		{
@@ -2090,8 +2337,35 @@ ArrowBeginForeignModify(ModifyTableState *mtstate,
 		}
 		PG_END_TRY();
 	}
-	rrinfo->ri_FdwState = createArrowWriteState(frel, filp,
-												redo_log_written);
+	if (fstat(FileGetRawDesc(filp), &stat_buf) != 0)
+		elog(ERROR, "failed on fstat('%s'): %m", FilePathName(filp));
+	initMetadataCacheKey(&key, stat_buf.st_dev, stat_buf.st_ino);
+
+	aw_state = palloc0(offsetof(arrowWriteState,
+								sql_table.columns[tupdesc->natts]));
+	aw_state->memcxt = CurrentMemoryContext;
+	aw_state->file = filp;
+	aw_state->key = key;
+	aw_state->hash = key.hash;
+	table = &aw_state->sql_table;
+	table->filename = FilePathName(filp);
+	table->fdesc = FileGetRawDesc(filp);
+	table->f_pos = f_pos;
+	setupArrowSQLbufferSchema(table, tupdesc);
+	if (!is_newfile)
+		setupArrowSQLbufferBatches(table);
+
+	rrinfo->ri_FdwState = aw_state;
+}
+
+static void
+ArrowBeginForeignModify(ModifyTableState *mtstate,
+						ResultRelInfo *rrinfo,
+						List *fdw_private,
+						int subplan_index,
+						int eflags)
+{
+	__ArrowBeginForeignModify(rrinfo, eflags);
 }
 
 /*
@@ -2142,6 +2416,7 @@ ArrowExecForeignInsert(EState *estate,
 			elog(ERROR, "Bug? unsupported type format");
 		}
 	}
+	table->usage = usage;
 	table->nitems++;
 	MemoryContextSwitchTo(oldcxt);
 
@@ -2166,6 +2441,27 @@ ArrowEndForeignModify(EState *estate,
 
 	writeOutArrowRecordBatch(aw_state, true);
 }
+
+#if PG_VERSION_NUM >= 110000
+/*
+ * MEMO: executor begin/end routine, if arrow_fdw is partitioned-leaf
+ * relations. In this case, ArrowBeginForeignModify shall not be called.
+ */
+static void
+ArrowBeginForeignInsert(ModifyTableState *mtstate,
+						ResultRelInfo *rrinfo)
+{
+	__ArrowBeginForeignModify(rrinfo, 0);
+}
+
+static void
+ArrowEndForeignInsert(EState *estate, ResultRelInfo *rrinfo)
+{
+	arrowWriteState *aw_state = rrinfo->ri_FdwState;
+
+	writeOutArrowRecordBatch(aw_state, true);
+}
+#endif
 
 /*
  * ArrowExplainForeignModify
@@ -2281,16 +2577,131 @@ arrowTypeIsEqual(ArrowField *a, ArrowField *b, int depth)
 }
 
 static Oid
-arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
+arrowFieldGetPGTypeHint(ArrowField *field)
+{
+	Oid		hint_oid = InvalidOid;
+	int		i, j;
+
+	for (i=0; i < field->_num_custom_metadata; i++)
+	{
+		ArrowKeyValue *kv = &field->custom_metadata[i];
+		char	   *namebuf, *pos;
+		Oid			namespace_oid;
+		HeapTuple	tup;
+
+		if (kv->_key_len != 7 || strncmp(kv->key, "pg_type", 7) != 0)
+			continue;
+		namebuf = alloca(kv->_value_len + 10);
+		/* namespace name */
+		pos = namebuf;
+		for (j=0; j < kv->_value_len; j++)
+		{
+			int		c = kv->value[j];
+
+			if (c == '.')
+				break;
+			else if (c == '\\' && ++j < kv->_value_len)
+				c = kv->value[j];
+			*pos++ = c;
+		}
+		*pos++ = '\0';
+
+		namespace_oid = get_namespace_oid(namebuf, true);
+		if (!OidIsValid(namespace_oid))
+			continue;
+
+		/* type name */
+		pos = namebuf;
+		for (j++; j < kv->_value_len; j++)
+		{
+			int		c = kv->value[j];
+
+			if (c == '\\' && ++j < kv->_value_len)
+				c = kv->value[j];
+			*pos++ = c;
+		}
+		*pos++ = '\0';
+
+		tup = SearchSysCache2(TYPENAMENSP,
+							  PointerGetDatum(namebuf),
+							  ObjectIdGetDatum(namespace_oid));
+		if (!HeapTupleIsValid(tup))
+			continue;
+		hint_oid = PgTypeTupleGetOid(tup);
+
+		ReleaseSysCache(tup);
+
+		return hint_oid;
+	}
+	return InvalidOid;
+}
+
+static bool
+__arrowStructTypeIsCompatible(ArrowField *field, Oid comp_oid)
+{
+	TupleDesc	tupdesc;
+	int			j;
+	bool		compatible = false;
+
+	if (pg_type_aclcheck(comp_oid,
+						 GetUserId(),
+						 ACL_USAGE) != ACLCHECK_OK)
+		return false;
+
+	tupdesc = lookup_rowtype_tupdesc_noerror(comp_oid, -1, true);
+	if (tupdesc && tupdesc->natts == field->_num_children)
+	{
+		for (j=0; j < tupdesc->natts; j++)
+		{
+			Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
+			ArrowField *child = &field->children[j];
+			Oid			typoid;
+			int			typmod;
+
+			typoid = arrowTypeToPGTypeOid(child, &typmod);
+			if (typoid != attr->atttypid)
+				break;
+		}
+		if (j >= tupdesc->natts)
+			compatible = true;
+	}
+	if (tupdesc)
+		ReleaseTupleDesc(tupdesc);
+
+	return compatible;
+}
+
+static Oid
+arrowTypeToPGTypeOid(ArrowField *field, int *p_type_mod)
 {
 	ArrowType  *t = &field->type;
+	Oid			hint_oid;
+	int			i;
 
-	*typmod = -1;
+	hint_oid = arrowFieldGetPGTypeHint(field);
+
+	/* extra module may provide own mapping */
+	for (i=0; i < pgstrom_num_users_extra; i++)
+	{
+		pgstromUsersExtraDescriptor *extra = &pgstrom_users_extra_desc[i];
+		Oid		type_oid;
+
+		if (extra->arrow_lookup_pgtype)
+		{
+			type_oid = extra->arrow_lookup_pgtype(field, hint_oid, p_type_mod);
+			if (OidIsValid(type_oid))
+				return type_oid;
+		}
+	}
+
+	*p_type_mod = -1;
 	switch (t->node.tag)
 	{
 		case ArrowNodeTag__Int:
 			switch (t->Int.bitWidth)
 			{
+				case 8:
+					return INT1OID;
 				case 16:
 					return INT2OID;
 				case 32:
@@ -2298,8 +2709,8 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 				case 64:
 					return INT8OID;
 				default:
-					elog(ERROR, "Arrow.%s is not supported",
-						 arrowTypeName(field));
+					elog(ERROR, "%s is not supported",
+						 arrowNodeName(&t->node));
 					break;
 			}
 			break;
@@ -2313,8 +2724,8 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 				case ArrowPrecision__Double:
 					return FLOAT8OID;
 				default:
-					elog(ERROR, "Arrow.%s is not supported",
-						 arrowTypeName(field));
+					elog(ERROR, "%s is not supported",
+						 arrowNodeName(&t->node));
 			}
 			break;
 		case ArrowNodeTag__Utf8:
@@ -2348,19 +2759,20 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 				elem_oid = arrowTypeToPGTypeOid(child, &elem_mod);
 				type_oid = get_array_type(elem_oid);
 				if (!OidIsValid(type_oid))
-					elog(ERROR, "array of arrow::%s type is not defined",
-						 arrowTypeName(field));
+					elog(ERROR, "array of %s type is not defined",
+						 arrowNodeName(&t->node));
 				return type_oid;
 			}
 			break;
 
 		case ArrowNodeTag__Struct:
+			if (!OidIsValid(hint_oid) ||
+				!__arrowStructTypeIsCompatible(field, hint_oid))
 			{
 				Relation	rel;
 				ScanKeyData	skey[2];
 				SysScanDesc	sscan;
 				HeapTuple	tup;
-				Oid			type_oid = InvalidOid;
 
 				/*
 				 * lookup composite type definition from pg_class
@@ -2378,58 +2790,42 @@ arrowTypeToPGTypeOid(ArrowField *field, int *typmod)
 
 				sscan = systable_beginscan(rel, InvalidOid, false,
 										   NULL, 2, skey);
-				while (!OidIsValid(type_oid) &&
+				hint_oid = InvalidOid;
+				while (!OidIsValid(hint_oid) &&
 					   HeapTupleIsValid(tup = systable_getnext(sscan)))
 				{
-					Form_pg_class relForm = (Form_pg_class) GETSTRUCT(tup);
-					TupleDesc	tupdesc;
-					int			j;
-					bool		compatible = true;
+					Oid		reltype = ((Form_pg_class) GETSTRUCT(tup))->reltype;
 
-					if (pg_namespace_aclcheck(relForm->relnamespace,
-											  GetUserId(),
-											  ACL_USAGE) != ACLCHECK_OK)
-						continue;
-
-					if (pg_type_aclcheck(relForm->reltype,
-										 GetUserId(),
-										 ACL_USAGE) != ACLCHECK_OK)
-						continue;
-
-					tupdesc = lookup_rowtype_tupdesc(relForm->reltype, -1);
-					Assert(tupdesc->natts == field->_num_children);
-					for (j=0; compatible && j < tupdesc->natts; j++)
-					{
-						Form_pg_attribute attr = tupleDescAttr(tupdesc, j);
-						ArrowField  *child = &field->children[j];
-						Oid			typoid;
-						int			typmod;
-
-						typoid = arrowTypeToPGTypeOid(child, &typmod);
-						if (typoid != attr->atttypid)
-							compatible = false;
-					}
-					ReleaseTupleDesc(tupdesc);
-
-					if (compatible)
-						type_oid = relForm->reltype;
+					if (__arrowStructTypeIsCompatible(field, reltype))
+						hint_oid = reltype;
 				}
 				systable_endscan(sscan);
 				table_close(rel, AccessShareLock);
 
-				if (!OidIsValid(type_oid))
+				if (!OidIsValid(hint_oid))
 					elog(ERROR, "arrow::%s is not supported",
-						 arrowTypeName(field));
-				return type_oid;
+						 arrowNodeName(&t->node));
 			}
-			break;
+			return hint_oid;
+
 		case ArrowNodeTag__FixedSizeBinary:
 			if (t->FixedSizeBinary.byteWidth < 1 ||
 				t->FixedSizeBinary.byteWidth > BLCKSZ)
 				elog(ERROR, "arrow_fdw: %s with byteWidth=%d is not supported",
 					 t->node.tagName,
 					 t->FixedSizeBinary.byteWidth);
-			*typmod = t->FixedSizeBinary.byteWidth;
+			if (hint_oid == MACADDROID &&
+				t->FixedSizeBinary.byteWidth == sizeof(macaddr))
+			{
+				return MACADDROID;
+			}
+			else if (hint_oid == INETOID &&
+					 (t->FixedSizeBinary.byteWidth == 4 ||
+					  t->FixedSizeBinary.byteWidth == 16))
+			{
+				return INETOID;
+			}
+			*p_type_mod = t->FixedSizeBinary.byteWidth;
 			return BPCHAROID;
 		default:
 			elog(ERROR, "arrow_fdw: type '%s' is not supported",
@@ -2470,6 +2866,9 @@ arrowTypeToPGTypeName(ArrowField *field)
 	return result;
 }
 
+#if 0
+//no longer needed?
+
 /*
  * arrowTypeIsConvertible
  */
@@ -2482,6 +2881,7 @@ arrowTypeIsConvertible(Oid type_oid, int typemod)
 
 	switch (type_oid)
 	{
+		case INT1OID:		/* Int8 */
 		case INT2OID:		/* Int16 */
 		case INT4OID:		/* Int32 */
 		case INT8OID:		/* Int64 */
@@ -2505,7 +2905,7 @@ arrowTypeIsConvertible(Oid type_oid, int typemod)
 				elog(ERROR, "cache lookup failed for type %u", type_oid);
 			typeForm = (Form_pg_type) GETSTRUCT(tup);
 
-			if (typeForm->typlen == -1 && OidIsValid(typeForm->typelem))
+			if (OidIsValid(typeForm->typelem) && typeForm->typlen == -1)
 			{
 				retval = arrowTypeIsConvertible(typeForm->typelem, typemod);
 			}
@@ -2533,6 +2933,7 @@ arrowTypeIsConvertible(Oid type_oid, int typemod)
 	}
 	return retval;
 }
+#endif
 
 /*
  * arrowFieldLength
@@ -2548,14 +2949,17 @@ arrowFieldLength(ArrowField *field, int64 nitems)
 		case ArrowNodeTag__Int:
 			switch (type->Int.bitWidth)
 			{
-				case sizeof(cl_short) * BITS_PER_BYTE:
-					length = sizeof(cl_short) * nitems;
+				case 8:
+					length = nitems;
 					break;
-				case sizeof(cl_int) * BITS_PER_BYTE:
-					length = sizeof(cl_int) * nitems;
+				case 16:
+					length = 2 * nitems;
 					break;
-				case sizeof(cl_long) * BITS_PER_BYTE:
-					length = sizeof(cl_long) * nitems;
+				case 32:
+					length = 4 * nitems;
+					break;
+				case 64:
+					length = 8 * nitems;
 					break;
 				default:
 					elog(ERROR, "Not a supported Int width: %d",
@@ -2678,7 +3082,7 @@ __arrowSchemaCompatibilityCheck(TupleDesc tupdesc,
 			if (!HeapTupleIsValid(tup))
 				elog(ERROR, "cache lookup failed for type %u", attr->atttypid);
 			typ = (Form_pg_type) GETSTRUCT(tup);
-			if (typ->typlen == -1 && OidIsValid(typ->typelem) &&
+			if (OidIsValid(typ->typelem) && typ->typlen == -1 &&
 				fstate->num_children == 1)
 			{
 				/* Arrow::List */
@@ -2747,12 +3151,15 @@ pg_varlena_arrow_ref(kern_data_store *kds,
 	cl_uint	   *offset = (cl_uint *)
 		((char *)kds + __kds_unpack(cmeta->values_offset));
 	char	   *extra = (char *)kds + __kds_unpack(cmeta->extra_offset);
-	size_t		extra_len = __kds_unpack(cmeta->extra_length);
-	cl_uint		len = offset[index+1] - offset[index];
+	cl_uint		len;
 	struct varlena *res;
 
-	if (offset[index] > offset[index + 1] || offset[index+1] > extra_len)
-		elog(ERROR, "corrupted arrow file? offset points out of extra buffer");
+	if (sizeof(uint32) * (index+2) > __kds_unpack(cmeta->values_length))
+		elog(ERROR, "corruption? varlena index out of range");
+	len = offset[index+1] - offset[index];
+	if (offset[index] > offset[index+1] ||
+		offset[index+1] > __kds_unpack(cmeta->extra_length))
+		elog(ERROR, "corruption? varlena points out of extra buffer");
 
 	res = palloc(VARHDRSZ + len);
 	SET_VARSIZE(res, VARHDRSZ + len);
@@ -2766,11 +3173,14 @@ pg_bpchar_arrow_ref(kern_data_store *kds,
 					kern_colmeta *cmeta, size_t index)
 {
 	cl_char	   *values = ((char *)kds + __kds_unpack(cmeta->values_offset));
+	size_t		length = __kds_unpack(cmeta->values_length);
 	cl_int		unitsz = cmeta->atttypmod - VARHDRSZ;
 	struct varlena *res;
 
 	if (unitsz <= 0)
 		elog(ERROR, "CHAR(%d) is not expected", unitsz);
+	if (unitsz * index >= length)
+		elog(ERROR, "corruption? bpchar points out of range");
 	res = palloc(VARHDRSZ + unitsz);
 	memcpy((char *)res + VARHDRSZ, values + unitsz * index, unitsz);
 	SET_VARSIZE(res, VARHDRSZ + unitsz);
@@ -2782,17 +3192,37 @@ static Datum
 pg_bool_arrow_ref(kern_data_store *kds,
 				  kern_colmeta *cmeta, size_t index)
 {
-	char   *bitmap = (char *)kds + __kds_unpack(cmeta->values_offset);
+	uint8  *bitmap = (uint8 *)kds + __kds_unpack(cmeta->values_offset);
+	size_t	length = __kds_unpack(cmeta->values_length);
+	uint8	mask = (1 << (index & 7));
 
-	return BoolGetDatum(att_isnull(index, bitmap));
+	index >>= 3;
+	if (sizeof(uint8) * index >= length)
+		elog(ERROR, "corruption? bool points out of range");
+	return BoolGetDatum((bitmap[index] & mask) != 0 ? true : false);
+}
+
+static Datum
+pg_int1_arrow_ref(kern_data_store *kds,
+				  kern_colmeta *cmeta, size_t index)
+{
+	int8   *values = (int8 *)((char *)kds + __kds_unpack(cmeta->values_offset));
+	size_t	length = __kds_unpack(cmeta->values_length);
+
+	if (sizeof(int8) * index >= length)
+		elog(ERROR, "corruption? int8 points out of range");
+	return values[index];
 }
 
 static Datum
 pg_int2_arrow_ref(kern_data_store *kds,
 				  kern_colmeta *cmeta, size_t index)
 {
-	cl_short   *values = (cl_short *)
-		((char *)kds + __kds_unpack(cmeta->values_offset));
+	int16  *values = (int16 *)((char *)kds + __kds_unpack(cmeta->values_offset));
+	size_t	length = __kds_unpack(cmeta->values_length);
+
+	if (sizeof(int16) * index >= length)
+		elog(ERROR, "corruption? int16 points out of range");
 	return values[index];
 }
 
@@ -2800,8 +3230,11 @@ static Datum
 pg_int4_arrow_ref(kern_data_store *kds,
 				  kern_colmeta *cmeta, size_t index)
 {
-	cl_int	   *values = (cl_int *)
-		((char *)kds + __kds_unpack(cmeta->values_offset));
+	int32  *values = (int32 *)((char *)kds + __kds_unpack(cmeta->values_offset));
+	size_t  length = __kds_unpack(cmeta->values_length);
+
+	if (sizeof(int32) * index >= length)
+		elog(ERROR, "corruption? int32 points out of range");
 	return values[index];
 }
 
@@ -2809,8 +3242,11 @@ static Datum
 pg_int8_arrow_ref(kern_data_store *kds,
 				  kern_colmeta *cmeta, size_t index)
 {
-	cl_long	   *values = (cl_long *)
-		((char *)kds + __kds_unpack(cmeta->values_offset));
+	int64  *values = (int64 *)((char *)kds + __kds_unpack(cmeta->values_offset));
+	size_t	length = __kds_unpack(cmeta->values_length);
+
+	if (sizeof(int64) * index >= length)
+		elog(ERROR, "corruption? int64 points out of range");
 	return values[index];
 }
 
@@ -2820,9 +3256,12 @@ pg_numeric_arrow_ref(kern_data_store *kds,
 {
 	char	   *result = palloc0(sizeof(struct NumericData));
 	char	   *base = (char *)kds + __kds_unpack(cmeta->values_offset);
+	size_t		length = __kds_unpack(cmeta->values_length);
 	int			dscale = cmeta->attopts.decimal.scale;
 	Int128_t	decimal;
 
+	if (sizeof(int128) * index >= length)
+		elog(ERROR, "corruption? numeric points out of range");
 	decimal.ival = ((int128 *)base)[index];
 
 	while (dscale > 0 && decimal.ival % 10 == 0)
@@ -2840,15 +3279,20 @@ pg_date_arrow_ref(kern_data_store *kds,
 				  kern_colmeta *cmeta, size_t index)
 {
 	char	   *base = (char *)kds + __kds_unpack(cmeta->values_offset);
+	size_t		length = __kds_unpack(cmeta->values_length);
 	DateADT		dt;
 
 	switch (cmeta->attopts.date.unit)
 	{
 		case ArrowDateUnit__Day:
-			dt = ((cl_uint *)base)[index];
+			if (sizeof(uint32) * index >= length)
+				elog(ERROR, "corruption? Date[day] points out of range");
+			dt = ((uint32 *)base)[index];
 			break;
 		case ArrowDateUnit__MilliSecond:
-			dt = ((cl_ulong *)base)[index] / 1000;
+			if (sizeof(uint64) * index >= length)
+				elog(ERROR, "corruption? Date[ms] points out of range");
+			dt = ((uint64 *)base)[index] / 1000;
 			break;
 		default:
 			elog(ERROR, "Bug? unexpected unit of Date type");
@@ -2863,24 +3307,34 @@ pg_time_arrow_ref(kern_data_store *kds,
 				  kern_colmeta *cmeta, size_t index)
 {
 	char	   *base = (char *)kds + __kds_unpack(cmeta->values_offset);
+	size_t		length = __kds_unpack(cmeta->values_length);
 	TimeADT		tm;
 
 	switch (cmeta->attopts.time.unit)
 	{
 		case ArrowTimeUnit__Second:
-			tm = ((cl_long)((cl_int *)base)[index]) * 1000000L;
+			if (sizeof(uint32) * index >= length)
+				elog(ERROR, "corruption? Time[sec] points out of range");
+			tm = ((uint32 *)base)[index] * 1000000L;
 			break;
 		case ArrowTimeUnit__MilliSecond:
-			tm = ((cl_long)((cl_int *)base)[index]) * 1000L;
+			if (sizeof(uint32) * index >= length)
+				elog(ERROR, "corruption? Time[ms] points out of range");
+			tm = ((uint32 *)base)[index] * 1000L;
 			break;
 		case ArrowTimeUnit__MicroSecond:
-			tm = ((cl_long *)base)[index];
+			if (sizeof(uint64) * index >= length)
+				elog(ERROR, "corruption? Time[us] points out of range");
+			tm = ((uint64 *)base)[index];
 			break;
 		case ArrowTimeUnit__NanoSecond:
-			tm = ((cl_ulong *)base)[index] / 1000L;
+			if (sizeof(uint64) * index >= length)
+				elog(ERROR, "corruption? Time[ns] points out of range");
+			tm = ((uint64 *)base)[index] / 1000L;
 			break;
 		default:
 			elog(ERROR, "Bug? unexpected unit of Time type");
+			break;
 	}
 	return TimeADTGetDatum(tm);
 }
@@ -2890,33 +3344,34 @@ pg_timestamp_arrow_ref(kern_data_store *kds,
 					   kern_colmeta *cmeta, size_t index)
 {
 	char	   *base = (char *)kds + __kds_unpack(cmeta->values_offset);
-	cl_long		tz_offset = cmeta->attopts.timestamp.tz_offset;
+	size_t		length = __kds_unpack(cmeta->values_length);
 	Timestamp	ts;
 
 	switch (cmeta->attopts.timestamp.unit)
 	{
 		case ArrowTimeUnit__Second:
-			ts = ((cl_ulong *)base)[index] * 1000000UL;
-			if (tz_offset != 0)
-				ts += tz_offset;
+			if (sizeof(uint64) * index >= length)
+				elog(ERROR, "corruption? Timestamp[sec] points out of range");
+			ts = ((uint64 *)base)[index] * 1000000UL;
 			break;
 		case ArrowTimeUnit__MilliSecond:
-			ts = ((cl_ulong *)base)[index] * 1000UL;
-			if (tz_offset != 0)
-				ts += tz_offset * 1000UL;
+			if (sizeof(uint64) * index >= length)
+				elog(ERROR, "corruption? Timestamp[ms] points out of range");
+			ts = ((uint64 *)base)[index] * 1000UL;
 			break;
 		case ArrowTimeUnit__MicroSecond:
-			ts = ((cl_ulong *)base)[index];
-			if (tz_offset != 0)
-				ts += tz_offset * 1000000UL;
+			if (sizeof(uint64) * index >= length)
+				elog(ERROR, "corruption? Timestamp[us] points out of range");
+			ts = ((uint64 *)base)[index];
 			break;
 		case ArrowTimeUnit__NanoSecond:
-			ts = ((cl_ulong *)base)[index] / 1000UL;
-			if (tz_offset != 0)
-				ts += tz_offset * 1000000000UL;
+			if (sizeof(uint64) * index >= length)
+				elog(ERROR, "corruption? Timestamp[ns] points out of range");
+			ts = ((uint64 *)base)[index] / 1000UL;
 			break;
 		default:
 			elog(ERROR, "Bug? unexpected unit of Timestamp type");
+			break;
 	}
 	/* convert UNIX epoch to PostgreSQL epoch */
 	ts -= (POSTGRES_EPOCH_JDATE -
@@ -2929,23 +3384,76 @@ pg_interval_arrow_ref(kern_data_store *kds,
 					  kern_colmeta *cmeta, size_t index)
 {
 	char	   *base = (char *)kds + __kds_unpack(cmeta->values_offset);
+	size_t		length = __kds_unpack(cmeta->values_length);
 	Interval   *iv = palloc0(sizeof(Interval));
 
 	switch (cmeta->attopts.interval.unit)
 	{
 		case ArrowIntervalUnit__Year_Month:
 			/* 32bit: number of months */
-			iv->month = ((cl_uint *)base)[index];
+			if (sizeof(uint32) * index >= length)
+				elog(ERROR, "corruption? Interval[Year/Month] points out of range");
+			iv->month = ((uint32 *)base)[index];
 			break;
 		case ArrowIntervalUnit__Day_Time:
 			/* 32bit+32bit: number of days and milliseconds */
-			iv->day = (int32)(((cl_uint *)base)[2 * index]);
-			iv->time = (TimeOffset)(((cl_uint *)base)[2 * index + 1]) * 1000;
+			if (2 * sizeof(uint32) * index >= length)
+				elog(ERROR, "corruption? Interval[Day/Time] points out of range");
+			iv->day  = ((int32 *)base)[2 * index];
+			iv->time = ((int32 *)base)[2 * index + 1] * 1000;
 			break;
 		default:
 			elog(ERROR, "Bug? unexpected unit of Interval type");
 	}
 	return PointerGetDatum(iv);
+}
+
+static Datum
+pg_macaddr_arrow_ref(kern_data_store *kds,
+					 kern_colmeta *cmeta, size_t index)
+{
+	char   *base = (char *)kds + __kds_unpack(cmeta->values_offset);
+	size_t	length = __kds_unpack(cmeta->values_length);
+
+	if (cmeta->attopts.fixed_size_binary.byteWidth != sizeof(macaddr))
+		elog(ERROR, "Bug? wrong FixedSizeBinary::byteWidth(%d) for macaddr",
+			 cmeta->attopts.fixed_size_binary.byteWidth);
+	if (sizeof(macaddr) * index >= length)
+		elog(ERROR, "corruption? Binary[macaddr] points out of range");
+
+	return PointerGetDatum(base + sizeof(macaddr) * index);
+}
+
+static Datum
+pg_inet_arrow_ref(kern_data_store *kds,
+				  kern_colmeta *cmeta, size_t index)
+{
+	char   *base = (char *)kds + __kds_unpack(cmeta->values_offset);
+	size_t	length = __kds_unpack(cmeta->values_length);
+	inet   *ip = palloc(sizeof(inet));
+
+	if (cmeta->attopts.fixed_size_binary.byteWidth == 4)
+	{
+		if (4 * index >= length)
+			elog(ERROR, "corruption? Binary[inet4] points out of range");
+		ip->inet_data.family = PGSQL_AF_INET;
+		ip->inet_data.bits = 32;
+		memcpy(ip->inet_data.ipaddr, base + 4 * index, 4);
+	}
+	else if (cmeta->attopts.fixed_size_binary.byteWidth == 16)
+	{
+		if (16 * index >= length)
+			elog(ERROR, "corruption? Binary[inet6] points out of range");
+		ip->inet_data.family = PGSQL_AF_INET6;
+		ip->inet_data.bits = 128;
+		memcpy(ip->inet_data.ipaddr, base + 16 * index, 16);
+	}
+	else
+		elog(ERROR, "Bug? wrong FixedSizeBinary::byteWidth(%d) for inet",
+			 cmeta->attopts.fixed_size_binary.byteWidth);
+
+	SET_INET_VARSIZE(ip);
+	return PointerGetDatum(ip);
 }
 
 static Datum
@@ -2956,10 +3464,12 @@ pg_array_arrow_ref(kern_data_store *kds,
 	ArrayType  *res;
 	size_t		sz;
 	cl_uint		i, nitems = end - start;
-	cl_uint	   *offset;
 	bits8	   *nullmap = NULL;
-	char	   *base;
-	size_t		usage;
+	size_t		usage, __usage;
+
+	/* sanity checks */
+	if (start > end)
+		elog(ERROR, "Bug? array index has reversed order [%u..%u]", start, end);
 
 	/* allocation of the result buffer */
 	if (smeta->nullmap_offset != 0)
@@ -2974,12 +3484,7 @@ pg_array_arrow_ref(kern_data_store *kds,
 	}
 	else if (smeta->attlen == -1)
 	{
-		if (smeta->values_offset == 0)
-			elog(ERROR, "Bug? corrupted kernel column metadata");
-		offset = (cl_uint *)((char *)kds + __kds_unpack(smeta->values_offset));
-		sz += (MAXALIGN(VARHDRSZ * nitems) +		/* space for varlena */
-			   MAXALIGN(sizeof(cl_uint) * nitems) +	/* space for alignment */
-			   offset[end] - offset[start]);
+		sz += 400;		/* tentative allocation */
 	}
 	else
 		elog(ERROR, "Bug? corrupted kernel column metadata");
@@ -2994,9 +3499,7 @@ pg_array_arrow_ref(kern_data_store *kds,
 	res->elemtype = smeta->atttypid;
 	ARR_DIMS(res)[0] = nitems;
 	ARR_LBOUND(res)[0] = 1;
-
-	base = ARR_DATA_PTR(res);
-	usage = 0;
+	usage = ARR_DATA_OFFSET(res);
 	for (i=0; i < nitems; i++)
 	{
 		Datum	datum;
@@ -3012,9 +3515,16 @@ pg_array_arrow_ref(kern_data_store *kds,
 		{
 			if (nullmap)
 				nullmap[i>>3] |= (1<<(i&7));
-			usage = TYPEALIGN(smeta->attalign, usage);
-			memcpy(base + usage, &datum, smeta->attlen);
-			usage += smeta->attlen;
+			__usage = TYPEALIGN(smeta->attalign, usage);
+			while (__usage + smeta->attlen > sz)
+			{
+				sz += sz;
+				res = repalloc(res, sz);
+			}
+			if (__usage > usage)
+				memset((char *)res + usage, 0, __usage - usage);
+			memcpy((char *)res + __usage, &datum, smeta->attlen);
+			usage = __usage + smeta->attlen;
 		}
 		else if (smeta->attlen == -1)
 		{
@@ -3022,16 +3532,23 @@ pg_array_arrow_ref(kern_data_store *kds,
 
 			if (nullmap)
 				nullmap[i>>3] |= (1<<(i&7));
-			usage = TYPEALIGN(smeta->attalign, usage);
-			memcpy(base + usage, DatumGetPointer(datum), vl_len);
-			usage += vl_len;
+			__usage = TYPEALIGN(smeta->attalign, usage);
+			while (__usage + vl_len > sz)
+			{
+				sz += sz;
+				res = repalloc(res, sz);
+			}
+			if (__usage > usage)
+				memset((char *)res + usage, 0, __usage - usage);
+			memcpy((char *)res + __usage, DatumGetPointer(datum), vl_len);
+			usage = __usage + vl_len;
 
 			pfree(DatumGetPointer(datum));
 		}
 		else
 			elog(ERROR, "Bug? corrupted kernel column metadata");
 	}
-	SET_VARSIZE(res, (base + usage) - (char *)res);
+	SET_VARSIZE(res, usage);
 
 	return PointerGetDatum(res);
 }
@@ -3060,17 +3577,18 @@ pg_datum_arrow_ref(kern_data_store *kds,
 
 	if (cmeta->atttypkind == TYPE_KIND__ARRAY)
 	{
+		/* array type */
 		kern_colmeta   *smeta;
-		cl_uint		   *offset;
+		uint32		   *offset;
 
 		if (cmeta->num_subattrs != 1 ||
 			cmeta->idx_subattrs < kds->ncols ||
 			cmeta->idx_subattrs >= kds->nr_colmeta)
 			elog(ERROR, "Bug? corrupted kernel column metadata");
+		if (sizeof(uint32) * (index+2) > __kds_unpack(cmeta->values_length))
+			elog(ERROR, "Bug? array index is out of range");
 		smeta = &kds->colmeta[cmeta->idx_subattrs];
-		if (cmeta->values_offset == 0)
-			goto out;		/* not loaded? always NULL */
-		offset = (cl_uint *)((char *)kds + __kds_unpack(cmeta->values_offset));
+		offset = (uint32 *)((char *)kds + __kds_unpack(cmeta->values_offset));
 		datum = pg_array_arrow_ref(kds, smeta,
 								   offset[index],
 								   offset[index+1]);
@@ -3078,6 +3596,7 @@ pg_datum_arrow_ref(kern_data_store *kds,
 	}
 	else if (cmeta->atttypkind == TYPE_KIND__COMPOSITE)
 	{
+		/* composite type */
 		TupleDesc	tupdesc = lookup_rowtype_tupdesc(cmeta->atttypid, -1);
 		Datum	   *sub_values = alloca(sizeof(Datum) * tupdesc->natts);
 		bool	   *sub_isnull = alloca(sizeof(bool)  * tupdesc->natts);
@@ -3105,16 +3624,16 @@ pg_datum_arrow_ref(kern_data_store *kds,
 		datum = PointerGetDatum(htup->t_data);
 		isnull = false;
 	}
-	else if (cmeta->values_offset == 0)
+	else if (cmeta->atttypkind != TYPE_KIND__NULL)
 	{
-		/* not loaded, always null */
-		goto out;
-	}
-	else
-	{
-		Assert(cmeta->atttypkind == TYPE_KIND__BASE);
+		/* anything else, except for unreferenced column */
+		int		i;
+
 		switch (cmeta->atttypid)
 		{
+			case INT1OID:
+				datum = pg_int1_arrow_ref(kds, cmeta, index);
+				break;
 			case INT2OID:
 			case FLOAT2OID:
 				datum = pg_int2_arrow_ref(kds, cmeta, index);
@@ -3153,9 +3672,24 @@ pg_datum_arrow_ref(kern_data_store *kds,
 			case INTERVALOID:
 				datum = pg_interval_arrow_ref(kds, cmeta, index);
 				break;
+			case MACADDROID:
+				datum = pg_macaddr_arrow_ref(kds, cmeta, index);
+				break;
+			case INETOID:
+				datum = pg_inet_arrow_ref(kds, cmeta, index);
+				break;
 			default:
-				elog(ERROR, "Bug? unexpected datum type: %u",
-					 cmeta->atttypid);
+				for (i=0; i < pgstrom_num_users_extra; i++)
+				{
+					pgstromUsersExtraDescriptor *extra = &pgstrom_users_extra_desc[i];
+
+					if (extra->arrow_datum_ref &&
+						extra->arrow_datum_ref(kds, cmeta, index, &datum, &isnull))
+					{
+						goto out;
+					}
+				}
+				elog(ERROR, "Bug? unexpected datum type: %u", cmeta->atttypid);
 				break;
 		}
 		isnull = false;
@@ -3173,8 +3707,6 @@ KDS_fetch_tuple_arrow(TupleTableSlot *slot,
 					  kern_data_store *kds,
 					  size_t index)
 {
-	Datum  *values = slot->tts_values;
-	bool   *isnull = slot->tts_isnull;
 	int		j;
 
 	if (index >= kds->nitems)
@@ -3186,8 +3718,8 @@ KDS_fetch_tuple_arrow(TupleTableSlot *slot,
 
 		pg_datum_arrow_ref(kds, cmeta,
 						   index,
-						   values + j,
-						   isnull + j);
+						   slot->tts_values + j,
+						   slot->tts_isnull + j);
 	}
 	return true;
 }
@@ -3411,6 +3943,7 @@ arrow_fdw_precheck_schema(Relation rel)
 	List		   *filesList;
 	ListCell	   *lc;
 	bool			writable;
+#if 0
 	int				j;
 
 	/* check schema definition is supported by Apache Arrow */
@@ -3425,7 +3958,7 @@ arrow_fdw_precheck_schema(Relation rel)
 				 RelationGetRelationName(rel),
 				 format_type_be(attr->atttypid));
 	}
-
+#endif
 	filesList = __arrowFdwExtractFilesList(ft->options,
 										   NULL,
 										   &writable);
@@ -3470,7 +4003,8 @@ pgstrom_arrow_fdw_precheck_schema(PG_FUNCTION_ARGS)
 	if (strcmp(trigdata->event, "ddl_command_end") != 0)
 		elog(ERROR, "%s: must be called on ddl_command_end event",
 			 __FUNCTION__);
-	if (strcmp(trigdata->tag, "CREATE FOREIGN TABLE") == 0)
+	if (strcmp(GetCommandTagName(trigdata->tag),
+			   "CREATE FOREIGN TABLE") == 0)
 	{
 		CreateStmt	   *stmt = (CreateStmt *)trigdata->parsetree;
 		Relation		rel;
@@ -3485,7 +4019,9 @@ pgstrom_arrow_fdw_precheck_schema(PG_FUNCTION_ARGS)
 		}
 		relation_close(rel, AccessShareLock);
 	}
-	else if (strcmp(trigdata->tag, "ALTER FOREIGN TABLE") == 0)
+	else if (strcmp(GetCommandTagName(trigdata->tag),
+					"ALTER FOREIGN TABLE") == 0 &&
+			 IsA(trigdata->parsetree, AlterTableStmt))
 	{
 		AlterTableStmt *stmt = (AlterTableStmt *)trigdata->parsetree;
 		Relation		rel;
@@ -3515,11 +4051,6 @@ pgstrom_arrow_fdw_precheck_schema(PG_FUNCTION_ARGS)
 		}
 		relation_close(rel, AccessShareLock);
 	}
-	else
-	{
-		elog(NOTICE, "%s was called on %s, ignored",
-			 __FUNCTION__, trigdata->tag);
-	}
 	PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_arrow_fdw_precheck_schema);
@@ -3530,7 +4061,7 @@ PG_FUNCTION_INFO_V1(pgstrom_arrow_fdw_precheck_schema);
  * NOTE: caller must have lock_slots[] with EXCLUSIVE mode
  */
 static uint64
-arrowInvalidateMetadataCache(arrowMetadataCache *mcache, bool detach_lru)
+__arrowInvalidateMetadataCache(arrowMetadataCache *mcache, bool detach_lru)
 {
 	arrowMetadataCache *mtemp;
 	dlist_node	   *dnode;
@@ -3558,8 +4089,28 @@ arrowInvalidateMetadataCache(arrowMetadataCache *mcache, bool detach_lru)
 	dlist_delete(&mcache->chain);
 	pfree(mcache);
 
-	return pg_atomic_sub_fetch_u64(&arrow_metadata_state->consumed,
-								   released);
+	return pg_atomic_sub_fetch_u64(&arrow_metadata_state->consumed, released);
+}
+
+static void
+arrowInvalidateMetadataCache(MetadataCacheKey *mkey, bool detach_lru)
+{
+	dlist_mutable_iter miter;
+	int		index = mkey->hash % ARROW_METADATA_HASH_NSLOTS;
+
+	dlist_foreach_modify(miter, &arrow_metadata_state->hash_slots[index])
+	{
+		arrowMetadataCache *mcache
+			= dlist_container(arrowMetadataCache, chain, miter.cur);
+
+		if (mcache->stat_buf.st_dev == mkey->st_dev &&
+			mcache->stat_buf.st_ino == mkey->st_ino)
+		{
+			elog(DEBUG2, "arrow_fdw: metadata cache invalidation for the file (st_dev=%lu/st_ino=%lu)",
+				 mkey->st_dev, mkey->st_ino);
+			__arrowInvalidateMetadataCache(mcache, true);
+		}
+	}
 }
 
 /*
@@ -3670,7 +4221,7 @@ arrowReclaimMetadataCache(void)
 			dlist_delete(&mcache->lru_chain);
 			memset(&mcache->lru_chain, 0, sizeof(dlist_node));
 			SpinLockRelease(&arrow_metadata_state->lru_lock);
-			consumed = arrowInvalidateMetadataCache(mcache, false);
+			consumed = __arrowInvalidateMetadataCache(mcache, false);
 		}
 		else
 		{
@@ -3799,12 +4350,7 @@ arrowLookupOrBuildMetadataCache(File fdesc)
 	if (fstat(FileGetRawDesc(fdesc), &stat_buf) != 0)
 		elog(ERROR, "failed on fstat('%s'): %m", FilePathName(fdesc));
 
-	memset(&key, 0, sizeof(key));
-	key.st_dev	= stat_buf.st_dev;
-	key.st_ino	= stat_buf.st_ino;
-	key.hash = hash_any((unsigned char *)&key,
-						offsetof(MetadataCacheKey, hash));
-	index = key.hash % ARROW_METADATA_HASH_NSLOTS;
+	index = initMetadataCacheKey(&key, stat_buf.st_dev, stat_buf.st_ino);
 	lock = &arrow_metadata_state->lock_slots[index];
 	hash_slot = &arrow_metadata_state->hash_slots[index];
 	mvcc_slot = &arrow_metadata_state->mvcc_slots[index];
@@ -3819,7 +4365,7 @@ retry:
 			mcache->stat_buf.st_ino == stat_buf.st_ino)
 		{
 			RecordBatchState *rbstate;
-			
+
 			Assert(mcache->hash == key.hash);
 			if (timespec_comp(&mcache->stat_buf.st_mtim,
 							  &stat_buf.st_mtim) < 0 ||
@@ -3846,7 +4392,7 @@ retry:
 				for (tail=buf4+strlen(buf4)-1; isspace(*tail); *tail--='\0');
 				elog(DEBUG2, "arrow_fdw: metadata cache for '%s' (m:%s, c:%s) is older than the latest file (m:%s, c:%s), so invalidated",
 					 FilePathName(fdesc), buf1, buf2, buf3, buf4);
-				arrowInvalidateMetadataCache(mcache, true);
+				__arrowInvalidateMetadataCache(mcache, true);
 				break;
 			}
 			/*
@@ -3938,6 +4484,50 @@ retry:
 }
 
 /*
+ * lookup_type_extension_info
+ */
+static void
+lookup_type_extension_info(Oid type_oid,
+						   const char **p_extname,
+						   const char **p_extschema)
+{
+	Oid		ext_oid;
+	char   *extname = NULL;
+	char   *extschema = NULL;
+
+	ext_oid = get_object_extension_oid(TypeRelationId,
+									   type_oid, 0, true);
+	if (OidIsValid(ext_oid))
+	{
+		Relation	rel;
+		SysScanDesc	sscan;
+		ScanKeyData	skey;
+		HeapTuple	tup;
+
+		rel = table_open(ExtensionRelationId, AccessShareLock);
+		ScanKeyInit(&skey,
+					Anum_pg_extension_oid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(ext_oid));
+		sscan = systable_beginscan(rel, ExtensionOidIndexId,
+								   true, NULL, 1, &skey);
+		tup = systable_getnext(sscan);
+		if (HeapTupleIsValid(tup))
+		{
+			Form_pg_extension __ext = (Form_pg_extension) GETSTRUCT(tup);
+
+			extname = pstrdup(NameStr(__ext->extname));
+			if (__ext->extrelocatable)
+				extschema = get_namespace_name(__ext->extnamespace);
+		}
+		systable_endscan(sscan);
+		table_close(rel, AccessShareLock);
+	}
+	*p_extname = extname;
+	*p_extschema = extschema;
+}
+
+/*
  * setupArrowSQLbufferSchema
  */
 static void
@@ -3945,36 +4535,53 @@ __setupArrowSQLbufferField(SQLtable *table,
 						   SQLfield *column,
 						   const char *attname,
 						   Oid atttypid,
-						   int atttypmod)
+						   int32 atttypmod)
 {
 	HeapTuple		tup;
-	Form_pg_type	typ;
+	Form_pg_type	__type;
+	const char	   *typname;
 	const char	   *typnamespace;
-	const char	   *tz = show_timezone();
+	const char	   *timezone = show_timezone();
+	const char	   *extname;
+	const char	   *extschema;
 
-	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(atttypid));
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for type: %u", atttypid);
-	typ = (Form_pg_type) GETSTRUCT(tup);
-	typnamespace = get_namespace_name(typ->typnamespace);
-
+	/* walk down to the base type, if domain */
+	for (;;)
+	{
+		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(atttypid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for type: %u", atttypid);
+		__type = (Form_pg_type) GETSTRUCT(tup);
+		if (__type->typtype != TYPTYPE_DOMAIN)
+			break;
+		atttypid = __type->typbasetype;
+		atttypmod = __type->typtypmod;
+		ReleaseSysCache(tup);
+	}
+	typname = NameStr(__type->typname);
+	typnamespace = get_namespace_name(__type->typnamespace);
+	lookup_type_extension_info(atttypid,
+							   &extname,
+							   &extschema);
 	table->numFieldNodes++;
     table->numBuffers +=
 		assignArrowTypePgSQL(column,
 							 attname,
 							 atttypid,
 							 atttypmod,
-							 NameStr(typ->typname),
+							 typname,
 							 typnamespace,
-							 typ->typlen,
-							 typ->typbyval,
-							 typ->typtype,
-							 typ->typalign,
-							 typ->typrelid,
-							 typ->typelem,
-							 tz,
-							 getTimezoneOffset(tz) * -1000000L);	/* [us]*/
-	if (OidIsValid(typ->typelem))
+							 __type->typlen,
+							 __type->typbyval,
+							 __type->typtype,
+							 __type->typalign,
+							 __type->typrelid,
+							 __type->typelem,
+							 timezone,
+							 extname,
+							 extschema,
+							 NULL);
+	if (OidIsValid(__type->typelem) && __type->typlen == -1)
 	{
 		/* array type */
 		char		elem_name[NAMEDATALEN+10];
@@ -3984,10 +4591,10 @@ __setupArrowSQLbufferField(SQLtable *table,
 		__setupArrowSQLbufferField(table,
 								   column->element,
 								   elem_name,
-								   typ->typelem,
+								   __type->typelem,
 								   -1);
 	}
-	else if (OidIsValid(typ->typrelid))
+	else if (OidIsValid(__type->typrelid))
 	{
 		/* composite type */
 		TupleDesc	tupdesc = lookup_rowtype_tupdesc(atttypid, atttypmod);
@@ -4006,7 +4613,7 @@ __setupArrowSQLbufferField(SQLtable *table,
 		}
 		ReleaseTupleDesc(tupdesc);
 	}
-	else if (typ->typtype == 'e')
+	else if (__type->typtype == 'e')
 	{
 		elog(ERROR, "Enum type is not supported right now");
 	}
@@ -4043,13 +4650,7 @@ setupArrowSQLbufferBatches(SQLtable *table)
 
 	if (fstat(table->fdesc, &stat_buf) != 0)
 		elog(ERROR, "failed on fstat('%s'): %m", table->filename);
-	memset(&key, 0, sizeof(key));
-	key.st_dev = stat_buf.st_dev;
-	key.st_ino = stat_buf.st_ino;
-	key.hash = hash_any((unsigned char *)&key,
-						offsetof(MetadataCacheKey, hash));
-	index = key.hash % ARROW_METADATA_HASH_NSLOTS;
-
+	index = initMetadataCacheKey(&key, stat_buf.st_dev, stat_buf.st_ino);
 	LWLockAcquire(&arrow_metadata_state->lock_slots[index], LW_SHARED);
 	readArrowFileDesc(table->fdesc, &af_info);
 	LWLockRelease(&arrow_metadata_state->lock_slots[index]);
@@ -4099,48 +4700,13 @@ setupArrowSQLbufferBatches(SQLtable *table)
 	if (lseek(table->fdesc, pos, SEEK_SET) < 0)
 		elog(ERROR, "failed on lseek('%s',%lu): %m",
 			 table->filename, pos);
-}
-
-/*
- * createArrowWriteState
- */
-static arrowWriteState *
-createArrowWriteState(Relation frel, File file, bool redo_log_written)
-{
-	TupleDesc		tupdesc = RelationGetDescr(frel);
-	arrowWriteState *aw_state;
-	SQLtable	   *table;
-	struct stat		stat_buf;
-	MetadataCacheKey key;
-
-	if (fstat(FileGetRawDesc(file), &stat_buf) != 0)
-		elog(ERROR, "failed on fstat('%s'): %m", FilePathName(file));
-	memset(&key, 0, sizeof(key));
-	key.st_dev = stat_buf.st_dev;
-	key.st_ino = stat_buf.st_ino;
-	key.hash = hash_any((unsigned char *)&key,
-						offsetof(MetadataCacheKey, hash));
-	aw_state = palloc0(offsetof(arrowWriteState,
-								sql_table.columns[tupdesc->natts]));
-	aw_state->memcxt = CurrentMemoryContext;
-	aw_state->file = file;
-	aw_state->key = key;
-	aw_state->hash = key.hash;
-	aw_state->redo_log_written = redo_log_written;
-	table = &aw_state->sql_table;
-	table->filename = FilePathName(file);
-	table->fdesc = FileGetRawDesc(file);
-	setupArrowSQLbufferSchema(table, tupdesc);
-	if (!redo_log_written)
-		setupArrowSQLbufferBatches(table);
-
-	return aw_state;
+	table->f_pos = pos;
 }
 
 /*
  * createArrowWriteRedoLog
  */
-static void
+static loff_t
 createArrowWriteRedoLog(File filp, bool is_newfile)
 {
 	arrowWriteRedoLog *redo;
@@ -4155,26 +4721,21 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 
 	if (fstat(fdesc, &stat_buf) != 0)
 		elog(ERROR, "failed on fstat(2): %m");
+	initMetadataCacheKey(&key, stat_buf.st_dev, stat_buf.st_ino);
 
 	dlist_foreach(iter, &arrow_write_redo_list)
 	{
 		redo = dlist_container(arrowWriteRedoLog, chain, iter.cur);
 
-		if (redo->key.st_dev == stat_buf.st_dev &&
-			redo->key.st_ino == stat_buf.st_ino &&
+		if (redo->key.st_dev == key.st_dev &&
+			redo->key.st_ino == key.st_ino &&
 			redo->xid    == curr_xid &&
 			redo->cid    <= curr_cid)
 		{
-			/* nothing to do */
-			return;
+			elog(ERROR, "Why? '%s' on behalf of arrow_fdw foreign-table is concurrently opened for update, please confirm the configuration", fname);
 		}
 	}
 
-	memset(&key, 0, sizeof(MetadataCacheKey));
-	key.st_dev = stat_buf.st_dev;
-	key.st_ino = stat_buf.st_ino;
-	key.hash = hash_any((unsigned char *)&key,
-						offsetof(MetadataCacheKey, hash));
 	if (is_newfile)
 	{
 		main_sz = MAXALIGN(offsetof(arrowWriteRedoLog, footer_backup));
@@ -4186,6 +4747,8 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 		redo->pathname = (char *)redo + main_sz;
 		strcpy(redo->pathname, fname);
 		redo->is_truncate = false;
+		redo->footer_offset = 0;
+		redo->footer_length = 0;
 	}
 	else
 	{
@@ -4195,11 +4758,9 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 
 		/* make backup image of the Footer section */
 		nbytes = sizeof(int32) + 6;		/* = strlen("ARROW1") */
-		offset = lseek(fdesc, -nbytes, SEEK_END);
-		if (offset < 0)
-			elog(ERROR, "failed on lseek(2): %m");
-		if (__readFile(fdesc, temp, nbytes) != nbytes)
-			elog(ERROR, "failed on read(2): %m");
+		offset = stat_buf.st_size - nbytes;
+		if (__preadFile(fdesc, temp, nbytes, offset) != nbytes)
+			elog(ERROR, "failed on pread(2): %m");
 		offset -= *((int32 *)temp);
 
 		nbytes = stat_buf.st_size - offset;
@@ -4214,13 +4775,12 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 		redo->cid = curr_cid;
 		redo->pathname = (char *)redo + main_sz;
 		strcpy(redo->pathname, fname);
+		redo->is_truncate = false;
 		PG_TRY();
 		{
-			if (lseek(fdesc, -nbytes, SEEK_END) < 0)
-				elog(ERROR, "failed on lseek(2): %m");
-			if (__readFile(fdesc, redo->footer_backup, nbytes) != nbytes)
-				elog(ERROR, "failed on read(2): %m");
-			if (lseek(fdesc, -nbytes, SEEK_END) < 0)
+			if (__preadFile(fdesc, redo->footer_backup, nbytes, offset) != nbytes)
+				elog(ERROR, "failed on pread(2): %m");
+			if (lseek(fdesc, offset, SEEK_SET) < 0)
 				elog(ERROR, "failed on lseek(2): %m");
 			redo->footer_offset = offset;
 			redo->footer_length = nbytes;
@@ -4239,6 +4799,8 @@ createArrowWriteRedoLog(File filp, bool is_newfile)
 		 (uint64)redo->footer_length);
 
 	dlist_push_head(&arrow_write_redo_list, &redo->chain);
+
+	return redo->footer_offset;
 }
 
 /*
@@ -4249,8 +4811,6 @@ writeOutArrowRecordBatch(arrowWriteState *aw_state, bool with_footer)
 {
 	SQLtable   *table = &aw_state->sql_table;
 	int			index = aw_state->hash % ARROW_METADATA_HASH_NSLOTS;
-	struct stat	stat_buf;
-	ssize_t		nbytes;
 	arrowWriteMVCCLog *mvcc = NULL;
 
 	if (table->nitems > 0)
@@ -4266,38 +4826,38 @@ writeOutArrowRecordBatch(arrowWriteState *aw_state, bool with_footer)
 	{
 		LWLockAcquire(&arrow_metadata_state->lock_slots[index],
 					  LW_EXCLUSIVE);
-		/* get the latest state of the file */
-		if (fstat(table->fdesc, &stat_buf) != 0)
-			elog(ERROR, "failed on fstat('%s'): %m", table->filename);
-		/* make a REDO log entry */
-		if (!aw_state->redo_log_written)
-		{
-			createArrowWriteRedoLog(aw_state->file, false);
-			aw_state->redo_log_written = true;
-		}
 		/* write out an empty arrow file */
-		if (stat_buf.st_size == 0)
+		if (table->f_pos == 0)
 		{
-			Assert(lseek(table->fdesc, 0, SEEK_END) == 0);
-			nbytes = __writeFile(table->fdesc, "ARROW1\0\0", 8);
-			if (nbytes != 8)
-				elog(ERROR, "failed on __writeFile('%s'): %m",
-					 table->filename);
+			arrowFileWrite(table, "ARROW1\0\0", 8);
 			writeArrowSchema(table);
 		}
 		if (table->nitems > 0)
 		{
 			mvcc->record_batch = writeArrowRecordBatch(table);
+			sql_table_clear(table);
 			dlist_push_tail(&arrow_metadata_state->mvcc_slots[index],
 							&mvcc->chain);
 			elog(DEBUG2,
-				 "arrow-write: '%s' (st_dev=%u, st_ino=%u), xid=%u, cid=%u, record_batch=%u",
+				 "arrow-write: '%s' (st_dev=%u, st_ino=%u), xid=%u, cid=%u, record_batch=%u nitems=%lu",
 				 FilePathName(aw_state->file),
 				 (uint32)mvcc->key.st_dev, (uint32)mvcc->key.st_ino,
-				 (uint32)mvcc->xid, (uint32)mvcc->cid, mvcc->record_batch);
+				 (uint32)mvcc->xid, (uint32)mvcc->cid, mvcc->record_batch,
+				 table->nitems);
 		}
 		if (with_footer)
 			writeArrowFooter(table);
+
+		/*
+		 * Invalidation of the metadata cache, if any
+		 *
+		 * NOTE: metadata cache shall be invalidated on the next reference,
+		 * if st_mtime of the file is newer than st_mtime of the mcache.
+		 * Linux kernel offers nanosecond precision in st_Xtime, but it never
+		 * guarantee the st_Xtime is recorded in nanosecond precision...
+		 */
+		arrowInvalidateMetadataCache(&aw_state->key, true);
+
 		LWLockRelease(&arrow_metadata_state->lock_slots[index]);
 	}
 	PG_CATCH();
@@ -4321,16 +4881,15 @@ __arrowExecTruncateRelation(Relation frel)
 	arrowWriteRedoLog *redo;
 	struct stat	stat_buf;
 	MetadataCacheKey key;
+	int			index;
 	List	   *filesList;
 	SQLtable   *table;
 	const char *path_name;
 	const char *dir_name;
 	const char *file_name;
 	size_t		main_sz;
-	int			dirfd = -1;
 	int			fdesc = -1;
-	int			nbytes;
-	char		path[MAXPGPATH];
+	char		backup_path[MAXPGPATH];
 	bool		writable;
 
 	filesList = __arrowFdwExtractFilesList(ft->options,
@@ -4343,11 +4902,12 @@ __arrowExecTruncateRelation(Relation frel)
 	path_name = strVal(linitial(filesList));
 	if (stat(path_name, &stat_buf) != 0)
 		elog(ERROR, "failed on stat('%s'): %m", path_name);
-	memset(&key, 0, sizeof(key));
-	key.st_dev = stat_buf.st_dev;
-	key.st_ino = stat_buf.st_ino;
-	key.hash = hash_any((unsigned char *)&key,
-						offsetof(MetadataCacheKey, hash));
+	/* metadata cache invalidation */
+	index = initMetadataCacheKey(&key, stat_buf.st_dev, stat_buf.st_ino);
+	LWLockAcquire(&arrow_metadata_state->lock_slots[index], LW_EXCLUSIVE);
+	arrowInvalidateMetadataCache(&key, true);
+	LWLockRelease(&arrow_metadata_state->lock_slots[index]);
+
 	/* build SQLtable to write out schema */
 	table = palloc0(offsetof(SQLtable, columns[tupdesc->natts]));
 	setupArrowSQLbufferSchema(table, tupdesc);
@@ -4356,75 +4916,73 @@ __arrowExecTruncateRelation(Relation frel)
 	main_sz = MAXALIGN(offsetof(arrowWriteRedoLog, footer_backup));
 	redo = MemoryContextAllocZero(CacheMemoryContext,
 								  main_sz + strlen(path_name) + 1);
-	redo->key    = key;
 	redo->xid    = GetCurrentTransactionId();
 	redo->cid    = GetCurrentCommandId(true);
 	redo->pathname = (char *)redo + main_sz;
 	strcpy(redo->pathname, path_name);
 	redo->is_truncate = true;
 
-	/* open directory of the arrow file (must have write permission) */
-	dir_name = dirname(pstrdup(path_name));
-	file_name = basename(pstrdup(path_name));
-	dirfd = open(dir_name, O_RDONLY | O_DIRECTORY);
-	if (dirfd < 0)
-	{
-		pfree(redo);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open directory '%s': %m", dir_name)));
-	}
-
 	PG_TRY();
 	{
-		/* create an empty file */
-	retry:
-		redo->suffix = random();
-		snprintf(path, sizeof(path), "%s.%u.backup",
-				 file_name, redo->suffix);
-		fdesc = openat(dirfd, path, O_RDWR | O_CREAT | O_EXCL, 0600);
-		if (fdesc < 0)
+		/*
+		 * move the current arrow file to the backup
+		 */
+		dir_name = dirname(pstrdup(path_name));
+		file_name = basename(pstrdup(path_name));
+		for (;;)
 		{
-			if (errno == EEXIST)
-				goto retry;
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not create a file '%s' at '%s': %m",
-							path, dir_name)));
+			redo->suffix = random();
+			snprintf(backup_path, sizeof(backup_path),
+					 "%s/%s.%u.backup",
+					 dir_name, file_name, redo->suffix);
+			if (stat(backup_path, &stat_buf) != 0)
+			{
+				if (errno == ENOENT)
+					break;
+				elog(ERROR, "failed on stat('%s'): %m", backup_path);
+			}
 		}
+		if (rename(path_name, backup_path) != 0)
+			elog(ERROR, "failed on rename('%s','%s'): %m",
+				 path_name, backup_path);
 
-		/* write out an empty arrow file */
-		table->filename = path;
-		table->fdesc = fdesc;
-		nbytes = __writeFile(table->fdesc, "ARROW1\0\0", 8);
-		if (nbytes != 8)
-			elog(ERROR, "failed on __writeFile('%s'): %m", path);
-		writeArrowSchema(table);
-		writeArrowFooter(table);
-
-		/* swap two files atomically */
-		if (renameat2(dirfd, file_name,
-					  dirfd, path, RENAME_EXCHANGE) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("failed to swap '%s' and '%s' at '%s': %m",
-							file_name, path, dir_name)));
+		/*
+		 * create an empty arrow file
+		 */
+		PG_TRY();
+		{
+			fdesc = open(path_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+			if (fdesc < 0)
+				elog(ERROR, "failed on open('%s'): %m", path_name);
+			if (fstat(fdesc, &stat_buf) != 0)
+				elog(ERROR, "failed on fstat('%s'): %m", path_name);
+			initMetadataCacheKey(&redo->key,
+								 stat_buf.st_dev,
+								 stat_buf.st_ino);
+			table->filename = path_name;
+			table->fdesc = fdesc;
+			arrowFileWrite(table, "ARROW1\0\0", 8);
+			writeArrowSchema(table);
+			writeArrowFooter(table);
+		}
+		PG_CATCH();
+		{
+			if (fdesc >= 0)
+				close(fdesc);
+			if (rename(backup_path, path_name) != 0)
+				elog(WARNING, "failed on rename('%s', '%s'): %m",
+					 backup_path, path_name);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		close(fdesc);
 	}
 	PG_CATCH();
 	{
-		if (fdesc >= 0)
-		{
-			unlinkat(dirfd, path, 0);
-			close(fdesc);
-		}
-		close(dirfd);
 		pfree(redo);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	close(fdesc);
-	close(dirfd);
-
 	/* save the REDO log entry */
 	dlist_push_head(&arrow_write_redo_list, &redo->chain);
 }
@@ -4486,6 +5044,7 @@ __applyArrowTruncateRedoLog(arrowWriteRedoLog *redo, bool is_commit)
 							backup),
 					 errhint("please restore \"%s\" to \"%s\" manually",
 							 backup, redo->pathname)));
+		arrowInvalidateMetadataCache(&redo->key, true);
 	}
 }
 
@@ -4541,6 +5100,9 @@ __applyArrowInsertRedoLog(arrowWriteRedoLog *redo, bool is_commit)
 				 errmsg("failed on ftruncate('%s'): %m", redo->pathname),
 				 errdetail("could not apply REDO image, therefore, arrow file might be corrupted")));
 	}
+	/* invalidation of the metadata-cache */
+	arrowInvalidateMetadataCache(&redo->key, true);
+
 	close(fdesc);
 
 	elog(DEBUG2, "arrow_fdw: REDO log applied (xid=%u, cid=%u, file=[%s], offset=%zu, length=%zu)", redo->xid, redo->cid, redo->pathname, redo->footer_offset, redo->footer_length);
@@ -4841,7 +5403,7 @@ BuildArrowGpuBufferCupy(Relation frel,
 		/*
 		 * Open GPU device memory, and load the array from apache arrow files
 		 */
-		gcontext = AllocGpuContext(cuda_dindex, true, true, false);
+		gcontext = AllocGpuContext(cuda_dindex, true, false);
 		rc = gpuIpcOpenMemHandle(gcontext,
 								 &gmem_ptr,
 								 gpubuf->ipc_mhandle,
@@ -5499,6 +6061,10 @@ pgstrom_init_arrow_fdw(void)
 	r->BeginForeignModify			= ArrowBeginForeignModify;
 	r->ExecForeignInsert			= ArrowExecForeignInsert;
 	r->EndForeignModify				= ArrowEndForeignModify;
+#if PG_VERSION_NUM >= 110000
+	r->BeginForeignInsert			= ArrowBeginForeignInsert;
+	r->EndForeignInsert				= ArrowEndForeignInsert;
+#endif
 	r->ExplainForeignModify			= ArrowExplainForeignModify;
 
 	/*

@@ -3,17 +3,11 @@
  *
  * half-precision floating point data type support
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
@@ -52,12 +46,14 @@ Datum pgstrom_float2_recv(PG_FUNCTION_ARGS);
 /* type cast functions */
 Datum pgstrom_float2_to_float4(PG_FUNCTION_ARGS);
 Datum pgstrom_float2_to_float8(PG_FUNCTION_ARGS);
+Datum pgstrom_float2_to_int1(PG_FUNCTION_ARGS);
 Datum pgstrom_float2_to_int2(PG_FUNCTION_ARGS);
 Datum pgstrom_float2_to_int4(PG_FUNCTION_ARGS);
 Datum pgstrom_float2_to_int8(PG_FUNCTION_ARGS);
 Datum pgstrom_float2_to_numeric(PG_FUNCTION_ARGS);
 Datum pgstrom_float4_to_float2(PG_FUNCTION_ARGS);
 Datum pgstrom_float8_to_float2(PG_FUNCTION_ARGS);
+Datum pgstrom_int1_to_float2(PG_FUNCTION_ARGS);
 Datum pgstrom_int2_to_float2(PG_FUNCTION_ARGS);
 Datum pgstrom_int4_to_float2(PG_FUNCTION_ARGS);
 Datum pgstrom_int8_to_float2(PG_FUNCTION_ARGS);
@@ -425,6 +421,24 @@ pgstrom_float2_to_float8(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(pgstrom_float2_to_float8);
 
 /*
+ * pgstrom_float2_to_int1
+ */
+Datum
+pgstrom_float2_to_int1(PG_FUNCTION_ARGS)
+{
+	float	fval = fp16_to_fp32(PG_GETARG_FLOAT2(0));
+	Datum	ival = DirectFunctionCall1(ftoi4, Float4GetDatum(fval));
+
+	if (DatumGetInt32(ival) < SCHAR_MIN ||
+		DatumGetInt32(ival) > SCHAR_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("tinyint out of range")));
+	return ival;
+}
+PG_FUNCTION_INFO_V1(pgstrom_float2_to_int1);
+
+/*
  * pgstrom_float2_to_int2
  */
 Datum
@@ -495,6 +509,18 @@ pgstrom_float8_to_float2(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT2(fp64_to_fp16(fval));
 }
 PG_FUNCTION_INFO_V1(pgstrom_float8_to_float2);
+
+/*
+ * pgstrom_int1_to_float2
+ */
+Datum
+pgstrom_int1_to_float2(PG_FUNCTION_ARGS)
+{
+	float	fval = (float)((int32)PG_GETARG_DATUM(0));
+
+	PG_RETURN_FLOAT2(fp32_to_fp16(fval));
+}
+PG_FUNCTION_INFO_V1(pgstrom_int1_to_float2);
 
 /*
  * pgstrom_int2_to_float2
@@ -1529,8 +1555,8 @@ pgstrom_define_shell_type(PG_FUNCTION_ARGS)
 	CatalogTupleInsert(type_rel, tup);
 
 	/* create dependencies */
-	GenerateTypeDependencies(type_oid,
-							 (Form_pg_type) GETSTRUCT(tup),
+	GenerateTypeDependencies(tup,
+							 type_rel,
 							 NULL,
 							 NULL,
 							 0,

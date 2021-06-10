@@ -3,12 +3,11 @@
  *
  * Header file of pg_strom module
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
- * This software is an extension of PostgreSQL; You can use, copy,
- * modify or distribute it under the terms of 'LICENSE' included
- * within this package.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef PG_STROM_H
 #define PG_STROM_H
@@ -22,13 +21,21 @@
 
 #include "access/brin.h"
 #include "access/brin_revmap.h"
+#include "access/generic_xlog.h"
+#include "access/gist.h"
 #include "access/hash.h"
 #include "access/heapam.h"
+#include "access/heapam_xlog.h"
+#if PG_VERSION_NUM >= 130000
+#include "access/heaptoast.h"
+#endif
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
+#if PG_VERSION_NUM < 130000
 #include "access/tuptoaster.h"
+#endif
 #include "access/twophase.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
@@ -45,6 +52,8 @@
 #include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
@@ -57,6 +66,8 @@
 #include "catalog/pg_type.h"
 #if PG_VERSION_NUM < 110000
 #include "catalog/pg_type_fn.h"
+#else
+#include "catalog/pg_type_d.h"
 #endif
 #include "catalog/pg_user_mapping.h"
 #include "commands/dbcommands.h"
@@ -64,11 +75,16 @@
 #include "commands/event_trigger.h"
 #include "commands/explain.h"
 #include "commands/proclang.h"
+#include "commands/tablecmds.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "commands/variable.h"
 #include "common/base64.h"
+#if PG_VERSION_NUM >= 130000
+#include "common/hashfn.h"
+#endif
+#include "common/int.h"
 #include "common/md5.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
@@ -83,6 +99,7 @@
 #include "lib/stringinfo.h"
 #include "libpq/be-fsstubs.h"
 #include "libpq/libpq-fs.h"
+#include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
@@ -95,6 +112,9 @@
 #include "nodes/readfuncs.h"
 #if PG_VERSION_NUM < 120000
 #include "nodes/relation.h"
+#endif
+#if PG_VERSION_NUM >= 120000
+#include "nodes/supportnodes.h"
 #endif
 #if PG_VERSION_NUM >= 120000
 #include "optimizer/appendinfo.h"
@@ -115,6 +135,7 @@
 #if PG_VERSION_NUM < 120000
 #include "optimizer/var.h"
 #endif
+#include "parser/parse_coerce.h"
 #include "parser/parsetree.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
@@ -144,6 +165,7 @@
 #include "utils/builtins.h"
 #include "utils/bytea.h"
 #include "utils/cash.h"
+#include "utils/catcache.h"
 #include "utils/date.h"
 #if PG_VERSION_NUM >= 120000
 #include "utils/float.h"
@@ -180,7 +202,6 @@
 #define CUDA_API_PER_THREAD_DEFAULT_STREAM		1
 #include <cuda.h>
 #include <nvrtc.h>
-
 #include <assert.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -196,8 +217,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/vfs.h>
+#include <heterodb_extra.h>
 
-#include "nvme_strom.h"
 #include "arrow_defs.h"
 
 /*
@@ -215,14 +236,16 @@
 #if SIZEOF_DATUM != 8
 #error PG-Strom expects 64bit platform
 #endif
-#if MAXIMUM_ALIGNOF != 8
-#error MAXALIGN() expects 64bit alignment
-#else
-#define MAXIMUM_ALIGNOF_SHIFT 3
-#endif
+#if PG_VERSION_NUM < 130000
+/*
+ * At PG13, 2e4db241bfd3206bad8286f8ffc2db6bbdaefcdf removed
+ * '--disable-float4-byval' configure flag, thus, float32 should be
+ * always passed by value.
+ */
 #ifndef USE_FLOAT4_BYVAL
 #error PG-Strom expects float32 is referenced by value, not reference
 #endif
+#endif /* VER < PG13*/
 #ifndef USE_FLOAT8_BYVAL
 #error PG-Strom expexts float64 is referenced by value, not reference
 #endif
@@ -232,27 +255,16 @@
 #include "cuda_common.h"
 #include "pg_compat.h"
 
-#define PGSTROM_SCHEMA_NAME		"pgstrom"
-
 #define RESTRACK_HASHSIZE		53
-#define CUDA_MODULES_HASHSIZE	25
-
-#define GPUCTX_CMD__RECLAIM_MEMORY		0x0001
-
 typedef struct GpuContext
 {
 	dlist_node		chain;
 	pg_atomic_uint32 refcnt;
 	ResourceOwner	resowner;
-	cl_bool			never_use_mps;
 	/* cuda resources per GpuContext */
 	cl_int			cuda_dindex;
 	CUdevice		cuda_device;
 	CUcontext		cuda_context;
-	CUevent		   *cuda_events0; /* per-worker general purpose event */
-	CUevent		   *cuda_events1; /* per-worker general purpose event */
-	pthread_mutex_t	cuda_modules_lock;
-	dlist_head		cuda_modules_slot[CUDA_MODULES_HASHSIZE];
 	/* resource management */
 	slock_t			restrack_lock;
 	dlist_head		restrack[RESTRACK_HASHSIZE];
@@ -269,12 +281,15 @@ typedef struct GpuContext
 	int				error_lineno;
 	const char	   *error_funcname;
 	char			error_message[200];
+	/* debug counter */
+	pg_atomic_uint64 debug_count1;
+	pg_atomic_uint64 debug_count2;
+	pg_atomic_uint64 debug_count3;
+	pg_atomic_uint64 debug_count4;
 	/* management of the work-queue */
 	bool			worker_is_running;
-	pg_atomic_uint32 *global_num_running_tasks;
-	pthread_mutex_t	*mutex;				/* IPC stuff */
-	pthread_cond_t	*cond;				/* IPC stuff */
-	pg_atomic_uint32 *command;			/* IPC stuff */
+	pthread_mutex_t	worker_mutex;
+	pthread_cond_t	worker_cond;
 	pg_atomic_uint32 terminate_workers;
 	dlist_head		pending_tasks;		/* list of GpuTask */
 	cl_int			num_workers;
@@ -301,6 +316,7 @@ typedef struct GpuTask				GpuTask;
 typedef struct GpuTaskState			GpuTaskState;
 typedef struct GpuTaskSharedState	GpuTaskSharedState;
 typedef struct ArrowFdwState		ArrowFdwState;
+typedef struct GpuCacheState		GpuCacheState;
 
 /*
  * GpuTaskState
@@ -337,6 +353,7 @@ struct GpuTaskState
 	long			outer_brin_count;	/* # of blocks skipped by index */
 
 	ArrowFdwState  *af_state;			/* for GpuTask on Arrow_Fdw */
+	GpuCacheState  *gc_state;			/* for GpuTask on GpuCache */
 
 	/*
 	 * A state object for NVMe-Strom. If not NULL, GTS prefers BLOCK format
@@ -377,6 +394,10 @@ struct GpuTaskState
 
 	/* misc fields */
 	cl_long			num_cpu_fallbacks;	/* # of CPU fallback chunks */
+	uint64			debug_counter0;
+	uint64			debug_counter1;
+	uint64			debug_counter2;
+	uint64			debug_counter3;
 
 	/* co-operation with CPU parallel */
 	GpuTaskSharedState *gtss;		/* DSM segment of GTS if any */
@@ -390,7 +411,8 @@ struct GpuTaskSharedState
 {
 	/* for arrow_fdw file scan  */
 	pg_atomic_uint32 af_rbatch_index;
-
+	/* for gpu_cache file scan  */
+	pg_atomic_uint32 gc_fetch_count;
 	/* for block-based regular table scan */
 	BlockNumber		pbs_nblocks;	/* # blocks in relation at start of scan */
 	slock_t			pbs_mutex;		/* lock of the fields below */
@@ -413,6 +435,11 @@ typedef struct
 	pg_atomic_uint64	nvme_count;
 	pg_atomic_uint64	brin_count;
 	pg_atomic_uint64	fallback_count;
+	/* debug counter */
+	pg_atomic_uint64	debug_counter0;
+	pg_atomic_uint64	debug_counter1;
+	pg_atomic_uint64	debug_counter2;
+	pg_atomic_uint64	debug_counter3;
 } GpuTaskRuntimeStat;
 
 static inline void
@@ -430,6 +457,15 @@ mergeGpuTaskRuntimeStatParallelWorker(GpuTaskState *gts,
 	pg_atomic_add_fetch_u64(&gt_rtstat->brin_count, gts->outer_brin_count);
 	pg_atomic_add_fetch_u64(&gt_rtstat->fallback_count,
 							gts->num_cpu_fallbacks);
+	/* debug counter */
+	if (gts->debug_counter0 != 0)
+		pg_atomic_add_fetch_u64(&gt_rtstat->debug_counter0, gts->debug_counter0);
+	if (gts->debug_counter1 != 0)
+		pg_atomic_add_fetch_u64(&gt_rtstat->debug_counter1, gts->debug_counter1);
+	if (gts->debug_counter2 != 0)
+		pg_atomic_add_fetch_u64(&gt_rtstat->debug_counter2, gts->debug_counter2);
+	if (gts->debug_counter3 != 0)
+		pg_atomic_add_fetch_u64(&gt_rtstat->debug_counter3, gts->debug_counter3);
 }
 
 static inline void
@@ -445,6 +481,11 @@ mergeGpuTaskRuntimeStat(GpuTaskState *gts,
 	gts->nvme_count += pg_atomic_read_u64(&gt_rtstat->nvme_count);
 	gts->outer_brin_count += pg_atomic_read_u64(&gt_rtstat->brin_count);
 	gts->num_cpu_fallbacks += pg_atomic_read_u64(&gt_rtstat->fallback_count);
+
+	gts->debug_counter0 += pg_atomic_read_u64(&gt_rtstat->debug_counter0);
+	gts->debug_counter1 += pg_atomic_read_u64(&gt_rtstat->debug_counter1);
+	gts->debug_counter2 += pg_atomic_read_u64(&gt_rtstat->debug_counter2);
+	gts->debug_counter3 += pg_atomic_read_u64(&gt_rtstat->debug_counter3);
 
 	if (gts->css.ss.ps.instrument)
 		memcpy(&gts->css.ss.ps.instrument->bufusage,
@@ -469,105 +510,17 @@ struct GpuTask
 };
 
 /*
- * Type declarations for code generator
+ * State structure of NVMe-Strom per GpuTaskState
  */
-#define DEVKERNEL_NEEDS_GPUSCAN			0x00000001	/* GpuScan */
-#define DEVKERNEL_NEEDS_GPUJOIN			0x00000002	/* GpuJoin */
-#define DEVKERNEL_NEEDS_GPUPREAGG		0x00000004	/* GpuPreAgg */
-#define DEVKERNEL_NEEDS_GPUSORT			0x00000008	/* GpuSort */
-
-#define DEVKERNEL_NEEDS_PRIMITIVE		0x00000100
-#define DEVKERNEL_NEEDS_TIMELIB			0x00000200
-#define DEVKERNEL_NEEDS_TEXTLIB			0x00000400
-#define DEVKERNEL_NEEDS_JSONLIB			0x00000800
-#define DEVKERNEL_NEEDS_MISCLIB			0x00001000
-#define DEVKERNEL_NEEDS_RANGETYPE		0x00002000
-
-
-#define DEVKERNEL_BUILD_DEBUG_INFO		0x80000000
-
-struct devtype_info;
-struct devfunc_info;
-struct devcast_info;
-struct codegen_context;
-
-typedef cl_uint (*devtype_hashfunc_type)(struct devtype_info *dtype,
-										 Datum datum);
-
-typedef struct devtype_info {
-	dlist_node	chain;
-	cl_uint		hashvalue;
-	Oid			type_oid;
-	uint32		type_flags;
-	int16		type_length;
-	int16		type_align;
-	bool		type_byval;
-	bool		type_is_negative;
-	const char *type_name;	/* name of device type; same of SQL's type */
-	/* oid of type related functions */
-	Oid			type_eqfunc;	/* function to check equality */
-	Oid			type_cmpfunc;	/* function to compare two values */
-	/* constant initializer cstring, if any */
-	const char *max_const;
-	const char *min_const;
-	const char *zero_const;
-	/*
-	 * required size for extra buffer, if device type has special
-	 * internal representation, or device type needs working buffer
-	 * on device-side projection.
-	 */
-	int			extra_sz;
-	/* type specific hash-function; to be compatible to device code */
-	devtype_hashfunc_type hash_func;
-	/* element type of array, if type is array */
-	struct devtype_info *type_element;
-	/* properties of sub-fields, if type is composite */
-	int			comp_nfields;
-	struct devtype_info *comp_subtypes[FLEXIBLE_ARRAY_MEMBER];
-} devtype_info;
-
-/*
- * Per-function callback to estimate maximum expected length of
- * the function result. -1, if cannot estimate it.
- * If device function may consume per-thread varlena buffer, it
- * should expand context->varlena_bufsz.
- */
-typedef int (*devfunc_result_sz_type)(struct codegen_context *context,
-									  struct devfunc_info *dfunc,
-									  Expr **args, int *args_width);
-typedef struct devfunc_info {
-	dlist_node	chain;
-	cl_uint		hashvalue;
-	Oid			func_oid;		/* OID of the SQL function */
-	Oid			func_collid;	/* OID of collation, if collation aware */
-	bool		func_is_negative;	/* True, if not supported by GPU */
-	bool		func_is_strict;		/* True, if NULL strict function */
-	/* fields below are valid only if func_is_negative is false */
-	int32		func_flags;		/* Extra flags of this function */
-	List	   *func_args;		/* argument types by devtype_info */
-	devtype_info *func_rettype;	/* result type by devtype_info */
-	const char *func_sqlname;	/* name of the function in SQL side */
-	const char *func_devname;	/* name of the function in device side */
-	Cost		func_devcost;	/* relative cost to run function on GPU */
-	devfunc_result_sz_type devfunc_result_sz; /* result width estimator */
-} devfunc_info;
-
-/*
- * Callback on CoerceViaIO (type cast using in/out handler).
- * In some special cases, device code can handle this class of type cast.
- */
-typedef int (*devcast_coerceviaio_callback_f)(struct codegen_context *context,
-											  struct devcast_info *dcast,
-											  CoerceViaIO *node);
-
-typedef struct devcast_info {
-	dlist_node		chain;
-	cl_uint			hashvalue;
-	devtype_info   *src_type;
-	devtype_info   *dst_type;
-	char			castmethod;	/* one of COERCION_METHOD_* */
-	devcast_coerceviaio_callback_f dcast_coerceviaio_callback;
-} devcast_info;
+typedef struct NVMEScanState
+{
+	cl_uint			nrows_per_block;
+	cl_uint			nblocks_per_chunk;
+	BlockNumber		curr_segno;
+	Buffer			curr_vmbuffer;
+	BlockNumber		nr_segs;
+	GPUDirectFileDesc files[FLEXIBLE_ARRAY_MEMBER];
+} NVMEScanState;
 
 /*
  * pgstrom_data_store - a data structure with various format to exchange
@@ -594,35 +547,48 @@ typedef struct pgstrom_data_store
 	 * If NULL, KDS is preliminary loaded by CPU and filesystem, and
 	 * PDS is also allocated on managed memory area. So, worker don't
 	 * need to kick DMA operations explicitly.
+	 *
+	 * NOTE: Extra information for KDS_FORMAT_COLUMN
+	 * @gc_sstate points the GpuCacheShareState for reference IPC handle
+	 * of the main/extra buffer on the device. This IPC handle is only
+	 * valid under the read lock.
 	 */
 	cl_uint				nblocks_uncached;	/* for KDS_FORMAT_BLOCK */
-	cl_int				filedesc;
+	GPUDirectFileDesc	filedesc;
 	strom_io_vector	   *iovec;				/* for KDS_FORMAT_ARROW */
-
+	/* for KDS_FORMAT_COLUMN */
+	void			   *gc_sstate;
+	CUdeviceptr			m_kds_main;
+	CUdeviceptr			m_kds_extra;
 	/* data chunk in kernel portion */
 	kern_data_store kds	__attribute__ ((aligned (STROMALIGN_LEN)));
 } pgstrom_data_store;
 
-/*
- * State structure of NVMe-Strom per GpuTaskState
- */
-typedef struct NVMEScanState
-{
-	cl_uint			nrows_per_block;
-	cl_uint			nblocks_per_chunk;
-	BlockNumber		curr_segno;
-	Buffer			curr_vmbuffer;
-	BlockNumber		nr_segs;
-	int				fdesc[FLEXIBLE_ARRAY_MEMBER];
-} NVMEScanState;
+/* --------------------------------------------------------------------
+ *
+ * PG-Strom GUC variables
+ *
+ * -------------------------------------------------------------------- */
+extern bool		pgstrom_enabled;
+extern bool		pgstrom_bulkexec_enabled;
+extern bool		pgstrom_cpu_fallback_enabled;
+extern bool		pgstrom_regression_test_mode;
+extern int		pgstrom_max_async_tasks;
+extern double	pgstrom_gpu_setup_cost;
+extern double	pgstrom_gpu_dma_cost;
+extern double	pgstrom_gpu_operator_cost;
+extern Size		pgstrom_chunk_size(void);
+extern long		PAGE_SIZE;
+extern long		PAGE_MASK;
+extern int		PAGE_SHIFT;
+extern long		PHYS_PAGES;
+#define PAGE_ALIGN(sz)		TYPEALIGN(PAGE_SIZE,(sz))
 
-/*
- * --------------------------------------------------------------------
+/* --------------------------------------------------------------------
  *
  * Function Declarations
  *
- * --------------------------------------------------------------------
- */
+ * -------------------------------------------------------------------- */
 
 /*
  * gpu_device.c
@@ -632,9 +598,11 @@ typedef struct DevAttributes
 	cl_int		NUMA_NODE_ID;
 	cl_int		DEV_ID;
 	char		DEV_NAME[256];
+	char		DEV_BRAND[16];
 	char		DEV_UUID[48];
 	size_t		DEV_TOTAL_MEMSZ;
-	cl_int		CORES_PER_MPU;
+	size_t		DEV_BAR1_MEMSZ;
+	bool		DEV_SUPPORT_GPUDIRECTSQL;
 #define DEV_ATTR(LABEL,a,b,c)		\
 	cl_int		LABEL;
 #include "device_attrs.h"
@@ -643,7 +611,6 @@ typedef struct DevAttributes
 
 extern DevAttributes   *devAttrs;
 extern cl_int			numDevAttrs;
-extern cl_ulong			devComputeCapability;
 extern cl_uint			devBaselineMaxThreadsPerBlock;
 
 extern void pgstrom_init_gpu_device(void);
@@ -661,6 +628,12 @@ extern CUresult gpuOptimalBlockSize(int *p_grid_sz,
 									CUdevice cuda_device,
 									size_t dyn_shmem_per_block,
 									size_t dyn_shmem_per_thread);
+extern CUresult __gpuOptimalBlockSize(int *p_grid_sz,
+									  int *p_block_sz,
+									  CUfunction kern_function,
+									  int cuda_dindex,
+									  size_t dyn_shmem_per_block,
+									  size_t dyn_shmem_per_thread);
 /*
  * shmbuf.c
  */
@@ -757,8 +730,7 @@ extern void pgstrom_init_gpu_mmgr(void);
 /*
  * gpu_context.c
  */
-extern int		global_max_async_tasks;		/* GUC */
-extern int		local_max_async_tasks;		/* GUC */
+extern int		pgstrom_max_async_tasks;		/* GUC */
 extern __thread GpuContext	   *GpuWorkerCurrentContext;
 extern __thread sigjmp_buf	   *GpuWorkerExceptionStack;
 extern __thread int				GpuWorkerIndex;
@@ -768,10 +740,8 @@ extern __thread int				GpuWorkerIndex;
 	(GpuWorkerCurrentContext->cuda_device)
 #define CU_DINDEX_PER_THREAD					\
 	(GpuWorkerCurrentContext->cuda_dindex)
-#define CU_EVENT0_PER_THREAD					\
-	(GpuWorkerCurrentContext->cuda_events0[GpuWorkerIndex])
-#define CU_EVENT1_PER_THREAD					\
-	(GpuWorkerCurrentContext->cuda_events1[GpuWorkerIndex])
+
+extern __thread CUevent			CU_EVENT_PER_THREAD;
 
 extern void GpuContextWorkerReportError(int elevel,
 										int errcode,
@@ -795,23 +765,19 @@ CHECK_FOR_GPUCONTEXT(GpuContext *gcontext)
 			pg_usleep(1000L);
 			error_level = pg_atomic_read_u32(&gcontext->error_level);
 		}
-		if (errstart(error_level / 2,
-					 gcontext->error_filename,
-					 gcontext->error_lineno,
-					 gcontext->error_funcname, NULL))
-		{
-			errcode(gcontext->error_code);
-			errmsg("%s", gcontext->error_message);
-			errfinish(0);
-		}
+		ereport(error_level / 2,
+				(errcode(gcontext->error_code),
+				 errmsg("%s", gcontext->error_message),
+				 (pgstrom_regression_test_mode ? 0 :
+				  errdetail("GPU kernel location: %s:%d [%s]",
+							gcontext->error_filename,
+							gcontext->error_lineno,
+							gcontext->error_funcname))));
 	}
 	CHECK_FOR_INTERRUPTS();
 }
-extern CUmodule GpuContextLookupModule(GpuContext *gcontext,
-									   ProgramId program_id);
 extern CUresult gpuInit(unsigned int flags);
 extern GpuContext *AllocGpuContext(int cuda_dindex,
-								   bool never_use_mps,
 								   bool activate_context,
 								   bool activate_workers);
 extern void ActivateGpuContext(GpuContext *gcontext);
@@ -820,6 +786,9 @@ extern GpuContext *GetGpuContext(GpuContext *gcontext);
 extern void PutGpuContext(GpuContext *gcontext);
 extern void SynchronizeGpuContext(GpuContext *gcontext);
 extern void SynchronizeGpuContextOnDSMDetach(dsm_segment *seg, Datum arg);
+
+#define GPUMEM_DEVICE_RAW_EXTRA		((void *)(~0L))
+#define GPUMEM_HOST_RAW_EXTRA		((void *)(~1L))
 
 extern bool trackCudaProgram(GpuContext *gcontext, ProgramId program_id,
 							 const char *filename, int lineno);
@@ -832,9 +801,15 @@ extern bool trackGpuMemIPC(GpuContext *gcontext,
 						   CUdeviceptr devptr, void *extra,
 						   const char *filename, int lineno);
 extern void *untrackGpuMemIPC(GpuContext *gcontext, CUdeviceptr devptr);
-extern bool trackRawFileDesc(GpuContext *gcontext, int filedesc,
+extern bool trackRawFileDesc(GpuContext *gcontext, GPUDirectFileDesc *fdesc,
 							 const char *filename, int lineno);
-extern void untrackRawFileDesc(GpuContext *gcontext, int filedesc);
+extern void untrackRawFileDesc(GpuContext *gcontext, GPUDirectFileDesc *fdesc);
+extern CUmodule __GpuContextLookupModule(GpuContext *gcontext,
+										 ProgramId program_id,
+										 const char *filename, int lineno);
+#define GpuContextLookupModule(a,b)			\
+	__GpuContextLookupModule((a),(b),__FILE__,__LINE__)
+
 extern void pgstrom_init_gpu_context(void);
 
 /*
@@ -954,7 +929,7 @@ extern void pgstromInitGpuTaskState(GpuTaskState *gts,
 									List *used_params,
 									cl_int optimal_gpu,
 									cl_uint outer_nrows_per_block,
-									EState *estate);
+									cl_int eflags);
 extern TupleTableSlot *pgstromExecGpuTaskState(GpuTaskState *gts);
 extern void pgstromRescanGpuTaskState(GpuTaskState *gts);
 extern void pgstromReleaseGpuTaskState(GpuTaskState *gts,
@@ -973,19 +948,6 @@ extern GpuTask *fetch_next_gputask(GpuTaskState *gts);
 
 extern void pgstromInitGpuTask(GpuTaskState *gts, GpuTask *gtask);
 extern void pgstrom_init_gputasks(void);
-
-/*
- * nvme_strom.c
- */
-extern Size	nvme_strom_threshold(void);
-extern int	nvme_strom_ioctl(int cmd, void *arg);
-extern int	GetOptimalGpuForFile(File fdesc);
-extern int	GetOptimalGpuForRelation(PlannerInfo *root,
-									 RelOptInfo *rel);
-extern bool ScanPathWillUseNvmeStrom(PlannerInfo *root,
-									 RelOptInfo *baserel);
-extern bool RelationCanUseNvmeStrom(Relation relation);
-extern void	pgstrom_init_nvme_strom(void);
 
 /*
  * cuda_program.c
@@ -1017,28 +979,17 @@ extern void pgstrom_init_cuda_program(void);
 /*
  * codegen.c
  */
-struct codegen_context {
-	StringInfoData	str;
-	StringInfoData	decl_temp;	/* declarations of temporary variables */
-	int				decl_count;	/* # of temporary variabes in decl */
-	PlannerInfo *root;		//not necessary?
-	RelOptInfo	*baserel;	/* scope of Var-node, if any */
-	List	   *used_params;/* list of Const/Param in use */
-	List	   *used_vars;	/* list of Var in use */
-	Bitmapset  *param_refs;	/* referenced parameters */
-	const char *var_label;	/* prefix of var reference, if exist */
-	const char *kds_label;	/* label to reference kds, if exist */
-	List	   *pseudo_tlist;	/* pseudo tlist expression, if any */
-	int			extra_flags;	/* external libraries to be included */
-	int			varlena_bufsz;	/* required size of temporary varlena buffer */
-	int			devcost;	/* relative device cost */
-};
-typedef struct codegen_context	codegen_context;
+#include "cuda_codegen.h"
 
-extern void pgstrom_codegen_typeoid_declarations(StringInfo buf);
+extern size_t pgstrom_codegen_extra_devtypes(char *buf, size_t bufsz,
+											 uint32 extra_flags);
 extern devtype_info *pgstrom_devtype_lookup(Oid type_oid);
 extern devtype_info *pgstrom_devtype_lookup_and_track(Oid type_oid,
 											  codegen_context *context);
+extern devfunc_info *pgstrom_devfunc_lookup(Oid func_oid,
+											Oid func_rettype,
+											List *func_args,
+											Oid func_collid);
 extern devfunc_info *pgstrom_devfunc_lookup_type_equal(devtype_info *dtype,
 													   Oid type_collid);
 extern devfunc_info *pgstrom_devfunc_lookup_type_compare(devtype_info *dtype,
@@ -1046,8 +997,7 @@ extern devfunc_info *pgstrom_devfunc_lookup_type_compare(devtype_info *dtype,
 extern void pgstrom_devfunc_track(codegen_context *context,
 								  devfunc_info *dfunc);
 extern devcast_info *pgstrom_devcast_lookup(Oid src_type_oid,
-											Oid dst_type_oid,
-											char castmethod);
+											Oid dst_type_oid);
 extern bool pgstrom_devtype_can_relabel(Oid src_type_oid,
 										Oid dst_type_oid);
 extern char *pgstrom_codegen_expression(Node *expr, codegen_context *context);
@@ -1088,9 +1038,6 @@ extern bool KDS_fetch_tuple_row(TupleTableSlot *slot,
 extern bool KDS_fetch_tuple_slot(TupleTableSlot *slot,
 								 kern_data_store *kds,
 								 size_t row_index);
-extern bool KDS_fetch_tuple_column(TupleTableSlot *slot,
-								   kern_data_store *kds,
-								   size_t row_index);
 extern bool PDS_fetch_tuple(TupleTableSlot *slot,
 							pgstrom_data_store *pds,
 							GpuTaskState *gts);
@@ -1103,7 +1050,8 @@ extern pgstrom_data_store *PDS_retain(pgstrom_data_store *pds);
 extern void PDS_release(pgstrom_data_store *pds);
 
 extern size_t	KDS_calculateHeadSize(TupleDesc tupdesc);
-
+extern bool		KDS_schemaIsCompatible(TupleDesc tupdesc,
+									   kern_data_store *kds);
 extern void init_kernel_data_store(kern_data_store *kds,
 								   TupleDesc tupdesc,
 								   Size length,
@@ -1139,17 +1087,11 @@ extern pgstrom_data_store *__PDS_create_block(GpuContext *gcontext,
 #define PDS_clone(a)							\
 	__PDS_clone((a),__FILE__,__LINE__)
 
+extern void KDS_dump_schema(kern_data_store *kds);
+
 //XXX - to be gpu_task.c?
 extern void PDS_init_heapscan_state(GpuTaskState *gts);
 extern void PDS_end_heapscan_state(GpuTaskState *gts);
-extern bool PDS_exec_heapscan(GpuTaskState *gts,
-							  pgstrom_data_store *pds);
-extern cl_uint NVMESS_NBlocksPerChunk(struct NVMEScanState *nvme_sstate);
-
-#define PGSTROM_DATA_STORE_BLOCK_FILEPOS(pds)							\
-	((loff_t *)((char *)KERN_DATA_STORE_BLOCK_PGPAGE(&(pds)->kds,		\
-													 (pds)->kds.nrooms) - \
-				(sizeof(loff_t) * (pds)->nblocks_uncached)))
 extern void PDS_fillup_blocks(pgstrom_data_store *pds);
 extern void __PDS_fillup_arrow(pgstrom_data_store *pds_dst,
 							   GpuContext *gcontext,
@@ -1175,9 +1117,10 @@ extern IndexOptInfo *pgstrom_tryfind_brinindex(PlannerInfo *root,
 											   List **p_indexConds,
 											   List **p_indexQuals,
 											   cl_long *p_indexNBlocks);
-#define PGSTROM_RELSCAN_NORMAL			0x0000
 #define PGSTROM_RELSCAN_SSD2GPU			0x0001
 #define PGSTROM_RELSCAN_BRIN_INDEX		0x0002
+#define PGSTROM_RELSCAN_ARROW_FDW		0x0004
+#define PGSTROM_RELSCAN_GPU_CACHE		0x0008
 extern int pgstrom_common_relscan_cost(PlannerInfo *root,
 									   RelOptInfo *scan_rel,
 									   List *scan_quals,
@@ -1194,6 +1137,14 @@ extern int pgstrom_common_relscan_cost(PlannerInfo *root,
 extern Bitmapset *pgstrom_pullup_outer_refs(PlannerInfo *root,
 											RelOptInfo *base_rel,
 											Bitmapset *referenced);
+
+extern int	GetOptimalGpuForFile(File fdesc);
+extern int	GetOptimalGpuForRelation(PlannerInfo *root,
+									 RelOptInfo *rel);
+extern bool ScanPathWillUseNvmeStrom(PlannerInfo *root,
+									 RelOptInfo *baserel);
+extern bool RelationCanUseNvmeStrom(Relation relation);
+
 extern void pgstromExecInitBrinIndexMap(GpuTaskState *gts,
 										Oid index_oid,
 										List *index_conds,
@@ -1262,7 +1213,8 @@ extern cl_int gpujoin_get_optimal_gpu(const Path *pathnode);
 #if PG_VERSION_NUM >= 110000
 extern List *extract_partitionwise_pathlist(PlannerInfo *root,
 											Path *outer_path,
-											bool try_parallel_path,
+											bool try_outer_parallel,
+											bool try_inner_parallel,
 											AppendPath **p_append_path,
 											int *p_parallel_nworkers,
 											Cost *p_discount_cost);
@@ -1285,33 +1237,13 @@ extern ProgramId GpuJoinCreateCombinedProgram(PlanState *node,
 extern bool GpuJoinInnerPreload(GpuTaskState *gts, CUdeviceptr *p_m_kmrels);
 extern void GpuJoinInnerUnload(GpuTaskState *gts, bool is_rescan);
 extern pgstrom_data_store *GpuJoinExecOuterScanChunk(GpuTaskState *gts);
-extern bool gpujoinHasRightOuterJoin(GpuTaskState *gts);
-extern int  gpujoinNextRightOuterJoin(GpuTaskState *gts);
-extern void gpujoinSyncRightOuterJoin(GpuTaskState *gts);
-extern void gpujoinColocateOuterJoinMaps(GpuTaskState *gts,
-										 CUmodule cuda_module);
+extern int  gpujoinNextRightOuterJoinIfAny(GpuTaskState *gts);
 extern TupleTableSlot *gpujoinNextTupleFallback(GpuTaskState *gts,
 												struct kern_gpujoin *kgjoin,
 												pgstrom_data_store *pds_src,
 												cl_int outer_depth);
 extern void gpujoinUpdateRunTimeStat(GpuTaskState *gts,
 									 struct kern_gpujoin *kgjoin);
-
-/*
- * inners.c
- */
-typedef struct shared_mmap_segment		shared_mmap_segment;
-
-extern shared_mmap_segment *shared_mmap_create(size_t size);
-extern shared_mmap_segment *shared_mmap_attach(uint32 handle);
-extern void shared_mmap_detach(shared_mmap_segment *shm_seg);
-extern void *shared_mmap_expand(shared_mmap_segment *shm_seg, size_t new_size);
-
-extern void *shared_mmap_address(shared_mmap_segment *shm_seg);
-extern size_t shared_mmap_length(shared_mmap_segment *shm_seg);
-extern uint64 shared_mmap_handle(shared_mmap_segment *shm_seg);
-
-extern void	pgstrom_init_inners(void);
 
 /*
  * gpupreagg.c
@@ -1326,88 +1258,70 @@ extern void assign_gpupreagg_session_info(StringInfo buf,
 extern void pgstrom_init_gpupreagg(void);
 
 /*
- * pl_cuda.c
- */
-extern const char *pgsql_host_plcuda_code;
-extern void pgstrom_init_plcuda(void);
-
-/*
- * gstore_fdw.c
- */
-extern void gstore_fdw_table_options(Oid gstore_oid,
-									 int *p_pinning, int *p_format);
-extern void gstore_fdw_column_options(Oid gstore_oid, AttrNumber attnum,
-									  int *p_compression);
-extern bool relation_is_gstore_fdw(Oid table_oid);
-extern bool type_is_reggstore(Oid type_oid);
-extern Oid	get_reggstore_type_oid(void);
-#define REGGSTOREOID		get_reggstore_type_oid()
-extern void pgstrom_init_gstore_fdw(void);
-
-/*
- * gstore_buf.c
- */
-typedef struct GpuStoreBuffer	GpuStoreBuffer;
-
-extern GpuStoreBuffer *GpuStoreBufferCreate(Relation frel,
-											Snapshot snapshot);
-extern CUdeviceptr GpuStoreBufferOpenDevPtr(GpuContext *gcontext,
-											GpuStoreBuffer *gs_buffer);
-extern int GpuStoreBufferGetTuple(Relation frel,
-								  Snapshot snapshot,
-								  TupleTableSlot *slot,
-								  GpuStoreBuffer *gs_buffer,
-								  size_t row_index,
-								  bool needs_system_columns);
-extern void GpuStoreBufferAppendRow(GpuStoreBuffer *gs_buffer,
-									TupleDesc tupdesc,
-									Snapshot snapshot,
-									TupleTableSlot *slot);
-extern void GpuStoreBufferRemoveRow(GpuStoreBuffer *gs_buffer,
-									TupleDesc tupdesc,
-									Snapshot snapshot,
-									size_t old_index);
-extern void GpuStoreBufferGetSize(Oid table_oid, Snapshot snapshot,
-								  Size *p_rawsize,
-								  Size *p_nitems);
-extern size_t GpuStoreBufferGetNitems(GpuStoreBuffer *gs_buffer);
-
-extern void pgstrom_init_gstore_buf(void);
-
-extern GstoreIpcHandle *__pgstrom_gstore_export_ipchandle(Oid ftable_oid);
-
-/*
  * arrow_fdw.c and arrow_read.c
  */
 extern bool baseRelIsArrowFdw(RelOptInfo *baserel);
+extern bool RelationIsArrowFdw(Relation frel);
 extern cl_int GetOptimalGpuForArrowFdw(PlannerInfo *root,
 									   RelOptInfo *baserel);
 extern bool KDS_fetch_tuple_arrow(TupleTableSlot *slot,
 								  kern_data_store *kds,
 								  size_t row_index);
 
-extern ArrowFdwState *ExecInitArrowFdw(Relation relation,
+extern ArrowFdwState *ExecInitArrowFdw(GpuContext *gcontext,
+									   Relation relation,
 									   Bitmapset *outer_refs);
 extern pgstrom_data_store *ExecScanChunkArrowFdw(GpuTaskState *gts);
 extern void ExecReScanArrowFdw(ArrowFdwState *af_state);
 extern void ExecEndArrowFdw(ArrowFdwState *af_state);
+
 extern void ExecInitDSMArrowFdw(ArrowFdwState *af_state,
-								pg_atomic_uint32 *rbatch_index);
+								GpuTaskSharedState *gtss);
 extern void ExecReInitDSMArrowFdw(ArrowFdwState *af_state);
 extern void ExecInitWorkerArrowFdw(ArrowFdwState *af_state,
-								   pg_atomic_uint32 *rbatch_index);
+								   GpuTaskSharedState *gtss);
 extern void ExecShutdownArrowFdw(ArrowFdwState *af_state);
 extern void ExplainArrowFdw(ArrowFdwState *af_state,
 							Relation frel, ExplainState *es);
 extern void pgstrom_init_arrow_fdw(void);
 
 /*
+ * gpu_cache.c
+ */
+extern bool baseRelHasGpuCache(PlannerInfo *root,
+							   RelOptInfo *baserel);
+extern bool RelationHasGpuCache(Relation rel);
+extern GpuCacheState *ExecInitGpuCache(ScanState *ss, int eflags,
+									   Bitmapset *outer_refs);
+extern pgstrom_data_store *ExecScanChunkGpuCache(GpuTaskState *gts);
+extern void ExecReScanGpuCache(GpuCacheState *gcache_state);
+extern void ExecEndGpuCache(GpuCacheState *gcache_state);
+
+extern void ExecInitDSMGpuCache(GpuCacheState *gcache_state,
+								GpuTaskSharedState *gtss);
+extern void ExecReInitDSMGpuCache(GpuCacheState *gcache_state);
+extern void ExecInitWorkerGpuCache(GpuCacheState *gcache_state,
+								   GpuTaskSharedState *gtss);
+extern void ExecShutdownGpuCache(GpuCacheState *gcache_state);
+extern void ExplainGpuCache(GpuCacheState *gcache_state,
+							Relation frel, ExplainState *es);
+extern CUresult gpuCacheMapDeviceMemory(GpuContext *gcontext,
+										pgstrom_data_store *pds);
+extern void gpuCacheUnmapDeviceMemory(GpuContext *gcontext,
+									  pgstrom_data_store *pds);
+extern void gpuCacheBgWorkerBegin(int cuda_dindex);
+extern bool gpuCacheBgWorkerDispatch(int cuda_dindex);
+extern bool gpuCacheBgWorkerIdleTask(int cuda_dindex);
+extern void gpuCacheBgWorkerEnd(int cuda_dindex);
+extern void pgstrom_init_gpu_cache(void);
+
+/*
  * misc.c
  */
 extern Expr *make_flat_ands_explicit(List *andclauses);
-extern AppendRelInfo **__find_appinfos_by_relids(PlannerInfo *root,
-												 Relids relids,
-												 int *nappinfos);
+extern AppendRelInfo **find_appinfos_by_relids_nofail(PlannerInfo *root,
+													  Relids relids,
+													  int *nappinfos);
 extern double get_parallel_divisor(Path *path);
 #if PG_VERSION_NUM < 110000
 /* PG11 changed pg_proc definition */
@@ -1425,45 +1339,95 @@ extern Oid	get_function_oid(const char *func_name,
 extern Oid	get_type_oid(const char *type_name,
 						 Oid namespace_oid,
 						 bool missing_ok);
+extern char *get_type_name(Oid type_oid, bool missing_ok);
+extern char *get_proc_library(HeapTuple protup);
+extern Oid	get_object_extension_oid(Oid class_id,
+									 Oid object_id,
+									 int32 objsub_id,
+									 bool missing_ok);
 extern char *bms_to_cstring(Bitmapset *x);
 extern bool pathtree_has_gpupath(Path *node);
+extern bool pathtree_has_parallel_aware(Path *node);
 extern Path *pgstrom_copy_pathnode(const Path *pathnode);
 extern const char *errorText(int errcode);
 
 extern ssize_t	__readFile(int fdesc, void *buffer, size_t nbytes);
 extern ssize_t	__writeFile(int fdesc, const void *buffer, size_t nbytes);
+extern ssize_t	__preadFile(int fdesc, void *buffer, size_t nbytes, off_t f_pos);
+extern ssize_t	__pwriteFile(int fdesc, const void *buffer, size_t nbytes, off_t f_pos);
 extern void	   *__mmapFile(void *addr, size_t length,
 						   int prot, int flags, int fdesc, off_t offset);
 extern int		__munmapFile(void *mmap_addr);
+extern void	   *__mremapFile(void *mmap_addr, size_t new_size);
 
 /*
  * nvrtc.c
  */
+extern int		pgstrom_nvrtc_version(void);
 extern void		pgstrom_init_nvrtc(void);
+
+/*
+ * cufile.c
+ */
+extern bool		cuFileDriverLoaded(void);
+extern void		pgstrom_init_cufile(void);
+
+/*
+ * extra.c
+ */
+extern bool		pgstrom_gpudirect_enabled(void);
+extern Size		pgstrom_gpudirect_threshold(void);
+extern void		pgstrom_init_extra(void);
+extern bool		heterodbLicenseCheck(void);
+extern void		gpuDirectFileDescOpen(GPUDirectFileDesc *gds_fdesc,
+									  File pg_fdesc);
+extern void		gpuDirectFileDescOpenByPath(GPUDirectFileDesc *gds_fdesc,
+											const char *pathname);
+extern void		gpuDirectFileDescClose(const GPUDirectFileDesc *gds_fdesc);
+extern CUresult gpuDirectMapGpuMemory(CUdeviceptr m_segment,
+									  size_t m_segment_sz,
+									  unsigned long *p_iomap_handle);
+extern CUresult gpuDirectUnmapGpuMemory(CUdeviceptr m_segment,
+										unsigned long iomap_handle);
+
+extern void		gpuDirectFileReadIOV(const GPUDirectFileDesc *gds_fdesc,
+									 CUdeviceptr m_segment,
+									 unsigned long iomap_handle,
+									 off_t m_offset,
+									 strom_io_vector *iovec);
+extern void	extraSysfsSetupDistanceMap(const char *manual_config);
+extern int	extraSysfsLookupOptimalGpu(dev_t st_dev);
+extern ssize_t extraSysfsPrintNvmeInfo(int index, char *buffer, ssize_t buffer_sz);
 
 /*
  * float2.c
  */
-#define		FLOAT2OID		421
+#ifndef FLOAT2OID
+#define FLOAT2OID		421
+#endif
+
+/*
+ * tinyint.c
+ */
+#ifndef INT1OID
+#define INT1OID			606
+#endif
 
 /*
  * main.c
  */
-extern bool		pgstrom_enabled;
-extern bool		pgstrom_debug_kernel_source;
-extern bool		pgstrom_bulkexec_enabled;
-extern bool		pgstrom_cpu_fallback_enabled;
-extern bool		pgstrom_regression_test_mode;
-extern int		pgstrom_max_async_tasks;
-extern double	pgstrom_gpu_setup_cost;
-extern double	pgstrom_gpu_dma_cost;
-extern double	pgstrom_gpu_operator_cost;
-extern Size		pgstrom_chunk_size(void);
-extern long		PAGE_SIZE;
-extern long		PAGE_MASK;
-extern int		PAGE_SHIFT;
-extern long		PHYS_PAGES;
-extern TimestampTz commercial_license_expired_at(void);
+extern int		pgstrom_num_users_extra;
+extern pgstromUsersExtraDescriptor pgstrom_users_extra_desc[];
+
+extern const Path *gpu_path_find_cheapest(PlannerInfo *root,
+										  RelOptInfo *rel,
+										  bool outer_parallel,
+										  bool inner_parallel);
+extern bool	gpu_path_remember(PlannerInfo *root,
+							  RelOptInfo *rel,
+							  bool outer_parallel,
+							  bool inner_parallel,
+							  const Path *gpu_path);
 
 extern Path *pgstrom_create_dummy_path(PlannerInfo *root,
 									   Path *subpath,
@@ -1547,6 +1511,23 @@ float_as_int(cl_float fval)
 	} datum;
 	datum.fval = fval;
 	return datum.ival;
+}
+
+/*
+ * trim_cstring - remove spaces from head/tail
+ */
+static inline char *
+trim_cstring(char *str)
+{
+	char   *end;
+
+	while (isspace(*str))
+		str++;
+	end = str + strlen(str) - 1;
+	while (end >= str && isspace(*end))
+		*end-- = '\0';
+
+	return str;
 }
 
 /*
@@ -1702,6 +1683,7 @@ typealign_get_width(char type_align)
 }
 
 #ifndef forfour
+/* XXX - PG12 added forfour() macro */
 #define forfour(lc1, list1, lc2, list2, lc3, list3, lc4, list4)		\
 	for ((lc1) = list_head(list1), (lc2) = list_head(list2),		\
 		 (lc3) = list_head(list3), (lc4) = list_head(list4);		\
@@ -1710,6 +1692,7 @@ typealign_get_width(char type_align)
 		 (lc1) = lnext(lc1), (lc2) = lnext(lc2), (lc3) = lnext(lc3),\
 		 (lc4) = lnext(lc4))
 #endif
+
 /* XXX - PG10 added lfirst_node() and related */
 #ifndef lfirst_node
 #define lfirst_node(T,x)		((T *)lfirst(x))
@@ -1737,6 +1720,14 @@ lappend_cxt(MemoryContext memcxt, List *list, void *datum)
 	return r;
 }
 
+/* initStringInfo on a particular memory context */
+static inline void
+initStringInfoContext(StringInfo str, MemoryContext memcxt)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(memcxt);
+	initStringInfo(str);
+	MemoryContextSwitchTo(oldcxt);
+}
 
 static inline char *
 format_numeric(cl_long value)
@@ -1783,6 +1774,20 @@ __basename(const char *filename)
 	const char *pos = strrchr(filename, '/');
 
 	return pos ? pos + 1 : filename;
+}
+
+/*
+ * merge two dlist_head
+ */
+static inline void
+dlist_append_tail(dlist_head *base, dlist_head *items)
+{
+	if (dlist_is_empty(items))
+		return;
+	items->head.next->prev = base->head.prev;
+	items->head.prev->next = &base->head;
+	base->head.prev->next = items->head.next;
+	base->head.prev = items->head.prev;
 }
 
 /*
@@ -1899,13 +1904,13 @@ pthreadRWLockUnlock(pthread_rwlock_t *rwlock)
 }
 
 static inline void
-pthreadCondInit(pthread_cond_t *cond)
+pthreadCondInit(pthread_cond_t *cond, int pshared)
 {
 	pthread_condattr_t condattr;
 
 	if ((errno = pthread_condattr_init(&condattr)) != 0)
 		wfatal("failed on pthread_condattr_init: %m");
-	if ((errno = pthread_condattr_setpshared(&condattr, 1)) != 0)
+	if ((errno = pthread_condattr_setpshared(&condattr, pshared)) != 0)
 		wfatal("failed on pthread_condattr_setpshared: %m");
 	if ((errno = pthread_cond_init(cond, &condattr)) != 0)
 		wfatal("failed on pthread_cond_init: %m");
@@ -1958,36 +1963,13 @@ pthreadCondSignal(pthread_cond_t *cond)
 }
 
 /*
- * functions for execution time measurement
+ * utility to calculate time diff
  */
-typedef struct timeval		timeval_t;
-
-static inline timeval_t
-stat_time_begin(void)
-{
-	timeval_t	tv_start;
-
-	gettimeofday(&tv_start, NULL);
-
-	return tv_start;
-}
-
-static inline void
-stat_time_end(timeval_t tv_start, const char *label)
-{
-	timeval_t	tv_end;
-	cl_long		delta;		/* us */
-
-	gettimeofday(&tv_end, NULL);
-	delta = ((tv_end.tv_sec - tv_start.tv_sec) * 1000000 +
-			 (tv_end.tv_usec - tv_start.tv_usec));
-	if (delta > 4000000)
-		elog(INFO, "%s: %.2fs", label, (double)delta / 1000000.0);
-	else if (delta > 4000)
-		elog(INFO, "%s: %.2fms", label, (double)delta / 1000.0);
-	else
-		elog(INFO, "%s: %luus", label, delta);
-}
+#define TV_DIFF(tv2,tv1)								\
+	(((double)(tv2.tv_sec  - tv1.tv_sec) * 1000000.0 +	\
+	  (double)(tv2.tv_usec - tv1.tv_usec)) / 1000.0)
+#define TP_DIFF(tp2,tp1)						\
+	((tp2.tv_sec - tp1.tv_sec) * 1000000000UL +	(tp2.tv_nsec - tp1.tv_nsec))
 
 /*
  * simple wrapper for permission checks

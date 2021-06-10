@@ -3,17 +3,11 @@
  *
  * Common routines related to relation scan
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
@@ -438,11 +432,11 @@ pgstrom_common_relscan_cost(PlannerInfo *root,
 							Cost *p_startup_cost,
 							Cost *p_run_cost)
 {
-	int			scan_mode = PGSTROM_RELSCAN_NORMAL;
+	int			scan_mode = 0;
 	Cost		startup_cost = 0.0;
 	Cost		run_cost = 0.0;
 	Cost		index_scan_cost = 0.0;
-	Cost		disk_scan_cost;
+	Cost		disk_scan_cost = 0.0;
 	double		gpu_ratio = pgstrom_gpu_operator_cost / cpu_operator_cost;
 	double		parallel_divisor;
 	double		ntuples = scan_rel->tuples;
@@ -461,6 +455,11 @@ pgstrom_common_relscan_cost(PlannerInfo *root,
 			scan_rel->reloptkind == RELOPT_OTHER_MEMBER_REL) &&
 		   scan_rel->relid > 0 &&
 		   scan_rel->relid < root->simple_rel_array_size);
+	/* mark if special storage layer */
+	if (baseRelIsArrowFdw(scan_rel))
+		scan_mode |= PGSTROM_RELSCAN_ARROW_FDW;
+	if (baseRelHasGpuCache(root, scan_rel))
+		scan_mode |= PGSTROM_RELSCAN_GPU_CACHE;
 
 	/* selectivity of device executable qualifiers */
 	selectivity = clauselist_selectivity(root,
@@ -468,11 +467,14 @@ pgstrom_common_relscan_cost(PlannerInfo *root,
 										 scan_rel->relid,
 										 JOIN_INNER,
 										 NULL);
-	/* cost of full-table scan, if no index */
-	get_tablespace_page_costs(scan_rel->reltablespace,
-							  &spc_rand_page_cost,
-							  &spc_seq_page_cost);
-	disk_scan_cost = spc_seq_page_cost * nblocks;
+	/* cost of full-table scan, if not gpu memory store */
+	if ((scan_mode & PGSTROM_RELSCAN_GPU_CACHE) == 0)
+	{
+		get_tablespace_page_costs(scan_rel->reltablespace,
+								  &spc_rand_page_cost,
+								  &spc_seq_page_cost);
+		disk_scan_cost = spc_seq_page_cost * nblocks;
+	}
 
 	/* consideration for BRIN-index, if any */
 	if (indexOpt)
@@ -674,6 +676,217 @@ pgstrom_pullup_outer_refs(PlannerInfo *root,
 		elog(ERROR, "Bug? outer is not a simple relation");
 	}
 	return referenced;
+}
+
+/* ----------------------------------------------------------------
+ *
+ * GPUDirectSQL related routines
+ *
+ * ----------------------------------------------------------------
+ */
+typedef struct
+{
+	Oid		tablespace_oid;
+	int		optimal_gpu;
+} tablespace_optimal_gpu_hentry;
+
+static HTAB	   *tablespace_optimal_gpu_htable = NULL;
+
+static void
+tablespace_optimal_gpu_cache_callback(Datum arg, int cacheid, uint32 hashvalue)
+{
+	/* invalidate all the cached status */
+	if (tablespace_optimal_gpu_htable)
+	{
+		hash_destroy(tablespace_optimal_gpu_htable);
+		tablespace_optimal_gpu_htable = NULL;
+	}
+}
+
+/*
+ * GetOptimalGpuForFile
+ */
+int
+GetOptimalGpuForFile(File fdesc)
+{
+	struct stat	stat_buf;
+
+	if (fstat(FileGetRawDesc(fdesc), &stat_buf) != 0)
+		elog(ERROR, "failed on fstat('%s'): %m", FilePathName(fdesc));
+
+	return extraSysfsLookupOptimalGpu(stat_buf.st_dev);
+}
+
+/*
+ * GetOptimalGpuForTablespace
+ */
+static cl_int
+GetOptimalGpuForTablespace(Oid tablespace_oid)
+{
+	tablespace_optimal_gpu_hentry *hentry;
+	bool		found;
+
+	if (!pgstrom_gpudirect_enabled())
+		return -1;
+
+	if (!OidIsValid(tablespace_oid))
+		tablespace_oid = MyDatabaseTableSpace;
+
+	hentry = (tablespace_optimal_gpu_hentry *)
+		hash_search(tablespace_optimal_gpu_htable,
+					&tablespace_oid,
+					HASH_ENTER,
+					&found);
+	if (!found)
+	{
+		PG_TRY();
+		{
+			char	   *pathname;
+			struct stat	stat_buf;
+
+			Assert(hentry->tablespace_oid == tablespace_oid);
+			hentry->optimal_gpu = -1;
+
+			pathname = GetDatabasePath(MyDatabaseId, tablespace_oid);
+			if (stat(pathname, &stat_buf) != 0)
+			{
+				elog(WARNING, "failed on stat('%s') of tablespace %u: %m",
+					 pathname, tablespace_oid);
+			}
+			else
+			{
+				hentry->optimal_gpu = extraSysfsLookupOptimalGpu(stat_buf.st_dev);
+				elog(INFO, "gpu=%d dev=%u:%u", hentry->optimal_gpu,
+					 major(stat_buf.st_dev),
+					 minor(stat_buf.st_dev));
+			}
+		}
+		PG_CATCH();
+		{
+			hash_search(tablespace_optimal_gpu_htable,
+						&tablespace_oid,
+						HASH_REMOVE,
+						NULL);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+	return hentry->optimal_gpu;
+}
+
+cl_int
+GetOptimalGpuForRelation(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+	HeapTuple	tup;
+	char		relpersistence;
+	cl_int		cuda_dindex;
+
+	if (baseRelIsArrowFdw(rel))
+	{
+		if (pgstrom_gpudirect_enabled())
+			return GetOptimalGpuForArrowFdw(root, rel);
+		return -1;
+	}
+
+	cuda_dindex = GetOptimalGpuForTablespace(rel->reltablespace);
+	if (cuda_dindex < 0 || cuda_dindex >= numDevAttrs)
+		return -1;
+
+	/* only permanent / unlogged table can use NVMe-Strom */
+	rte = root->simple_rte_array[rel->relid];
+	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for relation %u", rte->relid);
+	relpersistence = ((Form_pg_class) GETSTRUCT(tup))->relpersistence;
+	ReleaseSysCache(tup);
+
+	if (relpersistence == RELPERSISTENCE_PERMANENT ||
+		relpersistence == RELPERSISTENCE_UNLOGGED)
+		return cuda_dindex;
+
+	return -1;
+}
+
+bool
+RelationCanUseNvmeStrom(Relation relation)
+{
+	Oid		tablespace_oid = RelationGetForm(relation)->reltablespace;
+	cl_int	cuda_dindex;
+	/* SSD2GPU on temp relation is not supported */
+	if (RelationUsesLocalBuffers(relation))
+		return false;
+	cuda_dindex = GetOptimalGpuForTablespace(tablespace_oid);
+	return (cuda_dindex >= 0 &&
+			cuda_dindex <  numDevAttrs);
+}
+
+/*
+ * ScanPathWillUseNvmeStrom - Optimizer Hint
+ */
+bool
+ScanPathWillUseNvmeStrom(PlannerInfo *root, RelOptInfo *baserel)
+{
+	size_t		num_scan_pages = 0;
+
+	if (!pgstrom_gpudirect_enabled())
+		return false;
+
+	/*
+	 * Check expected amount of the scan i/o.
+	 * If 'baserel' is children of partition table, threshold shall be
+	 * checked towards the entire partition size, because the range of
+	 * child tables fully depend on scan qualifiers thus variable time
+	 * by time. Once user focus on a particular range, but he wants to
+	 * focus on other area. It leads potential thrashing on i/o.
+	 */
+	if (baserel->reloptkind == RELOPT_BASEREL)
+	{
+		if (GetOptimalGpuForRelation(root, baserel) >= 0)
+			num_scan_pages = baserel->pages;
+	}
+	else if (baserel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+	{
+		ListCell   *lc;
+		Index		parent_relid = 0;
+
+		foreach (lc, root->append_rel_list)
+		{
+			AppendRelInfo  *appinfo = (AppendRelInfo *) lfirst(lc);
+
+			if (appinfo->child_relid == baserel->relid)
+			{
+				parent_relid = appinfo->parent_relid;
+				break;
+			}
+		}
+		if (!lc)
+		{
+			elog(NOTICE, "Bug? child table (%d) not found in append_rel_list",
+				 baserel->relid);
+			return false;
+		}
+
+		foreach (lc, root->append_rel_list)
+		{
+			AppendRelInfo  *appinfo = (AppendRelInfo *) lfirst(lc);
+			RelOptInfo	   *rel;
+
+			if (appinfo->parent_relid != parent_relid)
+				continue;
+			rel = root->simple_rel_array[appinfo->child_relid];
+			if (GetOptimalGpuForRelation(root, rel) >= 0)
+				num_scan_pages += rel->pages;
+		}
+	}
+	else
+		elog(ERROR, "Bug? unexpected reloptkind of base relation: %d",
+			 (int)baserel->reloptkind);
+
+	if (num_scan_pages < pgstrom_gpudirect_threshold() / BLCKSZ)
+		return false;
+	/* ok, this table scan can use nvme-strom */
+	return true;
 }
 
 /*
@@ -1034,6 +1247,321 @@ pgstromExplainBrinIndexMap(GpuTaskState *gts,
 }
 
 /*
+ * PDS_exec_heapscan_block - PDS scan for KDS_FORMAT_BLOCK format
+ */
+typedef struct {
+	strom_io_vector	*iovec;
+	BlockNumber	   *blknum;
+} PDSHeapScanBlockState;
+
+#define initPDSHeapScanBlockState(pds, bstate)							\
+	do{																	\
+		(bstate).iovec = alloca(offsetof(strom_io_vector,				\
+										 ioc[(pds)->kds.nrooms]));		\
+		(bstate).iovec->nr_chunks = 0;									\
+		(bstate).blknum = alloca(sizeof(BlockNumber) * (pds)->kds.nrooms); \
+	}while(0)
+
+static inline void
+updatePDSHeapScanBlockState(pgstrom_data_store *pds,
+							PDSHeapScanBlockState *bstate,
+							BlockNumber blknum)
+{
+	strom_io_vector *iovec = bstate->iovec;
+	strom_io_chunk	*iochunk;
+	cl_uint		pages_per_block = (BLCKSZ / PAGE_SIZE);
+	cl_uint		fchunk_id = (blknum % RELSEG_SIZE) * pages_per_block;
+
+	if (iovec->nr_chunks > 0)
+	{
+		iochunk = &iovec->ioc[iovec->nr_chunks - 1];
+		if (iochunk->fchunk_id + iochunk->nr_pages == fchunk_id)
+		{
+			/* continuous region - expand the last chunk */
+			iochunk->nr_pages += pages_per_block;
+			goto out;
+		}
+	}
+	/* discontinuous region - add a new chunk */
+	iochunk = &iovec->ioc[iovec->nr_chunks++];
+	iochunk->m_offset = BLCKSZ * pds->nblocks_uncached;
+	iochunk->fchunk_id = fchunk_id;
+	iochunk->nr_pages = pages_per_block;
+out:
+	bstate->blknum[pds->nblocks_uncached++] = blknum;
+}
+
+static void
+mergePDSHeapScanBlockState(pgstrom_data_store *pds,
+						   PDSHeapScanBlockState *bstate)
+{
+	strom_io_vector *iovec = bstate->iovec;
+	cl_uint			nr_uncached = pds->nblocks_uncached;
+	cl_uint			nr_loaded = pds->kds.nitems - nr_uncached;
+	BlockNumber	   *block_nums = (BlockNumber *)KERN_DATA_STORE_BODY(&pds->kds);
+
+	Assert(pds->nblocks_uncached > 0);
+	Assert(iovec != NULL);
+
+	/* copy BlockNumber array */
+	memcpy(block_nums + nr_loaded, bstate->blknum,
+		   sizeof(BlockNumber) * nr_uncached);
+	/* copy iovec */
+	memcpy(pds->iovec, iovec, offsetof(strom_io_vector,
+									   ioc[iovec->nr_chunks]));
+}
+
+static bool
+PDS_exec_heapscan_block(GpuTaskState *gts,
+						pgstrom_data_store *pds,
+						PDSHeapScanBlockState *bstate)
+{
+	Relation		relation = gts->css.ss.ss_currentRelation;
+	HeapScanDesc	hscan = (HeapScanDesc)gts->css.ss.ss_currentScanDesc;
+	NVMEScanState  *nvme_sstate = gts->nvme_sstate;
+	BlockNumber		blknum = hscan->rs_cblock;
+	BlockNumber	   *block_nums;
+	Snapshot		snapshot = ((TableScanDesc)hscan)->rs_snapshot;
+	BufferAccessStrategy strategy = hscan->rs_strategy;
+	SMgrRelation	smgr = relation->rd_smgr;
+	Buffer			buffer;
+	Page			spage;
+	Page			dpage;
+	cl_uint			nr_loaded;
+	bool			all_visible;
+
+	/* PDS cannot eat any blocks more, obviously */
+	if (pds->kds.nitems >= pds->kds.nrooms)
+		return false;
+
+	/* array of block numbers */
+	block_nums = (BlockNumber *)KERN_DATA_STORE_BODY(&pds->kds);
+
+	/*
+	 * NVMe-Strom can be applied only when filesystem supports the feature,
+	 * and the current source block is all-visible.
+	 * Elsewhere, we will go fallback with synchronized buffer scan.
+	 */
+	if (RelationCanUseNvmeStrom(relation) &&
+		VM_ALL_VISIBLE(relation, blknum,
+					   &nvme_sstate->curr_vmbuffer))
+	{
+		BufferTag	newTag;
+		uint32		newHash;
+		LWLock	   *newPartitionLock = NULL;
+		bool		retval;
+		int			buf_id;
+
+		/* create a tag so we can lookup the buffer */
+		INIT_BUFFERTAG(newTag, smgr->smgr_rnode.node, MAIN_FORKNUM, blknum);
+		/* determine its hash code and partition lock ID */
+		newHash = BufTableHashCode(&newTag);
+		newPartitionLock = BufMappingPartitionLock(newHash);
+
+		/* check whether the block exists on the shared buffer? */
+		LWLockAcquire(newPartitionLock, LW_SHARED);
+		buf_id = BufTableLookup(&newTag, newHash);
+		if (buf_id < 0)
+		{
+			BlockNumber	segno = blknum / RELSEG_SIZE;
+			GPUDirectFileDesc *dfile;
+
+			Assert(segno < nvme_sstate->nr_segs);
+			/*
+			 * We cannot mix up multiple source files in a single PDS chunk.
+			 * If heapscan_block comes across segment boundary, rest of the
+			 * blocks must be read on the next PDS chunk.
+			 */
+			dfile = &nvme_sstate->files[segno];
+			if (pds->filedesc.rawfd >= 0 &&
+				pds->filedesc.rawfd != dfile->rawfd)
+				retval = false;
+			else
+			{
+				if (pds->filedesc.rawfd < 0)
+					memcpy(&pds->filedesc, dfile, sizeof(GPUDirectFileDesc));
+				updatePDSHeapScanBlockState(pds, bstate, blknum);
+				pds->kds.nitems++;
+				retval = true;
+			}
+			LWLockRelease(newPartitionLock);
+			return retval;
+		}
+		LWLockRelease(newPartitionLock);
+	}
+	/*
+	 * Load the source buffer with synchronous read
+	 */
+	buffer = ReadBufferExtended(relation, MAIN_FORKNUM, blknum,
+								RBM_NORMAL, strategy);
+#if 1
+	/* Just like heapgetpage(), however, jobs we focus on is OLAP
+	 * workload, so it's uncertain whether we should vacuum the page
+	 * here.
+	 */
+	heap_page_prune_opt(relation, buffer);
+#endif
+	/* we will check tuple's visibility under the shared lock */
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	nr_loaded = pds->kds.nitems - pds->nblocks_uncached;
+	spage = (Page) BufferGetPage(buffer);
+	dpage = (Page) KERN_DATA_STORE_BLOCK_PGPAGE(&pds->kds, nr_loaded);
+	memcpy(dpage, spage, BLCKSZ);
+	block_nums[nr_loaded] = blknum;
+
+	/*
+	 * Logic is almost same as heapgetpage() doing. We have to invalidate
+	 * invisible tuples prior to GPU kernel execution, if not all-visible.
+	 */
+	all_visible = PageIsAllVisible(dpage) && !snapshot->takenDuringRecovery;
+	if (!all_visible)
+	{
+		int				lines = PageGetMaxOffsetNumber(dpage);
+		OffsetNumber	lineoff;
+		ItemId			lpp;
+
+		for (lineoff = FirstOffsetNumber, lpp = PageGetItemId(dpage, lineoff);
+			 lineoff <= lines;
+			 lineoff++, lpp++)
+		{
+			HeapTupleData	tup;
+			bool			valid;
+
+			if (!ItemIdIsNormal(lpp))
+				continue;
+
+			tup.t_tableOid = RelationGetRelid(relation);
+			tup.t_data = (HeapTupleHeader) PageGetItem((Page) dpage, lpp);
+			tup.t_len = ItemIdGetLength(lpp);
+			ItemPointerSet(&tup.t_self, blknum, lineoff);
+
+			valid = HeapTupleSatisfiesVisibility(&tup, snapshot, buffer);
+			HeapCheckForSerializableConflictOut(valid, relation, &tup,
+												buffer, snapshot);
+			if (!valid)
+				ItemIdSetUnused(lpp);
+		}
+	}
+	UnlockReleaseBuffer(buffer);
+	/* dpage became all-visible also */
+	PageSetAllVisible(dpage);
+	pds->kds.nitems++;
+
+	return true;
+}
+
+/*
+ * PDS_exec_heapscan_row - PDS scan for KDS_FORMAT_ROW format
+ */
+static bool
+PDS_exec_heapscan_row(GpuTaskState *gts, pgstrom_data_store *pds)
+{
+	Relation		relation = gts->css.ss.ss_currentRelation;
+	HeapScanDesc	hscan = (HeapScanDesc)gts->css.ss.ss_currentScanDesc;
+	BlockNumber		blknum = hscan->rs_cblock;
+	Snapshot		snapshot = ((TableScanDesc)hscan)->rs_snapshot;
+	BufferAccessStrategy strategy = hscan->rs_strategy;
+	kern_data_store	*kds = &pds->kds;
+	Buffer			buffer;
+	Page			page;
+	int				lines;
+	int				ntup;
+	OffsetNumber	lineoff;
+	ItemId			lpp;
+	uint		   *tup_index;
+	kern_tupitem   *tup_item;
+	bool			all_visible;
+	Size			max_consume;
+
+	/* Load the target buffer */
+	buffer = ReadBufferExtended(relation, MAIN_FORKNUM, blknum,
+								RBM_NORMAL, strategy);
+#if 1
+	/* Just like heapgetpage(), however, jobs we focus on is OLAP
+	 * workload, so it's uncertain whether we should vacuum the page
+	 * here.
+	 */
+	heap_page_prune_opt(relation, buffer);
+#endif
+	/* we will check tuple's visibility under the shared lock */
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	page = (Page) BufferGetPage(buffer);
+	lines = PageGetMaxOffsetNumber(page);
+	ntup = 0;
+
+	/*
+	 * Check whether we have enough rooms to store expected number of
+	 * tuples on the remaining space. If it is hopeless to load all
+	 * the items in a block, we inform the caller this block shall be
+	 * loaded on the next data store.
+	 */
+	max_consume = KERN_DATA_STORE_HEAD_LENGTH(kds) +
+		STROMALIGN(sizeof(cl_uint) * (kds->nitems + lines)) +
+		offsetof(kern_tupitem, htup) * lines + BLCKSZ +
+		__kds_unpack(kds->usage);
+	if (max_consume > kds->length)
+	{
+		UnlockReleaseBuffer(buffer);
+		return false;
+	}
+
+	/*
+	 * Logic is almost same as heapgetpage() doing.
+	 */
+	all_visible = PageIsAllVisible(page) && !snapshot->takenDuringRecovery;
+
+	/* TODO: make SerializationNeededForRead() an external function
+	 * on the core side. It kills necessity of setting up HeapTupleData
+	 * when all_visible and non-serialized transaction.
+	 */
+	tup_index = KERN_DATA_STORE_ROWINDEX(kds) + kds->nitems;
+	for (lineoff = FirstOffsetNumber, lpp = PageGetItemId(page, lineoff);
+		 lineoff <= lines;
+		 lineoff++, lpp++)
+	{
+		HeapTupleData	tup;
+		size_t			curr_usage;
+		bool			valid;
+
+		if (!ItemIdIsNormal(lpp))
+			continue;
+
+		tup.t_tableOid = RelationGetRelid(relation);
+		tup.t_data = (HeapTupleHeader) PageGetItem((Page) page, lpp);
+		tup.t_len = ItemIdGetLength(lpp);
+		ItemPointerSet(&tup.t_self, blknum, lineoff);
+
+		if (all_visible)
+			valid = true;
+		else
+			valid = HeapTupleSatisfiesVisibility(&tup, snapshot, buffer);
+
+		HeapCheckForSerializableConflictOut(valid, relation,
+											&tup, buffer, snapshot);
+		if (!valid)
+			continue;
+
+		/* put tuple */
+		curr_usage = (__kds_unpack(kds->usage) +
+					  MAXALIGN(offsetof(kern_tupitem, htup) + tup.t_len));
+		tup_item = (kern_tupitem *)((char *)kds + kds->length - curr_usage);
+		tup_item->rowid = kds->nitems + ntup;
+		tup_item->t_len = tup.t_len;
+		memcpy(&tup_item->htup, tup.t_data, tup.t_len);
+		memcpy(&tup_item->htup.t_ctid, &tup.t_self, sizeof(ItemPointerData));
+
+		tup_index[ntup++] = __kds_packed((uintptr_t)tup_item - (uintptr_t)kds);
+		kds->usage = __kds_packed(curr_usage);
+	}
+	UnlockReleaseBuffer(buffer);
+	Assert(ntup <= MaxHeapTuplesPerPage);
+	Assert(kds->nitems + ntup <= kds->nrooms);
+	kds->nitems += ntup;
+
+	return true;
+}
+
+/*
  * heapscan_report_location
  */
 static inline void
@@ -1060,10 +1588,14 @@ pgstromExecHeapScanChunkParallel(GpuTaskState *gts,
 	Relation			relation = gts->css.ss.ss_currentRelation;
 	HeapScanDesc		hscan = (HeapScanDesc)gts->css.ss.ss_currentScanDesc;
 	pgstrom_data_store *pds = NULL;
+	PDSHeapScanBlockState bstate;
 
 	Assert(gts->css.ss.ss_currentScanDesc->rs_parallel);
+	memset(&bstate, 0, sizeof(PDSHeapScanBlockState));
 	for (;;)
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		if (!hscan->rs_inited)
 		{
 			if (hscan->rs_nblocks == 0)
@@ -1223,22 +1755,34 @@ pgstromExecHeapScanChunkParallel(GpuTaskState *gts,
 			hscan->rs_numblocks = nr_blocks;
 			continue;
 		}
-		/* allocation of row-based PDS on demand */
-		if (!pds)
+		/* scan next block */
+		if (gts->nvme_sstate)
 		{
-			if (gts->nvme_sstate)
+			/* KDS_FORMAT_BLOCK */
+			if (!pds)
+			{
 				pds = PDS_create_block(gts->gcontext,
 									   RelationGetDescr(relation),
 									   gts->nvme_sstate);
-			else
+				pds->kds.table_oid = RelationGetRelid(relation);
+				initPDSHeapScanBlockState(pds, bstate);
+			}
+			if (!PDS_exec_heapscan_block(gts, pds, &bstate))
+				break;
+		}
+		else
+		{
+			/* KDS_FORMAT_ROW */
+			if (!pds)
+			{
 				pds = PDS_create_row(gts->gcontext,
 									 RelationGetDescr(relation),
 									 pgstrom_chunk_size());
-			pds->kds.table_oid = RelationGetRelid(relation);
+				pds->kds.table_oid = RelationGetRelid(relation);
+			}
+			if (!PDS_exec_heapscan_row(gts, pds))
+				break;
 		}
-		/* scan next block */
-		if (!PDS_exec_heapscan(gts, pds))
-			break;
 		/* move to the next block */
 		hscan->rs_numblocks--;
 		hscan->rs_cblock++;
@@ -1249,6 +1793,10 @@ pgstromExecHeapScanChunkParallel(GpuTaskState *gts,
 		if (hscan->rs_cblock == hscan->rs_startblock)
 			hscan->rs_cblock = InvalidBlockNumber;
 	}
+	/* merge strom_io_vector to the PDS, if KDS_FORMAT_BLOCK */
+	if (pds && pds->nblocks_uncached > 0)
+		mergePDSHeapScanBlockState(pds, &bstate);
+
 	return pds;
 }
 
@@ -1262,10 +1810,14 @@ pgstromExecHeapScanChunk(GpuTaskState *gts,
 	Relation		rel = gts->css.ss.ss_currentRelation;
 	HeapScanDesc	hscan = (HeapScanDesc)gts->css.ss.ss_currentScanDesc;
 	pgstrom_data_store *pds = NULL;
+	PDSHeapScanBlockState bstate;
 
+	memset(&bstate, 0, sizeof(PDSHeapScanBlockState));
 	for (;;)
 	{
 		cl_long		page;
+
+		CHECK_FOR_INTERRUPTS();
 
 		if (!hscan->rs_inited)
 		{
@@ -1304,23 +1856,32 @@ pgstromExecHeapScanChunk(GpuTaskState *gts,
 				goto skip;
 			}
 		}
-
-		/* allocation of row-based PDS on demand */
-		if (!pds)
+		/* scan the next block */
+		if (gts->nvme_sstate)
 		{
-			if (gts->nvme_sstate)
+			if (!pds)
+			{
 				pds =  PDS_create_block(gts->gcontext,
 										RelationGetDescr(rel),
 										gts->nvme_sstate);
-			else
+				pds->kds.table_oid = RelationGetRelid(rel);
+				initPDSHeapScanBlockState(pds, bstate);
+			}
+			if (!PDS_exec_heapscan_block(gts, pds, &bstate))
+				break;
+		}
+		else
+		{
+			if (!pds)
+			{
 				pds = PDS_create_row(gts->gcontext,
 									 RelationGetDescr(rel),
 									 pgstrom_chunk_size());
-			pds->kds.table_oid = RelationGetRelid(rel);
+				pds->kds.table_oid = RelationGetRelid(rel);
+			}
+			if (!PDS_exec_heapscan_row(gts, pds))
+				break;
 		}
-		/* scan the next block */
-		if (!PDS_exec_heapscan(gts, pds))
-			break;		/* no more tuples we can store now! */
 		/* move to the next block */
 		hscan->rs_cblock++;
 	skip:
@@ -1332,6 +1893,10 @@ pgstromExecHeapScanChunk(GpuTaskState *gts,
 		if (hscan->rs_cblock == hscan->rs_startblock)
 			hscan->rs_cblock = InvalidBlockNumber;
 	}
+	/* merge strom_io_vector to the PDS, if any */
+	if (pds && pds->nblocks_uncached > 0)
+		mergePDSHeapScanBlockState(pds, &bstate);
+
 	/* PDS is valid, or end of the relation */
 	Assert(pds || !BlockNumberIsValid(hscan->rs_cblock));
 
@@ -1620,6 +2185,11 @@ pgstromExplainOuterScan(GpuTaskState *gts,
 void
 pgstrom_init_relscan(void)
 {
+	static char	*nvme_manual_distance_map = NULL;
+	HASHCTL		hctl;
+	char		buffer[1280];
+	int			index = 0;
+
 	/* pg_strom.enable_brin */
 	DefineCustomBoolVariable("pg_strom.enable_brin",
 							 "Enables to use BRIN-index",
@@ -1629,4 +2199,37 @@ pgstrom_init_relscan(void)
 							 PGC_USERSET,
                              GUC_NOT_IN_SAMPLE,
                              NULL, NULL, NULL);
+	/*
+	 * pg_strom.nvme_distance_map
+	 *
+	 * config := <token>[,<token>...]
+	 * token  := nvmeXX:gpuXX
+	 *
+	 * eg) nvme0:gpu0,nvme1:gpu1
+	 */
+	DefineCustomStringVariable("pg_strom.nvme_distance_map",
+							   "Manual configuration of optimal GPU for each NVME",
+							   NULL,
+							   &nvme_manual_distance_map,
+							   NULL,
+							   PGC_POSTMASTER,
+							   GUC_NOT_IN_SAMPLE,
+							   NULL, NULL, NULL);
+	extraSysfsSetupDistanceMap(nvme_manual_distance_map);
+	while (extraSysfsPrintNvmeInfo(index, buffer, sizeof(buffer)) >= 0)
+	{
+		elog(LOG, "- %s", buffer);
+		index++;
+	}
+
+	/* hash table for tablespace <-> optimal GPU */
+	memset(&hctl, 0, sizeof(HASHCTL));
+	hctl.keysize = sizeof(Oid);
+	hctl.entrysize = sizeof(tablespace_optimal_gpu_hentry);
+	tablespace_optimal_gpu_htable
+		= hash_create("TablespaceOptimalGpu", 128,
+					  &hctl, HASH_ELEM | HASH_BLOBS);
+	CacheRegisterSyscacheCallback(TABLESPACEOID,
+								  tablespace_optimal_gpu_cache_callback,
+								  (Datum) 0);
 }

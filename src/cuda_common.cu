@@ -3,19 +3,15 @@
  *
  * Core implementation of GPU device code.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "cuda_common.h"
+#include "cuda_gcache.h"
+#include "cuda_postgis.h"
 
 /*
  * __compute_heaptuple_size
@@ -64,6 +60,10 @@ __compute_heaptuple_size(kern_context *kcxt,
 					break;
 				case DATUM_CLASS__COMPOSITE:
 					vl_len = pg_composite_datum_length(kcxt,datum);
+					datalen = TYPEALIGN(cmeta->attalign, datalen);
+					break;
+				case DATUM_CLASS__GEOMETRY:
+					vl_len = pg_geometry_datum_length(kcxt,datum);
 					datalen = TYPEALIGN(cmeta->attalign, datalen);
 					break;
 				default:
@@ -184,10 +184,9 @@ __form_kern_heaptuple(kern_context *kcxt,
 					  void	   *buffer,			/* out */
 					  cl_int	ncols,			/* in */
 					  kern_colmeta *colmeta,	/* in */
-					  HeapTupleHeaderData *htup_orig, /* in: if heap-tuple */
-					  cl_int	comp_typmod,	/* in: if composite type */
-					  cl_uint	comp_typeid,	/* in: if composite type */
-					  cl_uint	htuple_oid,		/* in */
+					  cl_uint	comp_typeid,	/* in */
+					  cl_int	comp_typmod,	/* in */
+					  ItemPointerData *tup_self,/* in: optional */
 					  cl_char  *tup_dclass,		/* in */
 					  Datum	   *tup_values)		/* in */
 {
@@ -198,7 +197,7 @@ __form_kern_heaptuple(kern_context *kcxt,
 	cl_uint		i, curr;
 
 	/* alignment checks */
-	assert((uintptr_t)htup == MAXALIGN(htup));
+	assert((cl_ulong)htup == MAXALIGN(htup));
 
 	/* has any NULL attributes? */
 	if (tup_dclass != NULL)
@@ -214,15 +213,13 @@ __form_kern_heaptuple(kern_context *kcxt,
 	}
 	t_infomask = (tup_hasnull ? HEAP_HASNULL : 0);
 
-	/* preserve HeapTupleHeaderData, if any */
-	if (htup_orig)
-		memcpy(htup, htup_orig, offsetof(HeapTupleHeaderData,
-										 t_ctid) + sizeof(ItemPointerData));
+	/* set up header */
+	htup->t_choice.t_datum.datum_typmod = comp_typmod;
+	htup->t_choice.t_datum.datum_typeid = comp_typeid;
+	if (tup_self)
+		memcpy(&htup->t_ctid, tup_self, sizeof(ItemPointerData));
 	else
 	{
-		/* datum_len_ shall be set on the tail  */
-		htup->t_choice.t_datum.datum_typmod = comp_typmod;
-		htup->t_choice.t_datum.datum_typeid = comp_typeid;
 		htup->t_ctid.ip_blkid.bi_hi = 0xffff;	/* InvalidBlockNumber */
 		htup->t_ctid.ip_blkid.bi_lo = 0xffff;
 		htup->t_ctid.ip_posid = 0;				/* InvalidOffsetNumber */
@@ -233,19 +230,11 @@ __form_kern_heaptuple(kern_context *kcxt,
 	t_hoff = offsetof(HeapTupleHeaderData, t_bits);
 	if (tup_hasnull)
 		t_hoff += BITMAPLEN(ncols);
-	if (htuple_oid != 0)
-	{
-		t_infomask |= HEAP_HASOID;
-		t_hoff += sizeof(cl_uint);
-	}
 	t_hoff = MAXALIGN(t_hoff);
-	if (htuple_oid != 0)
-		*((cl_uint *)((char *)htup + t_hoff - sizeof(cl_uint))) = htuple_oid;
 
 	/* walk on the regular columns */
 	htup->t_hoff = t_hoff;
 	curr = t_hoff;
-
 	for (i=0; i < ncols; i++)
 	{
 		kern_colmeta *cmeta = &colmeta[i];
@@ -310,6 +299,13 @@ __form_kern_heaptuple(kern_context *kcxt,
 													  (char *)htup+curr,
 													  datum);
 					break;
+				case DATUM_CLASS__GEOMETRY:
+					while (padding-- > 0)
+						((char *)htup)[curr++] = '\0';
+					vl_len = pg_geometry_datum_write(kcxt,
+													 (char *)htup+curr,
+													 datum);
+					break;
 				default:
 					assert(dclass == DATUM_CLASS__NORMAL);
 					vl_len = VARSIZE_ANY(datum);
@@ -327,9 +323,148 @@ __form_kern_heaptuple(kern_context *kcxt,
 		}
 	}
 	htup->t_infomask = t_infomask;
-	if (!htup_orig)
-		SET_VARSIZE(&htup->t_choice.t_datum, curr);
+	SET_VARSIZE(&htup->t_choice.t_datum, curr);
 	return curr;
+}
+
+/*
+ * kds_slot_compute_extra
+ */
+DEVICE_FUNCTION(cl_uint)
+kds_slot_compute_extra(kern_context *kcxt,
+					   kern_data_store *kds,
+					   cl_char *tup_dclass,
+					   Datum   *tup_values)
+{
+	cl_uint		extra_sz = 0;
+
+	for (int j=0; j < kds->ncols; j++)
+	{
+		kern_colmeta *cmeta = &kds->colmeta[j];
+		cl_char		dclass = tup_dclass[j];
+
+		if (dclass == DATUM_CLASS__NULL)
+			continue;
+
+		if (cmeta->attbyval)
+		{
+			assert(dclass == DATUM_CLASS__NORMAL);
+		}
+		else if (cmeta->attlen > 0)
+		{
+			assert(dclass == DATUM_CLASS__NORMAL);
+			extra_sz = TYPEALIGN(cmeta->attalign, extra_sz);
+			extra_sz += cmeta->attlen;
+		}
+		else
+		{
+			Datum	datum = tup_values[j];
+
+			extra_sz = TYPEALIGN(cmeta->attalign, extra_sz);
+			switch (dclass)
+			{
+				case DATUM_CLASS__NORMAL:
+					extra_sz += VARSIZE_ANY(datum);
+					break;
+				case DATUM_CLASS__VARLENA:
+					extra_sz += pg_varlena_datum_length(kcxt,datum);
+					break;
+				case DATUM_CLASS__ARRAY:
+					extra_sz += pg_array_datum_length(kcxt,datum);
+					break;
+				case DATUM_CLASS__COMPOSITE:
+					extra_sz += pg_composite_datum_length(kcxt,datum);
+					break;
+				case DATUM_CLASS__GEOMETRY:
+					extra_sz += pg_geometry_datum_length(kcxt,datum);
+					break;
+				default:
+					STROM_ELOG(kcxt, "unexpected DATUM_CLASS");
+					return 0;
+			}
+		}
+	}
+	return MAXALIGN(extra_sz);
+}
+
+DEVICE_FUNCTION(void)
+kds_slot_store_values(kern_context *kcxt,
+					  kern_data_store *kds_dst,
+					  cl_uint  dst_index,
+					  char    *dst_extra,
+					  cl_char *tup_dclass,
+					  Datum   *tup_values)
+{
+	Datum	   *dst_values = KERN_DATA_STORE_VALUES(kds_dst, dst_index);
+	cl_char	   *dst_dclass = KERN_DATA_STORE_DCLASS(kds_dst, dst_index);
+
+	assert(dst_extra == (char *)MAXALIGN(dst_extra));
+	assert(dst_extra >= (char *)(dst_dclass + kds_dst->ncols) &&
+		   dst_extra <= (char *)kds_dst + kds_dst->length);
+	for (int j=0; j < kds_dst->ncols; j++)
+	{
+		kern_colmeta *cmeta = &kds_dst->colmeta[j];
+		cl_char		dclass = tup_dclass[j];
+		cl_int		sz, padding;
+
+		if (dclass == DATUM_CLASS__NULL)
+		{
+			dst_dclass[j] = DATUM_CLASS__NULL;
+			dst_values[j] = 0;
+		}
+		else if (cmeta->attbyval)
+		{
+			assert(dclass == DATUM_CLASS__NORMAL);
+			dst_dclass[j] = DATUM_CLASS__NORMAL;
+			dst_values[j] = tup_values[j];
+		}
+		else if (cmeta->attlen > 0)
+		{
+			assert(dclass == DATUM_CLASS__NORMAL);
+			padding = (char *)TYPEALIGN(cmeta->attalign,
+										dst_extra) - dst_extra;
+			while (padding-- > 0)
+				*dst_extra++ = '\0';
+			memcpy(dst_extra, (char *)tup_values[j], cmeta->attlen);
+			dst_dclass[j] = DATUM_CLASS__NORMAL;
+			dst_values[j] = PointerGetDatum(dst_extra);
+			dst_extra += cmeta->attlen;
+		}
+		else
+		{
+			Datum	datum = tup_values[j];
+
+			padding = (char *)TYPEALIGN(cmeta->attalign,
+										dst_extra) - dst_extra;
+			while (padding-- > 0)
+				*dst_extra++ = '\0';
+			switch (dclass)
+			{
+				case DATUM_CLASS__NORMAL:
+					sz = VARSIZE_ANY(datum);
+					memcpy(dst_extra, DatumGetPointer(datum), sz);
+					break;
+				case DATUM_CLASS__VARLENA:
+					sz = pg_varlena_datum_write(kcxt, dst_extra, datum);
+					break;
+				case DATUM_CLASS__ARRAY:
+					sz = pg_array_datum_write(kcxt, dst_extra, datum);
+					break;
+				case DATUM_CLASS__COMPOSITE:
+					sz = pg_composite_datum_write(kcxt, dst_extra, datum);
+					break;
+				case DATUM_CLASS__GEOMETRY:
+					sz = pg_geometry_datum_write(kcxt, dst_extra, datum);
+					break;
+				default:
+					STROM_ELOG(kcxt, "unexpected DATUM_CLASS");
+					return;
+			}
+			dst_dclass[j] = DATUM_CLASS__NORMAL;
+            dst_values[j] = PointerGetDatum(dst_extra);
+			dst_extra += sz;
+		}
+	}
 }
 
 /*
@@ -420,8 +555,9 @@ pgstromStairlikeBinaryCount(int predicate, cl_uint *total_count)
 	cl_int		unit_sz;
 	cl_int		i, j;
 
+	assert(__activemask() == ~0U);
 	w_bitmap = __ballot_sync(__activemask(), predicate);
-	if ((get_local_id() & (warpSize-1)) == 0)
+	if (get_lane_id() == 0)
 		items[warp_id] = __popc(w_bitmap);
 	__syncthreads();
 
@@ -481,7 +617,7 @@ pg_hash_any(const cl_uchar *k, cl_int keylen)
 	a = b = c = 0x9e3779b9 + len + 3923095;
 
 	/* If the source pointer is word-aligned, we use word-wide fetches */
-	if (((uintptr_t) k & (sizeof(cl_uint) - 1)) == 0)
+	if (((cl_ulong) k & (sizeof(cl_uint) - 1)) == 0)
 	{
 		/* Code path for aligned source data */
 		const cl_uint	*ka = (const cl_uint *) k;
@@ -803,10 +939,10 @@ kern_get_datum_tuple(kern_colmeta *colmeta,
 	/* shortcut if tuple contains no NULL values */
 	if (!heap_hasnull)
 	{
-		kern_colmeta	cmeta = colmeta[colidx];
+		kern_colmeta   *cmeta = &colmeta[colidx];
 
-		if (cmeta.attcacheoff >= 0)
-			return (char *)htup + cmeta.attcacheoff;
+		if (cmeta->attcacheoff >= 0)
+			return (char *)htup + cmeta->attcacheoff;
 	}
 	/* regular path that walks on heap-tuple from the head */
 	for (i=0; i < ncols; i++)
@@ -818,20 +954,20 @@ kern_get_datum_tuple(kern_colmeta *colmeta,
 		}
 		else
 		{
-			kern_colmeta	cmeta = colmeta[i];
+			kern_colmeta   *cmeta = &colmeta[i];
 			char		   *addr;
 
-			if (cmeta.attlen > 0)
-				offset = TYPEALIGN(cmeta.attalign, offset);
+			if (cmeta->attlen > 0)
+				offset = TYPEALIGN(cmeta->attalign, offset);
 			else if (!VARATT_NOT_PAD_BYTE((char *)htup + offset))
-				offset = TYPEALIGN(cmeta.attalign, offset);
+				offset = TYPEALIGN(cmeta->attalign, offset);
 
 			/* TODO: overrun checks here */
 			addr = ((char *) htup + offset);
 			if (i == colidx)
 				return addr;
-			if (cmeta.attlen > 0)
-				offset += cmeta.attlen;
+			if (cmeta->attlen > 0)
+				offset += cmeta->attlen;
 			else
 				offset += VARSIZE_ANY(addr);
 		}
@@ -839,37 +975,78 @@ kern_get_datum_tuple(kern_colmeta *colmeta,
 	return NULL;
 }
 
-#if 0
-/* nobody uses these routines now? */
+/*
+ * kern_get_datum_column - datum referer to KDS_FORMAT_COLUMN
+ */
 DEVICE_FUNCTION(void *)
-kern_get_datum_row(kern_data_store *kds,
-				   cl_uint colidx, cl_uint rowidx)
+kern_get_datum_column(kern_data_store *kds,
+					  kern_data_extra *extra,
+					  cl_uint colidx, cl_uint rowidx)
 {
-	kern_tupitem   *tupitem;
+	kern_colmeta   *cmeta = &kds->colmeta[colidx];
+	char		   *addr;
 
-	if (colidx >= kds->ncols ||
-		rowidx >= kds->nitems)
-		return NULL;	/* likely a BUG */
-	tupitem = KERN_DATA_STORE_TUPITEM(kds, rowidx);
+	if (rowidx >= kds->nitems)
+		return NULL;	/* out of range */
+	if (cmeta->nullmap_offset != 0)
+	{
+		cl_uint	   *nullmap = (cl_uint *)
+			((char *)kds + __kds_unpack(cmeta->nullmap_offset));
+		if ((nullmap[rowidx>>5] & (1U << (rowidx & 0x1f))) == 0)
+			return NULL;
+	}
 
-	return kern_get_datum_tuple(kds->colmeta, &tupitem->htup, colidx);
+	addr = (char *)kds + __kds_unpack(cmeta->values_offset);
+	if (cmeta->attlen > 0)
+	{
+		addr += TYPEALIGN(cmeta->attalign,
+						  cmeta->attlen) * rowidx;
+		return addr;
+	}
+	else if (cmeta->attlen == -1)
+	{
+		assert(extra != NULL);
+		return (char *)extra + __kds_unpack(((cl_uint *)addr)[rowidx]);
+	}
+	return NULL;
 }
 
-DEVICE_FUNCTION(void *)
-kern_get_datum_slot(kern_data_store *kds,
-					cl_uint colidx, cl_uint rowidx)
+DEVICE_FUNCTION(cl_bool)
+kern_check_visibility_column(kern_context *kcxt,
+							 kern_data_store *kds,
+							 cl_uint rowidx)
 {
-	Datum	   *values = KERN_DATA_STORE_VALUES(kds,rowidx);
-	cl_bool	   *isnull = KERN_DATA_STORE_ISNULL(kds,rowidx);
-	kern_colmeta		cmeta = kds->colmeta[colidx];
+	kern_parambuf  *kparams = kcxt->kparams;
+	xidvector	   *xvec = (xidvector *)
+		kparam_get_value(kparams, kparams->xactIdVector);
+	GpuCacheSysattr *sysattr = (GpuCacheSysattr *)
+		kern_get_datum_column(kds, NULL, kds->nr_colmeta-1, rowidx);
 
-	if (isnull[colidx])
-		return NULL;
-	if (cmeta.attbyval)
-		return values + colidx;
-	return (char *)values[colidx];
+	assert(xvec != NULL);
+	assert(sysattr != NULL);
+	if (sysattr->xmin == InvalidTransactionId)
+		return false;
+	if (sysattr->xmin != FrozenTransactionId)
+	{
+		for (int i=0; i < xvec->dim1; i++)
+		{
+			if (sysattr->xmin == xvec->values[i])
+				goto xmin_is_visible;
+		}
+		return false;
+	}
+xmin_is_visible:
+	if (sysattr->xmax == InvalidTransactionId)
+		return true;
+	if (sysattr->xmax == FrozenTransactionId)
+		return false;
+	for (int i=0; i < xvec->dim1; i++)
+	{
+		if (sysattr->xmax == xvec->values[i])
+			return false;
+	}
+	return true;
 }
-#endif
 
 /*
  * Routines to reference values on KDS_FORMAT_ARROW for base types.
@@ -919,7 +1096,7 @@ pg_datum_fetch_arrow(kern_context *kcxt,
 			{
 				result.isnull = false;
 				result.value = *((cl_uint *)addr)
-					+ (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE);
+					- (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE);
 			}
 			break;
 		case ArrowDateUnit__MilliSecond:
@@ -933,7 +1110,7 @@ pg_datum_fetch_arrow(kern_context *kcxt,
 			{
 				result.isnull = false;
 				result.value = *((cl_ulong *)addr) / 1000
-					+ (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE);
+					- (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE);
 			}
 			break;
 		default:
@@ -1053,29 +1230,21 @@ pg_datum_fetch_arrow(kern_context *kcxt,
 				result.isnull = false;
 				result.value = *aval * 1000000L -
 					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
-				if (cmeta->attopts.timestamp.tz_offset != 0)
-					result.value += cmeta->attopts.timestamp.tz_offset;
 				break;
 			case ArrowTimeUnit__MilliSecond:
 				result.isnull = false;
 				result.value = *aval * 1000L -
 					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
-				if (cmeta->attopts.timestamp.tz_offset != 0)
-					result.value += cmeta->attopts.timestamp.tz_offset * 1000;
 				break;
 			case ArrowTimeUnit__MicroSecond:
 				result.isnull = false;
 				result.value = *aval -
 					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
-				if (cmeta->attopts.timestamp.tz_offset != 0)
-					result.value += cmeta->attopts.timestamp.tz_offset * 1000000L;
 				break;
 			case ArrowTimeUnit__NanoSecond:
 				result.isnull = false;
 				result.value = *aval / 1000L -
 					(POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY;
-				if (cmeta->attopts.timestamp.tz_offset != 0)
-					result.value += cmeta->attopts.timestamp.tz_offset * 1000000000L;
 				break;
 			default:
 				result.isnull = true;
@@ -1458,169 +1627,6 @@ pg_datum_fetch_arrow(kern_context *kcxt,
 	result.smeta  = smeta;
 }
 
-/*
- * Template to generate pg_array_t from Apache Arrow store
- */
-#define STROMCL_SIMPLE_PGARRAY_TEMPLATE(NAME)				\
-	STATIC_INLINE(cl_uint)									\
-	pg_##NAME##_array_from_arrow(kern_context *kcxt,		\
-								 char *dest,				\
-								 kern_colmeta *cmeta,		\
-								 char *base,				\
-								 cl_uint start,				\
-								 cl_uint end)				\
-	{														\
-		return pg_simple_array_from_arrow<pg_##NAME##_t>	\
-					(kcxt, dest, cmeta, base, start, end);	\
-	}
-
-#define STROMCL_VARLENA_PGARRAY_TEMPLATE(NAME)				\
-	STATIC_INLINE(cl_uint)									\
-	pg_##NAME##_array_from_arrow(kern_context *kcxt,		\
-								 char *dest,				\
-								 kern_colmeta *cmeta,		\
-								 char *base,				\
-								 cl_uint start,				\
-								 cl_uint end)				\
-	{														\
-		return pg_varlena_array_from_arrow<pg_##NAME##_t>	\
-					(kcxt, dest, cmeta, base, start, end);	\
-	}
-
-#define STROMCL_EXTERNAL_PGARRAY_TEMPLATE(NAME)				\
-	DEVICE_FUNCTION(cl_uint)								\
-	pg_##NAME##_array_from_arrow(kern_context *kcxt,		\
-								 char *dest,				\
-								 kern_colmeta *cmeta,		\
-								 char *base,				\
-								 cl_uint start,				\
-                                 cl_uint end);
-
-template <typename T>
-STATIC_FUNCTION(cl_uint)
-pg_simple_array_from_arrow(kern_context *kcxt,
-						   char *dest,
-						   kern_colmeta *cmeta,
-						   char *base,
-						   cl_uint start, cl_uint end)
-{
-	ArrayType  *res = (ArrayType *)dest;
-	cl_uint		nitems = end - start;
-	cl_uint		i, sz;
-	char	   *nullmap = NULL;
-	T			temp;
-
-	Assert((cl_ulong)res == MAXALIGN(res));
-	Assert(start <= end);
-	if (cmeta->nullmap_offset == 0)
-		sz = ARR_OVERHEAD_NONULLS(1);
-	else
-		sz = ARR_OVERHEAD_WITHNULLS(1, nitems);
-
-	if (res)
-	{
-		res->ndim = 1;
-		res->dataoffset = (cmeta->nullmap_offset == 0 ? 0 : sz);
-		res->elemtype = cmeta->atttypid;
-		ARR_DIMS(res)[0] = nitems;
-		ARR_LBOUND(res)[0] = 1;
-
-		nullmap = ARR_NULLBITMAP(res);
-	}
-
-	for (i=0; i < nitems; i++)
-	{
-		pg_datum_fetch_arrow(kcxt, temp, cmeta, base, start+i);
-		if (temp.isnull)
-		{
-			if (nullmap)
-				nullmap[i>>3] &= ~(1<<(i&7));
-			else
-				Assert(!dest);
-		}
-		else
-		{
-			if (nullmap)
-				nullmap[i>>3] |= (1<<(i&7));
-			sz = TYPEALIGN(cmeta->attalign, sz);
-			if (dest)
-				memcpy(dest+sz, &temp.value, sizeof(temp.value));
-			sz += sizeof(temp.value);
-		}
-	}
-	return sz;
-}
-
-template <typename T>
-STATIC_INLINE(cl_uint)
-pg_varlena_array_from_arrow(kern_context *kcxt,
-							char *dest,
-							kern_colmeta *cmeta,
-							char *base,
-							cl_uint start, cl_uint end)
-{
-	ArrayType  *res = (ArrayType *)dest;
-	cl_uint		nitems = end - start;
-	cl_uint		i, sz;
-	char	   *nullmap = NULL;
-	T			temp;
-
-	Assert((cl_ulong)res == MAXALIGN(res));
-	Assert(start <= end);
-	if (cmeta->nullmap_offset == 0)
-		sz = ARR_OVERHEAD_NONULLS(1);
-	else
-		sz = ARR_OVERHEAD_WITHNULLS(1, nitems);
-
-	if (res)
-	{
-		res->ndim = 1;
-		res->dataoffset = (cmeta->nullmap_offset == 0 ? 0 : sz);
-		res->elemtype = cmeta->atttypid;
-		ARR_DIMS(res)[0] = nitems;
-		ARR_LBOUND(res)[0] = 1;
-
-		nullmap = ARR_NULLBITMAP(res);
-	}
-
-	for (i=0; i < nitems; i++)
-	{
-		pg_datum_fetch_arrow(kcxt, temp, cmeta, base, start+i);
-		if (temp.isnull)
-		{
-			if (nullmap)
-				nullmap[i>>3] &= ~(1<<(i&7));
-			else
-				Assert(!dest);
-		}
-		else
-		{
-			if (nullmap)
-				nullmap[i>>3] |= (1<<(i&7));
-
-			sz = TYPEALIGN(cmeta->attalign, sz);
-			if (temp.length < 0)
-			{
-				cl_uint		vl_len = VARSIZE_ANY(temp.value);
-
-				if (dest)
-					memcpy(dest + sz, DatumGetPointer(temp.value), vl_len);
-				sz += vl_len;
-			}
-			else
-			{
-				if (dest)
-				{
-					memcpy(dest + sz + VARHDRSZ, temp.value, temp.length);
-					SET_VARSIZE(dest + sz, VARHDRSZ + temp.length);
-				}
-				sz += VARHDRSZ + temp.length;
-			}
-		}
-	}
-	return sz;
-}
-
 STROMCL_SIMPLE_PGARRAY_TEMPLATE(bool)
 STROMCL_SIMPLE_PGARRAY_TEMPLATE(int2)
 STROMCL_SIMPLE_PGARRAY_TEMPLATE(int4)
@@ -1707,9 +1713,11 @@ __pg_array_from_arrow(kern_context *kcxt, char *dest, Datum datum)
 			sz = pg_bytea_array_from_arrow(kcxt,dest,smeta,base,start,end);
 			break;
 		default:
-			STROM_EREPORT(kcxt, ERRCODE_STROM_WRONG_CODE_GENERATION,
-						  "wrong code generation");
-			return 0;
+			sz = pg_extras_array_from_arrow(kcxt,dest,smeta,base,start,end);
+			if (sz == 0)
+				STROM_EREPORT(kcxt, ERRCODE_STROM_WRONG_CODE_GENERATION,
+							  "unsupported array element-type");
+			break;
 	}
 	return sz;
 }
@@ -1896,7 +1904,12 @@ __pg_composite_from_arrow(kern_context *kcxt,
 	{
 		kern_colmeta   *smeta = comp->smeta + j;
 
-		if (smeta->atttypkind == TYPE_KIND__COMPOSITE)
+		if (smeta->atttypkind == TYPE_KIND__NULL)
+		{
+			tup_dclass[j] = DATUM_CLASS__NULL;
+			tup_values[j] = 0;
+		}
+		else if (smeta->atttypkind == TYPE_KIND__COMPOSITE)
 		{
 			pg_composite_t	temp;
 
@@ -1933,6 +1946,7 @@ __pg_composite_from_arrow(kern_context *kcxt,
 			switch (smeta->atttypid)
 			{
 				ELEMENT_ENTRY(bool,PG_BOOLOID);
+				ELEMENT_ENTRY(int1,PG_INT1OID);
 				ELEMENT_ENTRY(int2,PG_INT2OID);
 				ELEMENT_ENTRY(int4,PG_INT4OID);
 				ELEMENT_ENTRY(int8,PG_INT8OID);
@@ -1950,9 +1964,17 @@ __pg_composite_from_arrow(kern_context *kcxt,
 				ELEMENT_ENTRY(varchar, PG_VARCHAROID);
 				ELEMENT_ENTRY(bytea, PG_BYTEAOID);
 				default:
-					STROM_EREPORT(kcxt, ERRCODE_INVALID_COLUMN_DEFINITION,
-								  "unsupported type of sub-field");
-					tup_dclass[j] = DATUM_CLASS__NULL;
+					/* try extra sub-field */
+					if (!pg_extras_composite_from_arrow(kcxt, smeta,
+														base, rowidx,
+														&tup_dclass[j],
+														&tup_values[j]))
+					{
+						STROM_EREPORT(kcxt, ERRCODE_INVALID_COLUMN_DEFINITION,
+									  "unsupported device type in composite sub-field");
+						tup_dclass[j] = DATUM_CLASS__NULL;
+					}
+					break;
 			}
 		}
 	}
@@ -2022,5 +2044,78 @@ pg_composite_datum_write(kern_context *kcxt, char *dest, Datum datum)
 								  tup_dclass,
 								  tup_values);
 	kcxt->vlpos = vlpos_saved;
+	return sz;
+}
+
+/* ================================================================
+ *
+ * PotsGIS Support Routines
+ *
+ * ================================================================
+ */
+DEVICE_FUNCTION(cl_uint)
+pg_geometry_datum_length(kern_context *kcxt, Datum datum)
+{
+	pg_geometry_t *geom = (pg_geometry_t *)DatumGetPointer(datum);
+	size_t		sz = offsetof(GSERIALIZED, body.data);
+
+	/*
+	 * NOTE: We always use v1 format of GSERIALIZED, because v2 has
+	 * no functional differences right now, and v1 is shorter than
+	 * the v2 format, by 8 bytes for extra flags.
+	 */
+	if ((geom->flags & GEOM_FLAG__BBOX) != 0 && geom->bbox)
+		sz += geometry_bbox_size(geom->flags);
+	return sz + (sizeof(cl_uint) +	/* geometry type */
+				 sizeof(cl_uint) + 	/* nitems of top-level items */
+				 geom->rawsize);	/* payload of points/vertexes */
+}
+
+DEVICE_FUNCTION(cl_uint)
+pg_geometry_datum_write(kern_context *kcxt, char *dest, Datum datum)
+{
+	pg_geometry_t *geom = (pg_geometry_t *)DatumGetPointer(datum);
+	GSERIALIZED	   *gs = (GSERIALIZED *)dest;
+	char		   *rawdata = gs->body.data;
+	cl_uchar		gflags = G1FLAG_READONLY;
+	cl_uint			sz;
+
+	/* extract SRID */
+	gs->body.srid[0] = (geom->srid & 0x001f0000) >> 16;
+	gs->body.srid[1] = (geom->srid & 0x0000ff00) >>  8;
+	gs->body.srid[2] = (geom->srid & 0x000000ff);
+
+	/* extract flags */
+	if ((geom->flags & GEOM_FLAG__Z) != 0)
+		gflags |= G1FLAG_Z;
+	if ((geom->flags & GEOM_FLAG__M) != 0)
+		gflags |= G1FLAG_M;
+	if ((geom->flags & GEOM_FLAG__BBOX) != 0 && geom->bbox)
+		gflags |= G1FLAG_BBOX;
+	if ((geom->flags & GEOM_FLAG__GEODETIC) != 0)
+		gflags |= G1FLAG_GEODETIC;
+	if ((geom->flags & GEOM_FLAG__SOLID) != 0)
+		gflags |= G1FLAG_SOLID;
+	gs->body.gflags = gflags;
+	
+	if ((gflags & G1FLAG_BBOX) != 0)
+	{
+		cl_uint		sz = geometry_bbox_size(geom->flags);
+
+		memcpy(rawdata, geom->bbox, sz);
+		rawdata += sz;
+	}
+	/* type and nitems */
+	((cl_uint *)rawdata)[0] = geom->type;
+	((cl_uint *)rawdata)[1] = geom->nitems;
+	rawdata += 2 * sizeof(cl_uint);
+
+	/* other payload */
+	memcpy(rawdata, geom->rawdata, geom->rawsize);
+	rawdata += geom->rawsize;
+
+	sz = (rawdata - dest);
+	SET_VARSIZE(gs, sz);
+
 	return sz;
 }

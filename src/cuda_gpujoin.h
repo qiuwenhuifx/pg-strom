@@ -4,17 +4,11 @@
  * GPU accelerated parallel relations join based on hash-join or
  * nested-loop logic.
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef CUDA_GPUJOIN_H
 #define CUDA_GPUJOIN_H
@@ -32,6 +26,7 @@ typedef struct
 	{
 		cl_ulong	chunk_offset;	/* offset to KDS or Hash */
 		cl_ulong	ojmap_offset;	/* offset to outer-join map, if any */
+		cl_ulong	gist_offset;	/* offset to GiST-index pages, if any */
 		cl_bool		is_nestloop;	/* true, if NestLoop. */
 		cl_bool		left_outer;		/* true, if JOIN_LEFT or JOIN_FULL */
 		cl_bool		right_outer;	/* true, if JOIN_RIGHT or JOIN_FULL */
@@ -47,16 +42,20 @@ typedef struct
 	((cl_bool *)((kmrels)->chunks[(depth)-1].right_outer				\
 				 ? ((char *)(kmrels) +									\
 					(size_t)(kmrels)->kmrels_length +					\
-					(size_t)(kmrels)->cuda_dindex *						\
-					(size_t)(kmrels)->ojmaps_length +					\
 					(size_t)(kmrels)->chunks[(depth)-1].ojmap_offset)	\
 				 : NULL))
 
+#define KERN_MULTIRELS_GIST_INDEX(kmrels, depth)						\
+	((kern_data_store *)												\
+	 ((kmrels)->chunks[(depth)-1].gist_offset == 0						\
+	  ? NULL															\
+	  : (char *)(kmrels) + (kmrels)->chunks[(depth)-1].gist_offset))
+
 #define KERN_MULTIRELS_LEFT_OUTER_JOIN(kmrels, depth)	\
-	__ldg(&((kmrels)->chunks[(depth)-1].left_outer))
+	((kmrels)->chunks[(depth)-1].left_outer)
 
 #define KERN_MULTIRELS_RIGHT_OUTER_JOIN(kmrels, depth)	\
-	__ldg(&((kmrels)->chunks[(depth)-1].right_outer))
+	((kmrels)->chunks[(depth)-1].right_outer)
 
 /*
  * kern_gpujoin - control object of GpuJoin
@@ -97,7 +96,6 @@ struct kern_gpujoin
 	kern_errorbuf	kerror;				/* kernel error information */
 	cl_uint			kparams_offset;		/* offset to the kparams */
 	cl_uint			pstack_offset;		/* offset to the pseudo-stack */
-	cl_uint			pstack_nrooms;		/* size of pseudo-stack */
 	cl_uint			num_rels;			/* number of inner relations */
 	cl_uint			grid_sz;			/* grid-size on invocation */
 	cl_uint			block_sz;			/* block-size on invocation */
@@ -107,12 +105,21 @@ struct kern_gpujoin
 	cl_uint			suspend_count;		/* number of suspended blocks */
 	cl_bool			resume_context;		/* resume context from suspend */
 	cl_uint			src_read_pos;		/* position to read from kds_src */
+	/* debug counters */
+	cl_ulong		debug_counter0;
+	cl_ulong		debug_counter1;
+	cl_ulong		debug_counter2;
+	cl_ulong		debug_counter3;
 	/* error status to be backed (OUT) */
 	cl_uint			source_nitems;		/* out: # of source rows */
 	cl_uint			outer_nitems;		/* out: # of filtered source rows */
-	cl_uint			stat_nitems[FLEXIBLE_ARRAY_MEMBER]; /* out: stat nitems */
-	/*-- pseudo-stack and suspend/resume context --*/
+	struct {
+		cl_uint		nitems;
+		cl_uint		nitems2;
+	}				stat[FLEXIBLE_ARRAY_MEMBER];	/* out: stat per depth */
 	/*-- kernel param/const buffer --*/
+	/*-- pseudo stack buffer --*/
+	/*-- suspend / resume context */
 };
 typedef struct kern_gpujoin		kern_gpujoin;
 
@@ -128,6 +135,18 @@ gpujoin_reset_kernel_task(kern_gpujoin *kgjoin, bool resume_context)
 	kgjoin->resume_context	= resume_context;
 }
 #endif
+/*
+ * pseudo stack
+ */
+struct gpujoinPseudoStack
+{
+	cl_uint			__vl_len;		/* varlena header */
+	cl_uint			ps_unitsz;		/* unit-size of pseudo-stack per SM */
+	cl_uint			ps_offset[FLEXIBLE_ARRAY_MEMBER];	/* for each depth */
+};
+typedef struct gpujoinPseudoStack		gpujoinPseudoStack;
+
+#define GPUJOIN_PSEUDO_STACK_NROOMS		2048
 
 /*
  * suspend/resume context
@@ -142,7 +161,10 @@ struct gpujoinSuspendContext
 		cl_uint		wip_count;
 		cl_uint		read_pos;
 		cl_uint		write_pos;
+		cl_uint		temp_pos;
+		cl_uint		gist_pos[MAXWARPS_PER_BLOCK];
 		cl_uint		stat_nitems;
+		cl_uint		stat_nitems2;
 		cl_uint		l_state[MAXTHREADS_PER_BLOCK];	/* private variables */
 		cl_bool		matched[MAXTHREADS_PER_BLOCK];	/* private variables */
 	} pd[FLEXIBLE_ARRAY_MEMBER];	/* per-depth */
@@ -186,7 +208,11 @@ DEVICE_FUNCTION(cl_bool)
 gpujoin_quals_eval_arrow(kern_context *kcxt,
 						 kern_data_store *kds,
 						 cl_uint row_index);
-
+DEVICE_FUNCTION(cl_bool)
+gpujoin_quals_eval_column(kern_context *kcxt,
+						  kern_data_store *kds,
+						  kern_data_extra *extra,
+						  cl_uint row_index);
 /*
  * gpujoin_join_quals
  *
@@ -201,12 +227,12 @@ gpujoin_quals_eval_arrow(kern_context *kcxt,
 DEVICE_FUNCTION(cl_bool)
 gpujoin_join_quals(kern_context *kcxt,
 				   kern_data_store *kds,
+				   kern_data_extra *extra,
 				   kern_multirels *kmrels,
 				   int depth,
 				   cl_uint *x_buffer,
 				   HeapTupleHeaderData *inner_htup,
 				   cl_bool *joinquals_matched);
-
 /*
  * gpujoin_hash_value
  *
@@ -215,10 +241,37 @@ gpujoin_join_quals(kern_context *kcxt,
 DEVICE_FUNCTION(cl_uint)
 gpujoin_hash_value(kern_context *kcxt,
 				   kern_data_store *kds,
+				   kern_data_extra *extra,
 				   kern_multirels *kmrels,
 				   cl_int depth,
 				   cl_uint *x_buffer,
 				   cl_bool *is_null_keys);
+
+/*
+ * gpujoin_gist_load_keys
+ *
+ * It preloads GiST index keys from the outer relations, then returns
+ * private datum on kcxt->vlbuf
+ */
+DEVICE_FUNCTION(void *)
+gpujoin_gist_load_keys(kern_context *kcxt,
+					   kern_multirels *kmrels,
+					   kern_data_store *kds,
+					   kern_data_extra *extra,
+					   cl_int depth,
+					   cl_uint *x_buffer);
+
+/*
+ * gpujoin_gist_index_quals
+ *
+ * It checks GiST-index key qualifiers
+ */
+DEVICE_FUNCTION(cl_bool)
+gpujoin_gist_index_quals(kern_context *kcxt,
+						 cl_int depth,
+						 kern_data_store *kds_gist,
+						 IndexTupleData *itup,
+						 void *gist_keys);
 
 /*
  * gpujoin_projection
@@ -229,6 +282,7 @@ gpujoin_hash_value(kern_context *kcxt,
 DEVICE_FUNCTION(cl_uint)
 gpujoin_projection(kern_context *kcxt,
 				   kern_data_store *kds_src,
+				   kern_data_extra *kds_extra,
 				   kern_multirels *kmrels,
 				   cl_uint *r_buffer,
 				   kern_data_store *kds_dst,
@@ -243,6 +297,7 @@ gpujoin_main(kern_context *kcxt,
 			 kern_gpujoin *kgjoin,
 			 kern_multirels *kmrels,
 			 kern_data_store *kds_src,
+			 kern_data_extra *kds_extra,
 			 kern_data_store *kds_dst,
 			 kern_parambuf *kparams_gpreagg,		/* only if combined Join */
 			 cl_uint *l_state,
@@ -268,12 +323,16 @@ gpujoin_right_outer(kern_context *kcxt,
 __shared__ cl_uint   wip_count[GPUJOIN_MAX_DEPTH+1];
 __shared__ cl_uint   read_pos[GPUJOIN_MAX_DEPTH+1];
 __shared__ cl_uint   write_pos[GPUJOIN_MAX_DEPTH+1];
+__shared__ cl_uint   temp_pos[GPUJOIN_MAX_DEPTH+1];
+__shared__ cl_uint   gist_pos[(GPUJOIN_MAX_DEPTH+1) * MAXWARPS_PER_BLOCK];
 __shared__ cl_uint   stat_nitems[GPUJOIN_MAX_DEPTH+1];
+__shared__ cl_uint   stat_nitems2[GPUJOIN_MAX_DEPTH+1];
 
 KERNEL_FUNCTION(void)
 kern_gpujoin_main(kern_gpujoin *kgjoin,
 				  kern_multirels *kmrels,
 				  kern_data_store *kds_src,
+				  kern_data_extra *kds_extra,
 				  kern_data_store *kds_dst,
 				  kern_parambuf *kparams_gpreagg)
 {
@@ -283,11 +342,14 @@ kern_gpujoin_main(kern_gpujoin *kgjoin,
 	DECL_KERNEL_CONTEXT(u);
 
 	assert(kgjoin->num_rels == GPUJOIN_MAX_DEPTH);
+	memset(l_state, 0, sizeof(l_state));
+	memset(matched, 0, sizeof(matched));
 	INIT_KERNEL_CONTEXT(&u.kcxt, kparams);
 	gpujoin_main(&u.kcxt,
 				 kgjoin,
 				 kmrels,
 				 kds_src,
+				 kds_extra,
 				 kds_dst,
 				 kparams_gpreagg,
 				 l_state,
@@ -308,6 +370,8 @@ kern_gpujoin_right_outer(kern_gpujoin *kgjoin,
 	DECL_KERNEL_CONTEXT(u);
 
 	assert(kgjoin->num_rels == GPUJOIN_MAX_DEPTH);
+	memset(l_state, 0, sizeof(l_state));
+	memset(matched, 0, sizeof(matched));
 	INIT_KERNEL_CONTEXT(&u.kcxt, kparams);
 	gpujoin_right_outer(&u.kcxt,
 						kgjoin,

@@ -6,17 +6,11 @@
  * NOTE: We intend to include this source file into libgpucore.cu or
  * other host code.
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "cuda_common.h"
 #include "cuda_numeric.h"
@@ -604,6 +598,20 @@ numeric_to_float(kern_context *kcxt, pg_numeric_t arg)
 									(ival & FP64_FRAC_MASK));
 }
 
+DEVICE_FUNCTION(pg_int1_t)
+pgfn_numeric_int1(kern_context *kcxt, pg_numeric_t arg)
+{
+	pg_int1_t	result;
+
+	result.isnull = arg.isnull;
+	if (!result.isnull)
+	{
+		result.value = (cl_char)
+			numeric_to_integer(kcxt, arg, SCHAR_MAX, &result.isnull);
+	}
+	return result;
+}
+
 DEVICE_FUNCTION(pg_int2_t)
 pgfn_numeric_int2(kern_context *kcxt, pg_numeric_t arg)
 {
@@ -779,6 +787,18 @@ float_to_numeric(kern_context *kcxt, cl_double fval, cl_long max_fraction)
 	if (sign)
 		result.value = __Int128_inverse(result.value);
 	return pg_numeric_normalize(result);
+}
+
+DEVICE_FUNCTION(pg_numeric_t)
+pgfn_int1_numeric(kern_context *kcxt, pg_int1_t arg)
+{
+	pg_numeric_t	result;
+
+	if (arg.isnull)
+		result.isnull = true;
+	else
+		result = integer_to_numeric(kcxt, arg.value);
+	return result;
 }
 
 DEVICE_FUNCTION(pg_numeric_t)

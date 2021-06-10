@@ -3,17 +3,11 @@
  *
  * Routines for just-in-time comple cuda code
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 #include "mb/pg_wchar.h"
@@ -89,6 +83,7 @@ typedef struct
 static int		program_cache_size_kb;
 static int		num_program_builders;
 static bool		pgstrom_debug_jit_compile_options;
+static int		pgstrom_extra_kernel_stack_size;
 
 /* ---- static variables ---- */
 static shmem_startup_hook_type shmem_startup_next;
@@ -336,6 +331,7 @@ construct_flat_cuda_source(cl_uint extra_flags,
 {
 	size_t		ofs = 0;
 	size_t		len = strlen(kern_define) + strlen(kern_source) + 25000;
+	size_t		stack_sz;
 	char	   *source;
 
 	source = malloc(len);
@@ -346,6 +342,21 @@ construct_flat_cuda_source(cl_uint extra_flags,
 					"#include <cuda_device_runtime_api.h>\n"
 					"#define KERN_CONTEXT_VARLENA_BUFSZ %u\n",
 					Max(varlena_bufsz, 1));
+	/*
+	 * Stack checker for recursive calls.
+	 *
+	 * Note that we don't consider the consumption by varlena buffer,
+	 * because stack area grows from higher to lower address, and
+	 * CHECK_KERNEL_STACK_DEPTH() macro compares the address of the
+	 * kern_context and local pointer in this invocation, thus,
+	 * KERN_CONTEXT_VARLENA_BUFSZ shall not affect.
+	 */
+	stack_sz = 1024 + pgstrom_extra_kernel_stack_size;
+	if ((extra_flags & DEVKERNEL_NEEDS_POSTGIS) != 0)
+		stack_sz += 6144;
+	ofs += snprintf(source + ofs, len - ofs,
+					"#define KERN_CONTEXT_STACK_LIMIT %zu\n", stack_sz);
+
 	/* Enables Debug build? */
 	if ((extra_flags & DEVKERNEL_BUILD_DEBUG_INFO) != 0)
 		ofs += snprintf(source + ofs, len - ofs,
@@ -372,6 +383,10 @@ construct_flat_cuda_source(cl_uint extra_flags,
 	if ((extra_flags & DEVKERNEL_NEEDS_RANGETYPE) != 0)
 		ofs += snprintf(source + ofs, len - ofs,
 						"#include \"cuda_rangetype.h\"\n");
+	/* cuda_postgis.h */
+	if ((extra_flags & DEVKERNEL_NEEDS_POSTGIS) != 0)
+		ofs += snprintf(source + ofs, len - ofs,
+						"#include \"cuda_postgis.h\"\n");
 	/* cuda_primitive.h */
 	if ((extra_flags & DEVKERNEL_NEEDS_PRIMITIVE) != 0)
 		ofs += snprintf(source + ofs, len - ofs,
@@ -392,6 +407,9 @@ construct_flat_cuda_source(cl_uint extra_flags,
 	if ((extra_flags & DEVKERNEL_NEEDS_GPUSORT) != 0)
 		ofs += snprintf(source + ofs, len - ofs,
 						"#include \"cuda_gpusort.h\"\n");
+	/* User's extra module, if any */
+	ofs += pgstrom_codegen_extra_devtypes(source + ofs, len - ofs,
+										  extra_flags);
 	/* Generated from SQL */
 	ofs += snprintf(source + ofs, len - ofs, "\n%s\n", kern_source);
 
@@ -487,6 +505,8 @@ link_cuda_libraries(char *ptx_image,
 			{ "cuda_timelib",   DEVKERNEL_NEEDS_TIMELIB },
 			{ "cuda_misclib",   DEVKERNEL_NEEDS_MISCLIB },
 			{ "cuda_jsonlib",   DEVKERNEL_NEEDS_JSONLIB },
+			{ "cuda_rangetype",	DEVKERNEL_NEEDS_RANGETYPE },
+			{ "cuda_postgis",	DEVKERNEL_NEEDS_POSTGIS },
 			{ "cuda_gpuscan",   DEVKERNEL_NEEDS_GPUSCAN },
 			{ "cuda_gpujoin",   DEVKERNEL_NEEDS_GPUJOIN },
 			{ "cuda_gpupreagg", DEVKERNEL_NEEDS_GPUPREAGG },
@@ -510,6 +530,24 @@ link_cuda_libraries(char *ptx_image,
 				snprintf(pathname, sizeof(pathname),
 						 PGSHAREDIR "/pg_strom/%s.%s",
 						 catalog[i].libname, lib_suffix);
+				rc = cuLinkAddFile(lstate, CU_JIT_INPUT_FATBINARY,
+								   pathname, 0, NULL, NULL);
+				if (rc != CUDA_SUCCESS)
+					werror("failed on cuLinkAddFile(\"%s\"): %s",
+						   pathname, errorText(rc));
+			}
+		}
+
+		/* user's extra device code if any */
+		for (i=0; i < pgstrom_num_users_extra; i++)
+		{
+			pgstromUsersExtraDescriptor *ex_desc = &pgstrom_users_extra_desc[i];
+
+			if ((extra_flags & ex_desc->extra_flags) == ex_desc->extra_flags)
+			{
+				snprintf(pathname, sizeof(pathname),
+						 PGSHAREDIR "/pg_strom/%s.%s",
+						 ex_desc->extra_name, lib_suffix);
 				rc = cuLinkAddFile(lstate, CU_JIT_INPUT_FATBINARY,
 								   pathname, 0, NULL, NULL);
 				if (rc != CUDA_SUCCESS)
@@ -933,16 +971,54 @@ __pgstrom_create_cuda_program(GpuContext *gcontext,
 	int			dindex = gcontext->cuda_dindex;
 	int			hindex;
 	cl_int		target_cc;
+	cl_int		nvrtc_version;
 	dlist_iter	iter;
 	pg_crc32	crc;
 
 	/* build with debug option? */
 	if (pgstrom_debug_jit_compile_options)
 		extra_flags |= DEVKERNEL_BUILD_DEBUG_INFO;
-	/* target binary to build */
+
+	/* Target binary to build
+	 *
+	 * The target binary version shall be determined by CUDA_VERSION
+	 * when PG-Strom was built for, NVRTC_VERSION when PG-Strom loaded it
+	 * at the runtime, and device's computing-capability version.
+	 */
 	Assert(dindex >= 0 && dindex < numDevAttrs);
 	target_cc = (devAttrs[dindex].COMPUTE_CAPABILITY_MAJOR * 10 +
 				 devAttrs[dindex].COMPUTE_CAPABILITY_MINOR);
+
+	nvrtc_version = pgstrom_nvrtc_version();
+#if CUDA_VERSION >= 10010
+#if CUDA_VERSION >= 11010
+	if (nvrtc_version >= 11010 && target_cc >= 80)
+	{
+		/* CUDA 11.1 added CC8.0 (Ampere) support */
+		target_cc = 80;
+	}
+	else
+#endif
+	if (nvrtc_version >= 10010 && target_cc >= 75)
+	{
+		/* CUDA 10.1 added CC7.5 (Turing) support */
+		target_cc = 75;
+	}
+	else
+#endif
+	{
+		/*
+		 * CUDA 9.0 added CC6.0/6.1 (Pascal) and CC7.0 (Volta) support.
+		 * And, PG-Strom does not support older CUDA Toolkit any more.
+		 */
+		if (target_cc >= 70)
+			target_cc = 70;		/* any Volta */
+		else if (target_cc >= 61)
+			target_cc = 61;		/* Pascal except for GP100 */
+		else
+			target_cc = 60;
+	}
+
 	/* makes a hash value */
 	INIT_LEGACY_CRC32(crc);
 	COMP_LEGACY_CRC32(crc, &target_cc, sizeof(cl_int));
@@ -1615,7 +1691,10 @@ retry_checks:
 		 * In addition, build with debug option also requires more stack than
 		 * optimized kernel.
 		 */
-		stack_sz = 1800 + MAXALIGN(entry->varlena_bufsz);
+		stack_sz = (1800 + MAXALIGN(entry->varlena_bufsz) +
+					pgstrom_extra_kernel_stack_size);
+		if ((entry->extra_flags & DEVKERNEL_NEEDS_POSTGIS) != 0)
+			stack_sz += 6144;
 		if ((entry->extra_flags & DEVKERNEL_BUILD_DEBUG_INFO) != 0)
 			stack_sz += 4096;
 #ifdef USE_ASSERT_CHECKING
@@ -1835,103 +1914,6 @@ cudaProgramBuilderWakeUp(bool error_if_no_builders)
 		elog(ERROR, "PG-Strom: no active CUDA C program builder");
 }
 
-#if 0
-/*
- * XXXX - PL/CUDA was re-designed to use CUDA runtime,
- * so we no longer need own wrapper library.
- */
-static void
-build_wrapper_libraries(const char *wrapper_filename,
-						void **p_wrapper_lib,
-						size_t *p_wrapper_libsz)
-{
-	char   *src_fname = NULL;
-	char   *lib_fname = NULL;
-	int		fdesc = -1;
-	int		status;
-	char	buffer[1024];
-	char	spath[128];
-	char	lpath[128];
-	char	cmd[MAXPGPATH];
-	void   *wrapper_lib = NULL;
-	ssize_t	rv, buffer_len;
-	struct stat st_buf;
-
-	PG_TRY();
-	{
-		/* write out source */
-		strcpy(spath, P_tmpdir "/XXXXXX.cu");
-		fdesc = mkstemps(spath, 3);
-		if (fdesc < 0)
-			elog(ERROR, "failed on mkstemps('%s') : %m", src_fname);
-		src_fname = spath;
-
-		buffer_len = snprintf(buffer, sizeof(buffer),
-							  "#include <%s>\n",
-							  wrapper_filename);
-		rv = write(fdesc, buffer, buffer_len);
-		if (rv != buffer_len)
-			elog(ERROR, "failed on write(2) on '%s': %m", src_fname);
-		close(fdesc);
-		fdesc = -1;
-
-		/* Run NVCC */
-		snprintf(lpath, sizeof(lpath),
-				 "%s.sm_%lu.o",
-				 spath, devComputeCapability);
-		lib_fname = lpath;
-		snprintf(cmd, sizeof(cmd),
-				 CUDA_BINARY_PATH "/nvcc "
-				 " --relocatable-device-code=true"
-				 " --gpu-architecture=sm_%lu"
-				 " -DPGSTROM_BUILD_WRAPPER"
-				 " -I " PGSHAREDIR "/extension"
-				 " --device-c %s -o %s",
-				 devComputeCapability,
-				 src_fname,
-				 lib_fname);
-		status = system(cmd);
-		if (status < 0 || WEXITSTATUS(status) != 0)
-			elog(ERROR, "failed on nvcc (%s)", cmd);
-
-		/* Read library */
-		fdesc = open(lib_fname, O_RDONLY);
-		if (fdesc < 0)
-			elog(ERROR, "failed to open \"%s\": %m", lib_fname);
-		if (fstat(fdesc, &st_buf) != 0)
-			elog(ERROR, "failed on fstat(\"%s\") : %m", lib_fname);
-
-		wrapper_lib = malloc(st_buf.st_size);
-		if (!wrapper_lib)
-			elog(ERROR, "out of memory");
-		rv = read(fdesc, wrapper_lib, st_buf.st_size);
-		if (rv != st_buf.st_size)
-			elog(ERROR, "failed on read(\"%s\") : %m", lib_fname);
-		close(fdesc);
-		fdesc = -1;
-	}
-	PG_CATCH();
-	{
-		if (wrapper_lib)
-			free(wrapper_lib);
-		if (fdesc >= 0)
-			close(fdesc);
-		if (src_fname)
-			unlink(src_fname);
-		if (lib_fname)
-			unlink(lib_fname);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	unlink(src_fname);
-	unlink(lib_fname);
-
-	*p_wrapper_lib = wrapper_lib;
-	*p_wrapper_libsz = st_buf.st_size;
-}
-#endif
-
 static void
 pgstrom_startup_cuda_program(void)
 {
@@ -2039,6 +2021,20 @@ pgstrom_init_cuda_program(void)
 							 PGC_SUSET,
 							 GUC_NOT_IN_SAMPLE | GUC_SUPERUSER_ONLY,
 							 NULL, NULL, NULL);
+
+	/*
+	 * Configure extra kernel stack for heavy CUDA programs
+	 */
+	DefineCustomIntVariable("pg_strom.extra_kernel_stack_size",
+							"extra stack size for CUDA kernel programs",
+							NULL,
+							&pgstrom_extra_kernel_stack_size,
+							0,
+							0,
+							INT_MAX,
+							PGC_USERSET,
+							GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
 
 	/* allocation of static shared memory */
 	RequestAddinShmemSpace(offsetof(program_cache_head, base) +

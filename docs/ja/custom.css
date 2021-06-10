@@ -1,8 +1,10 @@
-li.toctree-l3 {
-  margin-left: -12pt;
+p.caption {
+	background: #606060;
+	color: #e8e8e8;
 }
 
-a.toctree-l3 {
-  margin-left: 12pt;
+.rst-content dl:not(.docutils) dt {
+	width: 100%;
 }
+
 

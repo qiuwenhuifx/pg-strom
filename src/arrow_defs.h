@@ -5,7 +5,6 @@
  */
 #ifndef _ARROW_DEFS_H_
 #define _ARROW_DEFS_H_
-
 /*
  * MetadataVersion : short
  */
@@ -15,6 +14,7 @@ typedef enum
 	ArrowMetadataVersion__V2 = 1,		/* not supported */
 	ArrowMetadataVersion__V3 = 2,		/* not supported */
 	ArrowMetadataVersion__V4 = 3,
+	ArrowMetadataVersion__V5 = 4,
 } ArrowMetadataVersion;
 
 /*
@@ -131,17 +131,30 @@ typedef union		ArrowTypeOptions
 	} time;
 	struct {
 		ArrowTimeUnit		unit;
-		int					tz_offset;
 	} timestamp;
 	struct {
 		ArrowIntervalUnit	unit;
 	} interval;
+	struct {
+		int					byteWidth;
+	} fixed_size_binary;
 } ArrowTypeOptions;
 
 #ifndef __CUDACC__
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef bool
+typedef unsigned char	bool;
+#endif
+#ifndef true
+#define true	((bool) 1)
+#endif
+#ifndef false
+#define false	((bool) 0)
+#endif
 
 /*
  * ArrowNodeTag
@@ -393,7 +406,7 @@ typedef struct		ArrowField
 	int				_name_len;
 	bool			nullable;
 	ArrowType		type;
-	ArrowDictionaryEncoding dictionary;
+	ArrowDictionaryEncoding *dictionary;
 	/* vector of nested data types */
 	struct ArrowField *children;
 	int				_num_children;

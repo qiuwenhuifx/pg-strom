@@ -3,31 +3,51 @@
  *
  * Definitions for Apache Arrow IPC stuff.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef ARROW_IPC_H
 #define ARROW_IPC_H
+#ifdef __PGSTROM_MODULE__
+#include "pg_strom.h"
+#endif
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <time.h>
 
 #include "arrow_defs.h"
 
-#define	ARROWALIGN(LEN)			TYPEALIGN(64, (LEN))
+/* several primitive definitions */
+#ifndef offsetof
+//#define offsetof(type,field)		((long) &((type *)0UL)->field)
+#endif
+#ifndef lengthof
+//#define lengthof(array)				(sizeof(array) / sizeof((array)[0]))
+#endif
+
+#ifndef TYPEALIGN
+#define TYPEALIGN(ALIGNVAL,LEN)					\
+	(((uint64_t)(LEN) + ((ALIGNVAL) - 1)) & ~((uint64_t)((ALIGNVAL) - 1)))
+#endif
+#define ARROWALIGN(LEN)			TYPEALIGN(64,(LEN))
+
+#ifndef Oid
+typedef unsigned int	Oid;
+#endif
 
 typedef struct SQLbuffer		SQLbuffer;
 typedef struct SQLtable			SQLtable;
@@ -40,8 +60,8 @@ typedef struct SQLtype__mysql	SQLtype__mysql;
 struct SQLbuffer
 {
 	char	   *data;
-	uint32		usage;
-	uint32		length;
+	uint32_t	usage;
+	uint32_t	length;
 };
 
 struct SQLtype__pgsql
@@ -53,12 +73,12 @@ struct SQLtype__pgsql
 	short		typlen;
 	bool		typbyval;
 	char		typtype;
-	uint8		typalign;
+	uint8_t		typalign;
 };
 
 struct SQLtype__mysql
 {
-	const char *typname;
+	int			typeid;
 };
 
 union SQLtype
@@ -77,9 +97,6 @@ struct SQLfield
 	SQLdictionary *enumdict;	/* valid, if enum type */
 
 	ArrowType	arrow_type;		/* type in apache arrow */
-	const char *arrow_typename;	/* typename in apache arrow */
-	/* other type specific attributes */
-	int64		timestamp__tz_offset; /* offset from UTC, if Timestamp */
 	/* data save as Apache Arrow datum */
 	size_t	(*put_value)(SQLfield *attr, const char *addr, int sz);
 	/* data buffers of the field */
@@ -93,16 +110,26 @@ struct SQLfield
 	ArrowKeyValue *customMetadata;
 	int			numCustomMetadata;
 };
+
 static inline size_t
 sql_field_put_value(SQLfield *column, const char *addr, int sz)
 {
 	return (column->__curr_usage__ = column->put_value(column, addr, sz));
 }
 
+#ifndef FLEXIBLE_ARRAY_MEMBER
+#define FLEXIBLE_ARRAY_MEMBER
+#endif
+
 struct SQLtable
 {
 	const char *filename;		/* output filename */
 	int			fdesc;			/* output file descriptor */
+	off_t		f_pos;			/* current file position */
+	int			__iov_len;		/* for internal use of pwritev support */
+	int			__iov_cnt;
+	struct iovec *__iov;
+
 	ArrowBlock *recordBatches;	/* recordBatches written in the past */
 	int			numRecordBatches;
 	ArrowBlock *dictionaries;	/* dictionaryBatches written in the past */
@@ -113,6 +140,7 @@ struct SQLtable
 	int			numCustomMetadata;
 	SQLdictionary *sql_dict_list; /* list of SQLdictionary */
 	size_t		segment_sz;		/* threshold of the memory usage */
+	size_t		usage;			/* current buffer usage */
 	size_t		nitems;			/* number of items */
 	int			nfields;		/* number of attributes */
 	SQLfield columns[FLEXIBLE_ARRAY_MEMBER];
@@ -122,31 +150,39 @@ typedef struct hashItem		hashItem;
 struct hashItem
 {
 	struct hashItem	*next;
-	uint32		hash;
-	uint32		index;
-	uint32		label_len;
+	uint32_t	hash;
+	uint32_t	index;
+	uint32_t	label_sz;
 	char		label[FLEXIBLE_ARRAY_MEMBER];
 };
 
 struct SQLdictionary
 {
 	struct SQLdictionary *next;
-	Oid			enum_typeid;
-	int			dict_id;
-	char		is_delta;
+	int64_t		dict_id;
 	SQLbuffer	values;
 	SQLbuffer	extra;
+	int			nloaded;	/* # of items loaded from existing file */
 	int			nitems;
-	int			nslots;			/* width of hash slot */
+	int			nslots;		/* width of hash slot */
 	hashItem   *hslots[FLEXIBLE_ARRAY_MEMBER];
 };
 
 /* arrow_write.c */
-extern ssize_t	writeArrowSchema(SQLtable *table);
+extern void		arrowFileWrite(SQLtable *table,
+							   const char *buffer,
+							   ssize_t length);
+extern void		arrowFileWriteIOV(SQLtable *table);
+extern void		writeArrowSchema(SQLtable *table);
 extern void		writeArrowDictionaryBatches(SQLtable *table);
 extern int		writeArrowRecordBatch(SQLtable *table);
-extern ssize_t	writeArrowFooter(SQLtable *table);
-extern size_t	estimateArrowBufferLength(SQLfield *column, size_t nitems);
+extern void		writeArrowFooter(SQLtable *table);
+
+extern size_t	setupArrowRecordBatchIOV(SQLtable *table);
+
+
+
+
 
 /* arrow_nodes.c */
 extern void		__initArrowNode(ArrowNode *node, ArrowNodeTag tag);
@@ -155,7 +191,7 @@ extern void		__initArrowNode(ArrowNode *node, ArrowNodeTag tag);
 extern char	   *dumpArrowNode(ArrowNode *node);
 extern void		copyArrowNode(ArrowNode *dest, const ArrowNode *src);
 extern void		readArrowFileDesc(int fdesc, ArrowFileInfo *af_info);
-extern char	   *arrowTypeName(ArrowField *field);
+extern const char *arrowNodeName(ArrowNode *node);
 
 /* arrow_pgsql.c */
 extern int		assignArrowTypePgSQL(SQLfield *column,
@@ -170,7 +206,10 @@ extern int		assignArrowTypePgSQL(SQLfield *column,
 									 char typalign,
 									 Oid typrelid,
 									 Oid typelem,
-									 const char *tz_name, int64_t tz_offset);
+									 const char *tz_name,
+									 const char *extname,
+									 const char *extschema,
+									 ArrowField *arrow_field);
 /*
  * Error messages, and misc definitions for pg2arrow
  */
@@ -188,6 +227,12 @@ extern int		assignArrowTypePgSQL(SQLfield *column,
 /*
  * SQLbuffer related routines
  */
+extern void	   *palloc(size_t sz);
+extern void	   *palloc0(size_t sz);
+extern char	   *pstrdup(const char *orig);
+extern void	   *repalloc(void *ptr, size_t sz);
+extern void		pfree(void *ptr);
+
 static inline void
 sql_buffer_init(SQLbuffer *buf)
 {
@@ -242,9 +287,24 @@ sql_buffer_append(SQLbuffer *buf, const void *src, size_t len)
 static inline void
 sql_buffer_append_zero(SQLbuffer *buf, size_t len)
 {
-	sql_buffer_expand(buf, buf->usage + len);
-	memset(buf->data + buf->usage, 0, len);
-	buf->usage += len;
+	if (len > 0)
+	{
+		sql_buffer_expand(buf, buf->usage + len);
+		memset(buf->data + buf->usage, 0, len);
+		buf->usage += len;
+	}
+	assert(buf->usage <= buf->length);
+}
+
+static inline void
+sql_buffer_append_char(SQLbuffer *buf, int c, size_t len)
+{
+	if (len > 0)
+	{
+		sql_buffer_expand(buf, buf->usage + len);
+		memset(buf->data + buf->usage, c, len);
+		buf->usage += len;
+	}
 	assert(buf->usage <= buf->length);
 }
 
@@ -255,8 +315,9 @@ sql_buffer_setbit(SQLbuffer *buf, size_t __index)
 	int			mask  = (1 << (__index & 7));
 
 	sql_buffer_expand(buf, index + 1);
-	((uint8 *)buf->data)[index] |= mask;
-	buf->usage = Max(buf->usage, index + 1);
+	((uint8_t *)buf->data)[index] |= mask;
+	if (buf->usage < index + 1)
+		buf->usage = index + 1;
 }
 
 static inline void
@@ -266,8 +327,9 @@ sql_buffer_clrbit(SQLbuffer *buf, size_t __index)
 	int			mask  = (1 << (__index & 7));
 
 	sql_buffer_expand(buf, index + 1);
-	((uint8 *)buf->data)[index] &= ~mask;
-	buf->usage = Max(buf->usage, index + 1);
+	((uint8_t *)buf->data)[index] &= ~mask;
+	if (buf->usage < index + 1)
+		buf->usage = index + 1;
 }
 
 static inline void
@@ -290,48 +352,51 @@ sql_buffer_copy(SQLbuffer *dest, const SQLbuffer *orig)
 }
 
 static inline void
-sql_buffer_write(int fdesc, SQLbuffer *buf)
+sql_field_clear(SQLfield *column)
 {
-	ssize_t		length = buf->usage;
-	ssize_t		offset = 0;
-	ssize_t		nbytes;
+	int		j;
 
-	while (offset < length)
+	column->nitems = 0;
+	column->nullcount = 0;
+	sql_buffer_clear(&column->nullmap);
+	sql_buffer_clear(&column->values);
+	sql_buffer_clear(&column->extra);
+	column->__curr_usage__ = 0;
+
+	if (column->element)
+		sql_field_clear(column->element);
+	if (column->nfields > 0)
 	{
-		nbytes = write(fdesc, buf->data + offset, length - offset);
-		if (nbytes < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			Elog("failed on write(2): %m");
-		}
-		offset += nbytes;
-	}
-
-	if (length != ARROWALIGN(length))
-	{
-		ssize_t	gap = ARROWALIGN(length) - length;
-		char	zero[64];
-
-		offset = 0;
-		memset(zero, 0, sizeof(zero));
-		while (offset < gap)
-		{
-			nbytes = write(fdesc, zero + offset, gap - offset);
-			if (nbytes < 0)
-			{
-				if (errno == EINTR)
-					continue;
-				Elog("failed on write(2): %m");
-			}
-			offset += nbytes;
-		}
+		for (j=0; j < column->nfields; j++)
+			sql_field_clear(&column->subfields[j]);
 	}
 }
 
-/*
- * Misc functions
- */
-extern Datum hash_any(const unsigned char *k, int keylen);
+static inline void
+sql_table_clear(SQLtable *table)
+{
+	int		j;
 
+	for (j=0; j < table->nfields; j++)
+		sql_field_clear(&table->columns[j]);
+	table->nitems = 0;
+	table->usage = 0;
+}
+
+static inline int
+sql_table_append_record_batch(SQLtable *table, ArrowBlock *block)
+{
+	int			index = table->numRecordBatches++;
+
+	if (!table->recordBatches)
+		table->recordBatches = palloc(sizeof(ArrowBlock) * 32);
+	else
+	{
+		size_t	sz = sizeof(ArrowBlock) * (index + 1);
+		table->recordBatches = repalloc(table->recordBatches, sz);
+	}
+	memcpy(&table->recordBatches[index], block, sizeof(ArrowBlock));
+
+	return index;
+}
 #endif	/* ARROW_IPC_H */

@@ -1,8 +1,8 @@
-@ja:<h1>列指向データストア (Arrow_Fdw)</h1>
-@en:<h1>Columnar data store (Arrow_Fdw)</h1>
+@ja:#Apache Arrow (列指向データストア)
+@en:#Apache Arrow (Columnar Store)
 
-@ja:#概要
-@en:#Overview
+@ja:##概要
+@en:##Overview
 
 @ja{
 PostgreSQLのテーブルは内部的に8KBのブロック[^1]と呼ばれる単位で編成され、ブロックは全ての属性及びメタデータを含むタプルと呼ばれるデータ構造を行単位で格納します。行を構成するデータが近傍に存在するため、これはINSERTやUPDATEの多いワークロードに有効ですが、一方で大量データの集計・解析ワークロードには不向きであるとされています。
@@ -54,7 +54,7 @@ Apache Arrow format file internally contains Schema portion to define data struc
 Apache Arrow形式におけるデータ表現は、必ずしも全ての場合でPostgreSQLのデータ表現と一致している訳ではありません。例えば、Arrow形式ではタイムスタンプ型のエポックは`1970-01-01`で複数の精度を持つ事ができますが、PostgreSQLのエポックは`2001-01-01`でマイクロ秒の精度を持ちます。
 }
 @en{
-Data representation in Apache Arrow is not identical with the representation in PostgreSQL. For example, epoch of timestamp in Arrow is `1970-01-01` and it supports multiple precision. On the other hands, epoch of timestamp in PostgreSQL is `2001-01-01` and it has microseconds accuracy.
+Data representation in Apache Arrow is not identical with the representation in PostgreSQL. For example, epoch of timestamp in Arrow is `1970-01-01` and it supports multiple precision. In contrast, epoch of timestamp in PostgreSQL is `2001-01-01` and it has microseconds accuracy.
 }
 
 @ja{
@@ -64,11 +64,11 @@ Arrow_Fdwは外部テーブルを用いてApache Arrow形式ファイルをPostg
 Arrow_Fdw allows to read Apache Arrow files on PostgreSQL using foreign table mechanism. If an Arrow file contains 8 of record batches that has million items for each column data, for example, we can access 8 million rows on the Arrow files through the foreign table.
 }
 
-@ja:#運用
-@en:#Operations
+@ja:##運用
+@en:##Operations
 
-@ja:##外部テーブルの定義
-@en:##Creation of foreign tables
+@ja:###外部テーブルの定義
+@en:###Creation of foreign tables
 
 @ja{
 通常、外部テーブルを作成するには以下の3ステップが必要です。
@@ -122,82 +122,144 @@ IMPORT FOREIGN SCHEMA flogdata
 OPTIONS (file '/path/to/logdata.arrow');
 ```
 
-@ja:##外部テーブルオプション
-@en:##Foreign table options
+@ja:###外部テーブルオプション
+@en:###Foreign table options
 
 @ja{
 Arrow_Fdwは以下のオプションに対応しています。現状、全てのオプションは外部テーブルに対して指定するものです。
 
-|対象|オプション|説明|
-|:---|:---------|:---|
-|外部テーブル|`file`|外部テーブルにマップするArrowファイルを1個指定します。|
-|外部テーブル|`files`|外部テーブルにマップするArrowファイルをカンマ(,）区切りで複数指定します。|
-|外部テーブル|`dir`|指定したディレクトリに格納されている全てのファイルを外部テーブルにマップします。|
-|外部テーブル|`suffix`|`dir`オプションの指定時、例えば`.arrow`など、特定の接尾句を持つファイルだけをマップします。|
-|外部テーブル|`parallel_workers`|この外部テーブルの並列スキャンに使用する並列ワーカープロセスの数を指定します。一般的なテーブルにおける`parallel_workers`ストレージパラメータと同等の意味を持ちます。|
-|外部テーブル|`writable`|この外部テーブルに対する`INSERT`文の実行を許可します。詳細は『書き込み可能Arrow_Fdw』の節を参照してください。|
+`file=PATHNAME`
+:   外部テーブルにマップするArrowファイルを1個指定します。
+
+`files=PATHNAME1[,PATHNAME2...]`
+:   外部テーブルにマップするArrowファイルをカンマ(,）区切りで複数指定します。
+
+`dir=DIRNAME`
+:   指定したディレクトリに格納されている全てのファイルを外部テーブルにマップします。
+
+`suffix=SUFFIX`
+:   `dir`オプションの指定時、例えば`.arrow`など、特定の接尾句を持つファイルだけをマップします。
+
+`parallel_workers=N_WORKERS`
+:   この外部テーブルの並列スキャンに使用する並列ワーカープロセスの数を指定します。一般的なテーブルにおける`parallel_workers`ストレージパラメータと同等の意味を持ちます。
+
+`writable=(true|false)`
+:   この外部テーブルに対する`INSERT`文の実行を許可します。詳細は『書き込み可能Arrow_Fdw』の節を参照してください。
 }
 @en{
 Arrow_Fdw supports the options below. Right now, all the options are for foreign tables.
 
-|Target|Option|Description|
-|:-----|:-----|:----------|
-|foreign table|`file`|It maps an Arrow file specified on the foreign table.
-|foreign table|`files`|It maps multiple Arrow files specified by comma (,) separated files list on the foreign table.
-|foreign table|`dir`|It maps all the Arrow files in the directory specified on the foreign table.
-|foreign table|`suffix`|When `dir` option is given, it maps only files with the specified suffix, like `.arrow` for example.
-|foreign table|`parallel_workers`|It tells the number of workers that should be used to assist a parallel scan of this foreign table; equivalent to `parallel_workers` storage parameter at normal tables.|
-|foreign table|`writable`|It allows execution of `INSERT` command on the foreign table. See the section of "Writable Arrow_Fdw"|
+`file=PATHNAME`
+:   It maps an Arrow file specified on the foreign table.
+
+`files=PATHNAME1[,PATHNAME2...]`
+:   It maps multiple Arrow files specified by comma (,) separated files list on the foreign table.
+
+`dir=DIRNAME`
+:   It maps all the Arrow files in the directory specified on the foreign table.
+
+`suffix=SUFFIX`
+:   `When `dir` option is given, it maps only files with the specified suffix, like `.arrow` for example.
+
+`parallel_workers=N_WORKERS`
+:   It tells the number of workers that should be used to assist a parallel scan of this foreign table; equivalent to `parallel_workers` storage parameter at normal tables.
+
+`writable=(true|false)`
+:   It allows execution of `INSERT` command on the foreign table. See the section of "Writable Arrow_Fdw"
 }
 
-@ja:##データ型の対応
-@en:##Data type mapping
+@ja:###データ型の対応
+@en:###Data type mapping
 
 @ja{
 Arrow形式のデータ型と、PostgreSQLのデータ型は以下のように対応しています。
 
-|Arrowデータ型  |PostgreSQLデータ型|備考|
-|:--------------|:-----------------|:---|
-|`Int`          |`int2,int4,int8`  |`is_signed`属性は無視。`bitWidth`属性は16、32または64のみ対応。|
-|`FloatingPoint`|`float2,float4,float8`|`float2`はPG-Stromによる独自拡張|
-|`Binary`       |`bytea`           |    |
-|`Utf8`         |`text`            |    |
-|`Decimal`      |`numeric`         |    |
-|`Date`         |`date`            |`unitsz=Day`相当に補正|
-|`Time`         |`time`            |`unitsz=MicroSecond`相当に補正|
-|`Timestamp`    |`timestamp`       |`unitsz=MicroSecond`相当に補正|
-|`Interval`     |`interval`        |    |
-|`List`         |配列型            |1次元配列のみ対応（予定）|
-|`Struct`       |複合型            |対応する複合型を予め定義しておくこと。|
-|`Union`        |--------          ||
-|`FixedSizeBinary`|`char(n)`       ||
-|`FixedSizeList`|--------          ||
-|`Map`          |--------          ||
+`Int`
+:   `bitWidth`属性の値に応じて、それぞれ`int1`、`int2`、`int4`、`int8`のいずれかに対応。
+:   `is_signed`属性の値は無視されます。
+:   `int1`はPG-Stromによる独自拡張
+
+`FloatingPoint`
+:   `precision`属性の値に応じて、それぞれ`float2`、`float4`、`float8`のいずれかに対応。
+:   `float2`はPG-Stromによる独自拡張
+
+`Binary`
+:   `bytea`型に対応
+
+`Decimal`
+:   `numeric`型に対応
+
+`Date`
+:   `date`型に対応。`unit=Day`相当となるように補正される。
+
+`Time`
+:   `time`型に対応。`unit=MicroSecond`相当になるように補正される。
+
+`Timestamp`
+:   `timestamp`型に対応。`unit=MicroSecond`相当になるように補正される。
+
+`Interval`
+:   `interval`型に対応
+
+`List`
+:   要素型の1次元配列型として表現される。
+
+`Struct`
+:   複合型として表現される。対応する複合型は予め定義されていなければならない。
+
+`FixedSizeBinary`
+:   `byteWidth`属性の値に応じて `char(n)` として表現される。
+:   メタデータ `pg_type=TYPENAME` が指定されている場合、該当するデータ型を割り当てる場合がある。現時点では、`inet`および`macaddr`型。
+
+`Union`、`Map`、`Duration`、`LargeBinary`、`LargeUtf8`、`LargeList`
+:   現時点ではPostgreSQLデータ型への対応はなし。
 }
 @en{
 Arrow data types are mapped on PostgreSQL data types as follows.
 
-|Arrow data types|PostgreSQL data types|Remarks|
-|:---------------|:--------------------|:------|
-|`Int`           |`int2,int4,int8`     |`is_signed` attribute is ignored. `bitWidth` attribute supports only 16,32 or 64.|
-|`FloatingPoint` |`float2,float4,float8`|`float2` is enhanced by PG-Strom.|
-|`Binary`        |`bytea`              ||
-|`Utf8`          |`text`               ||
-|`Decimal`       |`numeric`            ||
-|`Date`          |`date`               |Adjusted as if `unitsz=Day`|
-|`Time`          |`time`               |Adjusted as if `unitsz=MicroSecond`|
-|`Timestamp`     |`timestamp`          |Adjusted as if `unitsz=MicroSecond`|
-|`Interval`      |`interval`           ||
-|`List`          |array of base type   |It supports only 1-dimensional List(WIP).|
-|`Struct`        |composite type       |PG composite type must be preliminary defined.|
-|`Union`         |--------             ||
-|`FixedSizeBinary`|`char(n)`           ||
-|`FixedSizeList` |--------             ||
-|`Map`           |--------             ||
+`Int`
+:   mapped to either of `int1`, `int2`, `int4` or `int8` according to the `bitWidth` attribute.
+:   `is_signed` attribute shall be ignored.
+:   `int1` is an enhanced data type by PG-Strom.
+
+`FloatingPoint`
+:   mapped to either of `float2`, `float4` or `float8` according to the `precision` attribute.
+:   `float2` is an enhanced data type by PG-Strom.
+
+`Binary`
+:   mapped to `bytea` data type
+
+`Decimal`
+:   mapped to `numeric` data type
+
+`Date`
+:   mapped to `date` data type; to be adjusted as if it has `unit=Day` precision.
+
+`Time`
+:   mapped to `time` data type; to be adjusted as if it has `unit=MicroSecond` precision.
+
+`Timestamp`
+:   mapped to `timestamp` data type; to be adjusted as if it has `unit=MicroSecond` precision.
+
+`Interval`
+:   mapped to `interval` data type.
+
+`List`
+:   mapped to 1-dimensional array of the element data type.
+
+`Struct`
+:   mapped to compatible composite data type; that shall be defined preliminary.
+
+`FixedSizeBinary`
+:   mapped to `char(n)` data type according to the `byteWidth` attribute.
+:   If `pg_type=TYPENAME` is configured, PG-Strom may assign the configured data type. Right now, `inet` and `macaddr` are supported.
+
+`Union`, `Map`, `Duration`, `LargeBinary`, `LargeUtf8`, `LargeList`
+:   Right now, PG-Strom cannot map these Arrow data types onto any of PostgreSQL data types.
 }
 
-@ja:##EXPLAIN出力の読み方
-@en:##How to read EXPLAIN
+@ja:###EXPLAIN出力の読み方
+@en:###How to read EXPLAIN
 
 @ja{
 `EXPLAIN`コマンドを用いて、Arrow形式ファイルの読み出しに関する情報を出力する事ができます。
@@ -310,8 +372,8 @@ VERBOSE option outputs more detailed information.
 The verbose output additionally displays amount of column-data to be loaded on reference of columns. The load of `lo_orderdate`, `lo_quantity`, `lo_extendedprice` and `lo_discount` columns needs to read 87.4GB in total. It is 28.3% towards the filesize (309.2GB).
 }
 
-@ja:#Arrowファイルの作成方法
-@en:#How to make Arrow files
+@ja:##Arrowファイルの作成方法
+@en:##How to make Arrow files
 
 @ja{
 本節では、既にPostgreSQLデータベースに格納されているデータをApache Arrow形式に変換する方法を説明します。
@@ -320,8 +382,8 @@ The verbose output additionally displays amount of column-data to be loaded on r
 This section introduces the way to transform dataset already stored in PostgreSQL database system into Apache Arrow file.
 }
 
-@ja:##PyArrow+Pandas
-@en:##Using PyArrow+Pandas
+@ja:###PyArrow+Pandas
+@en:###Using PyArrow+Pandas
 
 @ja{
 Arrow開発者コミュニティが開発を行っている PyArrow モジュールとPandasデータフレームの組合せを用いて、PostgreSQLデータベースの内容をArrow形式ファイルへと書き出す事ができます。
@@ -350,8 +412,8 @@ f.close()
 Please note that the above operation once keeps query result of the SQL on memory, so should pay attention on memory consumption if you want to transfer massive rows at once.
 }
 
-@ja:##Pg2Arrow
-@en:##Using Pg2Arrow
+@ja:###Pg2Arrow
+@en:###Using Pg2Arrow
 
 @ja{
 一方、PG-Strom Development Teamが開発を行っている `pg2arrow` コマンドを使用して、PostgreSQLデータベースの内容をArrow形式ファイルへと書き出す事ができます。 このツールは比較的大量のデータをNVME-SSDなどストレージに書き出す事を念頭に設計されており、PostgreSQLデータベースから`-s|--segment-size`オプションで指定したサイズのデータを読み出すたびに、Arrow形式のレコードバッチ（Record Batch）としてファイルに書き出します。そのため、メモリ消費量は比較的リーズナブルな値となります。
@@ -435,8 +497,8 @@ Although it is an option for developers, `--dump <filename>` prints schema defin
 `--progress` option enables to show progress of the task. It is useful when a huge table is transformed to Apache Arrow format.
 }
 
-@ja:##書き込み可能Arrow_Fdw
-@en:##Writable Arrow_Fdw
+@ja:###書き込み可能Arrow_Fdw
+@en:###Writable Arrow_Fdw
 @ja{
 `writable`オプションを付加したArrow_Fdw外部テーブルに対しては、`INSERT`構文によりデータを追記する事が可能です。また、`pgstrom.arrow_fdw_truncate()`関数を用いて外部テーブル全体、すなわちその背後にあるApache Arrowファイルの内容を消去する事が可能です。一方、`UPDATE`および`DELETE`構文に関してはサポートされていません。
 }
@@ -542,12 +604,12 @@ postgres=# SELECT count(*) FROM ftest;
 ```
 
 
-@ja:#先進的な使い方
-@en:#Advanced Usage
+@ja:##先進的な使い方
+@en:##Advanced Usage
 
 
-@ja:##SSDtoGPUダイレクトSQL
-@en:##SSDtoGPU Direct SQL
+@ja:###SSDtoGPUダイレクトSQL
+@en:###SSDtoGPU Direct SQL
 
 @ja{
 Arrow_Fdw外部テーブルにマップされた全てのArrow形式ファイルが以下の条件を満たす場合には、列データの読み出しにSSD-to-GPUダイレクトSQLを使用する事ができます。
@@ -564,8 +626,8 @@ In case when all the Arrow files mapped on the Arrow_Fdw foreign table satisfies
 - Total size of Arrow files exceeds the `pg_strom.nvme_strom_threshold` configuration.
 }
 
-@ja:##パーティション設定
-@en:##Partition configuration
+@ja:###パーティション設定
+@en:###Partition configuration
 
 @ja{
 Arrow_Fdw外部テーブルを、パーティションの一部として利用する事ができます。 通常のPostgreSQLテーブルと混在する事も可能ですが、Arrow_Fdw外部テーブルは書き込みに対応していない事に注意してください。 また、マップされたArrow形式ファイルに含まれるデータは、パーティションの境界条件と矛盾しないように設定してください。これはデータベース管理者の責任です。

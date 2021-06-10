@@ -3,24 +3,17 @@
  *
  * Routines to collect GPU device information.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
 /* variable declarations */
 DevAttributes	   *devAttrs = NULL;
 cl_int				numDevAttrs = 0;
-cl_ulong			devComputeCapability = UINT_MAX;
 cl_uint				devBaselineMaxThreadsPerBlock = UINT_MAX;
 
 /* catalog of device attributes */
@@ -79,7 +72,7 @@ pgstrom_collect_gpu_device(void)
 	char	   *cuda_runtime_version = NULL;
 	char	   *nvidia_driver_version = NULL;
 	int			num_devices = -1;	/* total num of GPUs; incl legacy models */
-	int			i, j;
+	int			i, cuda_dindex;
 
 	initStringInfo(&str);
 
@@ -153,6 +146,11 @@ pgstrom_collect_gpu_device(void)
 				strncpy(devAttrs[dindex].DEV_NAME, tok_val,
 						sizeof(devAttrs[dindex].DEV_NAME));
 			}
+			else if (strcmp(tok_attr, "DEVICE_BRAND") == 0)
+			{
+				strncpy(devAttrs[dindex].DEV_BRAND, tok_val,
+						sizeof(devAttrs[dindex].DEV_BRAND));
+			}
 			else if (strcmp(tok_attr, "DEVICE_UUID") == 0)
 			{
 				strncpy(devAttrs[dindex].DEV_UUID, tok_val,
@@ -160,6 +158,8 @@ pgstrom_collect_gpu_device(void)
 			}
 			else if (strcmp(tok_attr, "GLOBAL_MEMORY_SIZE") == 0)
 				devAttrs[dindex].DEV_TOTAL_MEMSZ = atol(tok_val);
+			else if (strcmp(tok_attr, "PCI_BAR1_MEMORY_SIZE") == 0)
+				devAttrs[dindex].DEV_BAR1_MEMSZ = atol(tok_val);
 #include "device_attrs.h"
 			else
 				elog(ERROR, "incorrect gpuinfo -md format");
@@ -170,10 +170,9 @@ pgstrom_collect_gpu_device(void)
 	}
 	ClosePipeStream(filp);
 
-	for (i=0, j=0; i < num_devices; i++)
+	for (i=0, cuda_dindex=0; i < num_devices; i++)
 	{
 		DevAttributes  *dattrs = &devAttrs[i];
-		int				compute_capability;
 		char			path[MAXPGPATH];
 		char			linebuf[2048];
 		FILE		   *filp;
@@ -190,40 +189,19 @@ pgstrom_collect_gpu_device(void)
 		}
 
 		/* Update the baseline device capability */
-		compute_capability = (dattrs->COMPUTE_CAPABILITY_MAJOR * 10 +
-							  dattrs->COMPUTE_CAPABILITY_MINOR);
-		devComputeCapability = Min(devComputeCapability,
-								   compute_capability);
 		devBaselineMaxThreadsPerBlock = Min(devBaselineMaxThreadsPerBlock,
 											dattrs->MAX_THREADS_PER_BLOCK);
 
-		/* Determine CORES_PER_MPU by CC */
-		if (dattrs->COMPUTE_CAPABILITY_MAJOR == 1)
-			dattrs->CORES_PER_MPU = 8;
-		else if (dattrs->COMPUTE_CAPABILITY_MAJOR == 2)
-		{
-			if (dattrs->COMPUTE_CAPABILITY_MINOR == 0)
-				dattrs->CORES_PER_MPU = 32;
-			else if (dattrs->COMPUTE_CAPABILITY_MINOR == 1)
-				dattrs->CORES_PER_MPU = 48;
-			else
-				dattrs->CORES_PER_MPU = -1;
-		}
-		else if (dattrs->COMPUTE_CAPABILITY_MAJOR == 3)
-			dattrs->CORES_PER_MPU = 192;
-		else if (dattrs->COMPUTE_CAPABILITY_MAJOR == 5)
-			dattrs->CORES_PER_MPU = 128;
-		else if (dattrs->COMPUTE_CAPABILITY_MAJOR == 6)
-		{
-			if (dattrs->COMPUTE_CAPABILITY_MINOR == 0)
-				dattrs->CORES_PER_MPU = 64;
-			else
-				dattrs->CORES_PER_MPU = 128;
-		}
-		else if (dattrs->COMPUTE_CAPABILITY_MAJOR == 7)
-			dattrs->CORES_PER_MPU = 64;
+		/*
+		 * Only Tesla or Quadro which have PCI Bar1 more than 256MB
+		 * supports GPUDirectSQL
+		 */
+		if (dattrs->GPU_DIRECT_RDMA_SUPPORTED &&
+			dattrs->DEV_BAR1_MEMSZ > (256UL << 20))
+			dattrs->DEV_SUPPORT_GPUDIRECTSQL = true;
 		else
-			dattrs->CORES_PER_MPU = 0;	/* unknown */
+			dattrs->DEV_SUPPORT_GPUDIRECTSQL = false;
+
 		/*
 		 * read the numa node-id from the sysfs entry
 		 *
@@ -239,11 +217,11 @@ pgstrom_collect_gpu_device(void)
 				 dattrs->PCI_DEVICE_ID);
 		filp = fopen(path, "r");
 		if (!filp)
-			dattrs->NUMA_NODE_ID = -1;		/* unknown */
+			dattrs->NUMA_NODE_ID = -1;              /* unknown */
 		else
 		{
 			if (!fgets(linebuf, sizeof(linebuf), filp))
-				dattrs->NUMA_NODE_ID = -1;	/* unknown */
+				dattrs->NUMA_NODE_ID = -1;      /* unknown */
 			else
 				dattrs->NUMA_NODE_ID = atoi(linebuf);
 			fclose(filp);
@@ -251,16 +229,9 @@ pgstrom_collect_gpu_device(void)
 
 		/* Log brief CUDA device properties */
 		resetStringInfo(&str);
-		appendStringInfo(&str, "GPU%d %s (",
-						 dattrs->DEV_ID, dattrs->DEV_NAME);
-		if (dattrs->CORES_PER_MPU > 0)
-			appendStringInfo(&str, "%d CUDA cores",
-							 dattrs->CORES_PER_MPU *
-							 dattrs->MULTIPROCESSOR_COUNT);
-		else
-			appendStringInfo(&str, "%d SMs",
-							 dattrs->MULTIPROCESSOR_COUNT);
-		appendStringInfo(&str, "; %dMHz, L2 %dkB)",
+		appendStringInfo(&str, "GPU%d %s (%d SMs; %dMHz, L2 %dkB)",
+						 dattrs->DEV_ID, dattrs->DEV_NAME,
+						 dattrs->MULTIPROCESSOR_COUNT,
 						 dattrs->CLOCK_RATE / 1000,
 						 dattrs->L2_CACHE_SIZE >> 10);
 		if (dattrs->DEV_TOTAL_MEMSZ > (4UL << 30))
@@ -279,18 +250,26 @@ pgstrom_collect_gpu_device(void)
 			appendStringInfo(&str, " (%dbits, %dMHz)",
 							 dattrs->GLOBAL_MEMORY_BUS_WIDTH,
 							 dattrs->MEMORY_CLOCK_RATE >> 10);
+
+		if (dattrs->DEV_BAR1_MEMSZ > (1UL << 30))
+			appendStringInfo(&str, ", PCI-E Bar1 %luGB",
+							 dattrs->DEV_BAR1_MEMSZ >> 30);
+		else if (dattrs->DEV_BAR1_MEMSZ > (1UL << 20))
+			appendStringInfo(&str, ", PCI-E Bar1 %luMB",
+							 dattrs->DEV_BAR1_MEMSZ >> 30);
+
 		appendStringInfo(&str, ", CC %d.%d",
 						 dattrs->COMPUTE_CAPABILITY_MAJOR,
 						 dattrs->COMPUTE_CAPABILITY_MINOR);
 		elog(LOG, "PG-Strom: %s", str.data);
 
-		if (i != j)
-			memcpy(&devAttrs[j], &devAttrs[i], sizeof(DevAttributes));
-
-		j++;
+		if (i != cuda_dindex)
+			memcpy(&devAttrs[cuda_dindex],
+				   &devAttrs[i], sizeof(DevAttributes));
+		cuda_dindex++;
 	}
-	Assert(j <= num_devices);
-	numDevAttrs = j;
+	Assert(cuda_dindex <= num_devices);
+	numDevAttrs = cuda_dindex;
 	if (numDevAttrs == 0)
 		elog(ERROR, "PG-Strom: no supported GPU devices found");
 }
@@ -424,6 +403,45 @@ gpuOptimalBlockSize(int *p_grid_sz,
 	return CUDA_SUCCESS;
 }
 
+CUresult
+__gpuOptimalBlockSize(int *p_grid_sz,
+					  int *p_block_sz,
+					  CUfunction kern_function,
+					  int cuda_dindex,
+					  size_t dynamic_shmem_per_block,
+					  size_t dynamic_shmem_per_thread)
+{
+	cl_int		mp_count = devAttrs[cuda_dindex].MULTIPROCESSOR_COUNT;
+	cl_int		min_grid_sz;
+	cl_int		max_block_sz;
+	cl_int		max_multiplicity;
+	size_t		dynamic_shmem_sz;
+	CUresult	rc;
+
+	rc = gpuOccupancyMaxPotentialBlockSize(&min_grid_sz,
+										   &max_block_sz,
+										   kern_function,
+										   dynamic_shmem_per_block,
+										   dynamic_shmem_per_thread);
+	if (rc != CUDA_SUCCESS)
+		return rc;
+
+	dynamic_shmem_sz = (dynamic_shmem_per_block +
+						dynamic_shmem_per_thread * max_block_sz);
+	rc = cuOccupancyMaxActiveBlocksPerMultiprocessor(&max_multiplicity,
+													 kern_function,
+													 max_block_sz,
+													 dynamic_shmem_sz);
+	if (rc != CUDA_SUCCESS)
+		return rc;
+
+	*p_grid_sz = Min(GPUKERNEL_MAX_SM_MULTIPLICITY,
+					 max_multiplicity) * mp_count;
+	*p_block_sz = max_block_sz;
+
+	return CUDA_SUCCESS;
+}
+
 /*
  * pgstrom_device_info - SQL function to dump device info
  */
@@ -465,8 +483,8 @@ pgstrom_device_info(PG_FUNCTION_ARGS)
 	}
 	fncxt = SRF_PERCALL_SETUP();
 
-	dindex = fncxt->call_cntr / (lengthof(DevAttrCatalog) + 3);
-	aindex = fncxt->call_cntr % (lengthof(DevAttrCatalog) + 3);
+	dindex = fncxt->call_cntr / (lengthof(DevAttrCatalog) + 5);
+	aindex = fncxt->call_cntr % (lengthof(DevAttrCatalog) + 5);
 
 	if (dindex >= numDevAttrs)
 		SRF_RETURN_DONE(fncxt);
@@ -479,17 +497,27 @@ pgstrom_device_info(PG_FUNCTION_ARGS)
 	}
 	else if (aindex == 1)
 	{
+		att_name = "GPU Device Brand";
+		att_value = dattrs->DEV_BRAND;
+	}
+	else if (aindex == 2)
+	{
 		att_name = "GPU Device UUID";
 		att_value = dattrs->DEV_UUID;
 	}
-	else if (aindex == 2)
+	else if (aindex == 3)
 	{
 		att_name = "GPU Total RAM Size";
 		att_value = format_bytesz(dattrs->DEV_TOTAL_MEMSZ);
 	}
+	else if (aindex == 4)
+	{
+		att_name = "GPU PCI Bar1 Size";
+		att_value = format_bytesz(dattrs->DEV_BAR1_MEMSZ);
+	}
 	else
 	{
-		int		i = aindex - 3;
+		int		i = aindex - 5;
 		int		value = *((int *)((char *)dattrs +
 								  DevAttrCatalog[i].attr_offset));
 
@@ -559,125 +587,92 @@ pgstrom_device_info(PG_FUNCTION_ARGS)
 PG_FUNCTION_INFO_V1(pgstrom_device_info);
 
 /*
- * SQL functions for GPU attributes
+ * SQL functions for GPU attributes (deprecated)
  */
-static DevAttributes *
-lookup_device_attributes(int device_nr)
-{
-	DevAttributes *dattr;
-	int		i;
-
-	for (i=0; i < numDevAttrs; i++)
-	{
-		dattr = &devAttrs[i];
-
-		if (dattr->DEV_ID == device_nr)
-			return dattr;
-	}
-	elog(ERROR, "invalid GPU device number: %d", device_nr);
-}
-
 Datum
 pgstrom_gpu_device_name(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_TEXT_P(cstring_to_text(dattr->DEV_NAME));
+	elog(ERROR, "gpu_device_name() was deprecated");
+	PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_device_name);
 
 Datum
 pgstrom_gpu_global_memsize(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT64(dattr->DEV_TOTAL_MEMSZ);
+	elog(ERROR, "gpu_global_memsize() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_global_memsize);
 
 Datum
 pgstrom_gpu_max_blocksize(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->MAX_THREADS_PER_BLOCK);
+	elog(ERROR, "gpu_max_blocksize() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_max_blocksize);
 
 Datum
 pgstrom_gpu_warp_size(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->WARP_SIZE);
+	elog(ERROR, "gpu_warp_size() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_warp_size);
 
 Datum
 pgstrom_gpu_max_shared_memory_perblock(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->MAX_SHARED_MEMORY_PER_BLOCK);
+	elog(ERROR, "gpu_max_shared_memory_perblock() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_max_shared_memory_perblock);
 
 Datum
 pgstrom_gpu_num_registers_perblock(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->MAX_REGISTERS_PER_BLOCK);
+	elog(ERROR, "gpu_num_registers_perblock() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_num_registers_perblock);
 
 Datum
 pgstrom_gpu_num_multiptocessors(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->MULTIPROCESSOR_COUNT);
+	elog(ERROR, "gpu_num_multiptocessors() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_num_multiptocessors);
 
 Datum
 pgstrom_gpu_num_cuda_cores(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->CORES_PER_MPU *
-					dattr->MULTIPROCESSOR_COUNT);
+	elog(ERROR, "gpu_num_cuda_cores() was deprecated");
+	PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_num_cuda_cores);
 
 Datum
 pgstrom_gpu_cc_major(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->COMPUTE_CAPABILITY_MAJOR);
+	elog(ERROR, "gpu_cc_major() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_cc_major);
 
 Datum
 pgstrom_gpu_cc_minor(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-
-	PG_RETURN_INT32(dattr->COMPUTE_CAPABILITY_MINOR);
+	elog(ERROR, "gpu_cc_minor() was deprecated");
+    PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_cc_minor);
 
 Datum
 pgstrom_gpu_pci_id(PG_FUNCTION_ARGS)
 {
-	DevAttributes *dattr = lookup_device_attributes(PG_GETARG_INT32(0));
-	char	temp[256];
-
-	snprintf(temp, sizeof(temp), "%04d:%02d:%02d",
-			 dattr->PCI_DOMAIN_ID,
-			 dattr->PCI_BUS_ID,
-			 dattr->PCI_DEVICE_ID);
-	PG_RETURN_TEXT_P(cstring_to_text(temp));
+	elog(ERROR, "gpu_pci_id() was deprecated");
+	PG_RETURN_NULL();
 }
 PG_FUNCTION_INFO_V1(pgstrom_gpu_pci_id);

@@ -3,17 +3,11 @@
  *
  * Collection of numeric functions for CUDA GPU devices
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef CUDA_NUMERIC_H
 #define CUDA_NUMERIC_H
@@ -334,6 +328,8 @@ pg_numeric_from_varlena(kern_context *kcxt, struct varlena *vl_datum);
 
 #ifdef __CUDACC__
 /* numeric cast functions */
+DEVICE_FUNCTION(pg_int1_t)
+pgfn_numeric_int1(kern_context *kcxt, pg_numeric_t arg);
 DEVICE_FUNCTION(pg_int2_t)
 pgfn_numeric_int2(kern_context *kcxt, pg_numeric_t arg);
 DEVICE_FUNCTION(pg_int4_t)
@@ -350,6 +346,8 @@ DEVICE_FUNCTION(pg_numeric_t)
 integer_to_numeric(kern_context *kcxt, cl_long ival);
 DEVICE_FUNCTION(pg_numeric_t)
 float_to_numeric(kern_context *kcxt, cl_double fval);
+DEVICE_FUNCTION(pg_numeric_t)
+pgfn_int1_numeric(kern_context *kcxt, pg_int1_t arg);
 DEVICE_FUNCTION(pg_numeric_t)
 pgfn_int2_numeric(kern_context *kcxt, pg_int2_t arg);
 DEVICE_FUNCTION(pg_numeric_t)

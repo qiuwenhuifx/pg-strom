@@ -3,17 +3,11 @@
  *
  * CUDA device code specific to GpuScan logic
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef CUDA_GPUSCAN_H
 #define CUDA_GPUSCAN_H
@@ -70,17 +64,22 @@ typedef struct
 	 KERN_GPUSCAN_PARAMBUF_LENGTH(kgpuscan))
 
 #ifdef __CUDACC__
+
 /* to be generated from SQL */
 DEVICE_FUNCTION(cl_bool)
 gpuscan_quals_eval(kern_context *kcxt,
 				   kern_data_store *kds,
 				   ItemPointerData *t_self,
 				   HeapTupleHeaderData *htup);
-
 DEVICE_FUNCTION(cl_bool)
 gpuscan_quals_eval_arrow(kern_context *kcxt,
 						 kern_data_store *kds,
 						 cl_uint src_index);
+DEVICE_FUNCTION(cl_bool)
+gpuscan_quals_eval_column(kern_context *kcxt,
+						  kern_data_store *kds,
+						  kern_data_extra *extra,
+						  cl_uint src_index);
 
 DEVICE_FUNCTION(void)
 gpuscan_projection_tuple(kern_context *kcxt,
@@ -89,13 +88,19 @@ gpuscan_projection_tuple(kern_context *kcxt,
 						 ItemPointerData *t_self,
 						 cl_char *tup_dclass,
 						 Datum *tup_values);
-
 DEVICE_FUNCTION(void)
 gpuscan_projection_arrow(kern_context *kcxt,
 						 kern_data_store *kds_src,
 						 size_t src_index,
 						 cl_char *tup_dclass,
 						 Datum *tup_values);
+DEVICE_FUNCTION(void)
+gpuscan_projection_column(kern_context *kcxt,
+						  kern_data_store *kds_src,
+						  kern_data_extra *kds_extra,
+						  size_t src_index,
+						  cl_char *tup_dclass,
+						  Datum *tup_values);
 /*
  * GpuScan main logic
  */
@@ -117,6 +122,12 @@ gpuscan_main_arrow(kern_context *kcxt,
 				   kern_data_store *kds_src,
 				   kern_data_store *kds_dst,
 				   bool has_device_projection);
+DEVICE_FUNCTION(void)
+gpuscan_main_column(kern_context *kcxt,
+                    kern_gpuscan *kgpuscan,
+                    kern_data_store *kds_src,
+                    kern_data_extra *kds_extra,
+                    kern_data_store *kds_dst);
 #endif	/* __CUDACC__ */
 #ifdef __CUDACC_RTC__
 /*
@@ -125,6 +136,7 @@ gpuscan_main_arrow(kern_context *kcxt,
 KERNEL_FUNCTION(void)
 kern_gpuscan_main_row(kern_gpuscan *kgpuscan,
                       kern_data_store *kds_src,
+					  kern_data_extra *__not_valid__,
                       kern_data_store *kds_dst)
 {
 	kern_parambuf *kparams = KERN_GPUSCAN_PARAMBUF(kgpuscan);
@@ -139,6 +151,7 @@ kern_gpuscan_main_row(kern_gpuscan *kgpuscan,
 KERNEL_FUNCTION(void)
 kern_gpuscan_main_block(kern_gpuscan *kgpuscan,
                         kern_data_store *kds_src,
+						kern_data_extra *__not_valid__,
                         kern_data_store *kds_dst)
 {
 	kern_parambuf *kparams = KERN_GPUSCAN_PARAMBUF(kgpuscan);
@@ -152,7 +165,8 @@ kern_gpuscan_main_block(kern_gpuscan *kgpuscan,
 
 KERNEL_FUNCTION(void)
 kern_gpuscan_main_arrow(kern_gpuscan *kgpuscan,
-                        kern_data_store *kds_src,
+						kern_data_store *kds_src,
+						kern_data_extra *__not_valid__,
                         kern_data_store *kds_dst)
 {
 	kern_parambuf *kparams = KERN_GPUSCAN_PARAMBUF(kgpuscan);
@@ -163,5 +177,24 @@ kern_gpuscan_main_arrow(kern_gpuscan *kgpuscan,
 					   GPUSCAN_HAS_DEVICE_PROJECTION);
 	kern_writeback_error_status(&kgpuscan->kerror, &u.kcxt);
 }
+
+KERNEL_FUNCTION(void)
+kern_gpuscan_main_column(kern_gpuscan *kgpuscan,
+						 kern_data_store *kds_src,
+						 kern_data_extra *kds_extra,
+						 kern_data_store *kds_dst)
+{
+	kern_parambuf *kparams = KERN_GPUSCAN_PARAMBUF(kgpuscan);
+	DECL_KERNEL_CONTEXT(u);
+
+	INIT_KERNEL_CONTEXT(&u.kcxt, kparams);
+	gpuscan_main_column(&u.kcxt,
+						kgpuscan,
+						kds_src,
+						kds_extra,
+						kds_dst);
+	kern_writeback_error_status(&kgpuscan->kerror, &u.kcxt);
+}
+
 #endif	/* __CUDACC_RTC__ */
 #endif	/* CUDA_GPUSCAN_H */

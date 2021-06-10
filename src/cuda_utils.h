@@ -3,17 +3,11 @@
  *
  * Collection of CUDA inline functions for device code
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef CUDA_UTILS_H
 #define CUDA_UTILS_H
@@ -136,6 +130,18 @@ __strncmp(const char *__s1, const char *__s2, cl_uint n)
 	return c1 - c2;
 }
 
+/* swap values */
+template <typename T>
+STATIC_INLINE(void)
+__swap(T &value_x, T &value_y)
+{
+	T	temp;
+
+	temp = value_x;
+	value_x = value_y;
+	value_y = temp;
+}
+
 /*
  * pgstromTotalSum
  *
@@ -185,7 +191,6 @@ pgstromTotalSum(T *values, cl_uint nitems)
 
 /*
  * Utility functions to reference system columns
- *   (except for ctid and table_oid)
  */
 DEVICE_INLINE(cl_int)
 pg_sysattr_ctid_store(kern_context *kcxt,
@@ -335,6 +340,96 @@ pg_sysattr_tableoid_store(kern_context *kcxt,
 	}
 	return 0;
 }
+/*
+ * System attribute reference for Apache Arrow
+ */
+DEVICE_INLINE(cl_int)
+pg_sysattr_ctid_fetch_arrow(kern_context *kcxt,
+							kern_data_store *kds,
+							cl_uint row_index,
+							cl_char &dclass,
+							Datum   &value)
+{
+	dclass = DATUM_CLASS__NULL;
+	return 0;
+}
+
+DEVICE_INLINE(cl_int)
+pg_sysattr_oid_fetch_arrow(kern_context *kcxt,
+						   kern_data_store *kds,
+                           cl_uint row_index,
+                           cl_char &dclass,
+                           Datum   &value)
+{
+	dclass = DATUM_CLASS__NULL;
+	return 0;
+}
+
+DEVICE_INLINE(cl_int)
+pg_sysattr_xmin_fetch_arrow(kern_context *kcxt,
+							kern_data_store *kds,
+							cl_uint row_index,
+							cl_char &dclass,
+							Datum   &value)
+{
+	dclass = DATUM_CLASS__NULL;
+	return 0;
+}
+
+DEVICE_INLINE(cl_int)
+pg_sysattr_xmax_fetch_arrow(kern_context *kcxt,
+                            kern_data_store *kds,
+                            cl_uint row_index,
+                            cl_char &dclass,
+                            Datum   &value)
+{
+	dclass = DATUM_CLASS__NULL;
+	return 0;
+}
+
+DEVICE_INLINE(cl_int)
+pg_sysattr_cmin_fetch_arrow(kern_context *kcxt,
+							kern_data_store *kds,
+							cl_uint row_index,
+							cl_char &dclass,
+							Datum   &value)
+{
+	dclass = DATUM_CLASS__NULL;
+	return 0;
+}
+
+DEVICE_INLINE(cl_int)
+pg_sysattr_cmax_fetch_arrow(kern_context *kcxt,
+							kern_data_store *kds,
+							cl_uint row_index,
+							cl_char &dclass,
+							Datum   &value)
+{
+	dclass = DATUM_CLASS__NULL;
+	return 0;
+}
+
+DEVICE_INLINE(cl_int)
+pg_sysattr_tableoid_fetch_arrow(kern_context *kcxt,
+								kern_data_store *kds,
+								cl_uint row_index,
+								cl_char &dclass,
+								Datum   &value)
+{
+	if (!kds)
+		dclass = DATUM_CLASS__NULL;
+	else
+	{
+		dclass = DATUM_CLASS__NORMAL;
+		value  = (Datum)kds->table_oid;
+	}
+	return 0;
+}
+
+/*
+ * System attribute reference for GPU memory Store
+ */
+#include "cuda_gcache.h"
 
 /*
  * inline functions to form/deform HeapTuple
@@ -371,40 +466,20 @@ form_kern_heaptuple(kern_context    *kcxt,
 					kern_tupitem    *tupitem,		/* out */
 					kern_data_store	*kds_dst,		/* in */
 					ItemPointerData *tup_self,		/* in, optional */
-					HeapTupleHeaderData *htup,		/* in, optional */
 					cl_char         *tup_dclass,	/* in */
 					Datum           *tup_values)	/* in */
 {
-	cl_uint		htuple_oid = 0;
-
-	assert((uintptr_t)tupitem == MAXALIGN(tupitem));
+	assert((cl_ulong)tupitem == MAXALIGN(tupitem));
 	assert((char *)tupitem >= (char *)kds_dst &&
 		   (char *)tupitem <  (char *)kds_dst + kds_dst->length);
-	/* setup kern_tupitem */
-	if (tup_self)
-		tupitem->t_self = *tup_self;
-	else
-	{
-		tupitem->t_self.ip_blkid.bi_hi = 0xffff;	/* InvalidBlockNumber */
-		tupitem->t_self.ip_blkid.bi_lo = 0xffff;
-		tupitem->t_self.ip_posid = 0;				/* InvalidOffsetNumber */
-	}
-	/* OID of tuple; deprecated at PG12 */
-	if (kds_dst->tdhasoid &&
-		htup && (htup->t_infomask & HEAP_HASOID) != 0)
-	{
-		htuple_oid = *((cl_uint *)((char *)htup
-								   + htup->t_hoff
-								   - sizeof(cl_uint)));
-	}
+	tupitem->rowid = UINT_MAX;		/* caller should set */
 	tupitem->t_len = __form_kern_heaptuple(kcxt,
 										   &tupitem->htup,
 										   kds_dst->ncols,
 										   kds_dst->colmeta,
-										   htup,
-										   0,	/* not a composite type */
-										   0,	/* not a composite type */
-										   htuple_oid,
+										   kds_dst->tdtypeid,
+										   kds_dst->tdtypmod,
+										   tup_self,
 										   tup_dclass,
 										   tup_values);
 	return tupitem->t_len;
@@ -440,10 +515,9 @@ form_kern_composite_type(kern_context *kcxt,
 								 buffer,
 								 nfields,
 								 colmeta,
-								 NULL,
-								 comp_typmod,
 								 comp_typeid,
-								 0,	/* composite type never have OID */
+								 comp_typmod,
+								 NULL,
 								 tup_dclass,
 								 tup_values);
 }

@@ -3,17 +3,11 @@
  *
  * Implementation of MemoryContext on dynamic shared-memory segments.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 #include "nodes/memnodes.h"
@@ -253,11 +247,13 @@ shmBufferAttachSegmentOnDemand(int signum, siginfo_t *siginfo, void *unused)
 		SpinLockRelease(&lmap->mutex);
 
 		/* problem solved */
+#ifdef PGSTROM_DEBUG_BUILD
 		fprintf(stderr, "pid=%u: %s on %p (seg_id=%u,rev=%u) - "
 				"[%s] has been locally mapped on demand.\n",
 				MyProcPid, strsignal(signum), fault_addr,
 				segment_id, revision,
 				namebuf);
+#endif
 		errno = errno_saved;
 		return;
 
@@ -702,6 +698,7 @@ shmemContextAlloc(MemoryContext __context, Size required)
 	if (!chunk)
 		return NULL;
 	Assert(chunk->memcxt == __context);
+	
 	return chunk->data;
 }
 
@@ -930,11 +927,30 @@ shmemContextIsEmpty(MemoryContext __context)
 
 /*
  * shmemContextStatsPrint
+ *
+ * NOTE: PG11 changed MemoryContextMethods->stat API
  */
+#if PG_VERSION_NUM < 110000
+typedef void (*MemoryStatsPrintFunc) (MemoryContext context,
+									  void *passthru,
+									  const char *stats_string);
 static void
-shmemContextStatsPrint(MemoryContext __context,
-					   MemoryStatsPrintFunc printfunc, void *passthru,
-					   MemoryContextCounters *totals)
+MemoryStatsPrintfStderr(MemoryContext context,
+						void *passthru,
+						const char *stats_string)
+{
+	int		i, level = *((int *)passthru);
+
+	for (i=0; i < level; i++)
+		fputc(' ', stderr);
+	fputs(stats_string, stderr);
+}
+#endif
+
+static void
+__shmemContextStatsPrint(MemoryContext __context,
+						 MemoryStatsPrintFunc printfunc, void *passthru,
+						 MemoryContextCounters *totals)
 {
 	shmBufferContext *context = (shmBufferContext *) __context;
 	dlist_iter	iter;
@@ -998,6 +1014,26 @@ shmemContextStatsPrint(MemoryContext __context,
 		totals->freespace += free_space;
 	}
 }
+
+#if PG_VERSION_NUM < 110000
+static void
+shmemContextStatsPrint(MemoryContext __context, int level, bool print,
+					   MemoryContextCounters *totals)
+{
+	__shmemContextStatsPrint(__context,
+							 print ? MemoryStatsPrintfStderr : NULL,
+							 &level,
+							 totals);
+}
+#else	/* PG10 or older */
+static void
+shmemContextStatsPrint(MemoryContext __context,
+					   MemoryStatsPrintFunc printfunc, void *passthru,
+					   MemoryContextCounters *totals)
+{
+	__shmemContextStatsPrint(__context, printfunc, passthru, totals);
+}
+#endif	/* PG11 or newer */
 
 #ifdef MEMORY_CONTEXT_CHECKING
 /*

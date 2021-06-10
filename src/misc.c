@@ -4,17 +4,11 @@
  * miscellaneous and uncategorized routines but usefull for multiple subsystems
  * of PG-Strom.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
 
@@ -49,24 +43,88 @@ make_flat_ands_explicit(List *andclauses)
 }
 
 /*
- * __find_appinfos_by_relids - almost equivalent to find_appinfos_by_relids
- * that is added at PG11, but ignores relations that are not partition leafs.
+ * find_appinfos_by_relids_nofail
+ *
+ * It is almost equivalent to find_appinfos_by_relids(), but ignores
+ * relations that are not partition leafs, instead of ereport().
+ * In addition, it tries to solve multi-leve parent-child relations.
  */
-AppendRelInfo **
-__find_appinfos_by_relids(PlannerInfo *root, Relids relids, int *nappinfos)
+static AppendRelInfo *
+build_multilevel_appinfos(PlannerInfo *root,
+						  AppendRelInfo **appstack, int nlevels)
 {
+	AppendRelInfo *apinfo = appstack[nlevels-1];
+	AppendRelInfo *apleaf = appstack[0];
+	AppendRelInfo *result;
+	ListCell   *lc;
+	int			i;
+
+	foreach (lc, root->append_rel_list)
+	{
+		AppendRelInfo *aptemp = lfirst(lc);
+
+		if (aptemp->child_relid == apinfo->parent_relid)
+		{
+			appstack[nlevels] = aptemp;
+			return build_multilevel_appinfos(root, appstack, nlevels+1);
+		}
+	}
+	/* shortcut if a simple single-level relationship */
+	if (nlevels == 1)
+		return apinfo;
+
+	result = makeNode(AppendRelInfo);
+	result->parent_relid = apinfo->parent_relid;
+	result->child_relid = apleaf->child_relid;
+	result->parent_reltype = apinfo->parent_reltype;
+	result->child_reltype = apleaf->child_reltype;
+	foreach (lc, apinfo->translated_vars)
+	{
+		Var	   *var = lfirst(lc);
+
+		for (i=nlevels-1; i>=0; i--)
+		{
+			AppendRelInfo *apcurr = appstack[i];
+			Var	   *temp;
+
+			if (var->varattno > list_length(apcurr->translated_vars))
+				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
+					 var->varattno, get_rel_name(apcurr->parent_reloid));
+			temp = list_nth(apcurr->translated_vars, var->varattno - 1);
+			if (!temp)
+				elog(ERROR, "attribute %d of relation \"%s\" does not exist",
+					 var->varattno, get_rel_name(apcurr->parent_reloid));
+			var = temp;
+		}
+		result->translated_vars = lappend(result->translated_vars, var);
+	}
+	result->parent_reloid = apinfo->parent_reloid;
+
+	return result;
+}
+
+AppendRelInfo **
+find_appinfos_by_relids_nofail(PlannerInfo *root,
+							   Relids relids,
+							   int *nappinfos)
+{
+	AppendRelInfo **appstack;
 	AppendRelInfo **appinfos;
 	ListCell   *lc;
 	int			nrooms = bms_num_members(relids);
 	int			nitems = 0;
 
 	appinfos = palloc0(sizeof(AppendRelInfo *) * nrooms);
+	appstack = alloca(sizeof(AppendRelInfo *) * root->simple_rel_array_size);
 	foreach (lc, root->append_rel_list)
 	{
 		AppendRelInfo *apinfo = lfirst(lc);
 
 		if (bms_is_member(apinfo->child_relid, relids))
-			appinfos[nitems++] = apinfo;
+		{
+			appstack[0] = apinfo;
+			appinfos[nitems++] = build_multilevel_appinfos(root, appstack, 1);
+		}
 	}
 	Assert(nitems <= nrooms);
 	*nappinfos = nitems;
@@ -199,6 +257,109 @@ get_type_oid(const char *type_name,
 				 errmsg("type %s is not defined", type_name)));
 
 	return type_oid;
+}
+
+/*
+ * get_type_name
+ */
+char *
+get_type_name(Oid type_oid, bool missing_ok)
+{
+	HeapTuple	tup;
+	char	   *retval;
+
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	if (!HeapTupleIsValid(tup))
+	{
+		if (!missing_ok)
+			elog(ERROR, "cache lookup failed for type %u", type_oid);
+		return NULL;
+	}
+	retval = pstrdup(NameStr(((Form_pg_type) GETSTRUCT(tup))->typname));
+	ReleaseSysCache(tup);
+
+	return retval;
+}
+
+/*
+ * get_proc_library
+ */
+char *
+get_proc_library(HeapTuple protup)
+{
+	Form_pg_proc	proc = (Form_pg_proc)GETSTRUCT(protup);
+
+	if (proc->prolang == ClanguageId)
+	{
+		Datum		datum;
+		bool		isnull;
+
+		datum = SysCacheGetAttr(PROCOID, protup,
+								Anum_pg_proc_probin,
+								&isnull);
+		if (!isnull)
+			return TextDatumGetCString(datum);
+	}
+	else if (proc->prolang != INTERNALlanguageId &&
+			 proc->prolang != SQLlanguageId)
+	{
+		return (void *)(~0UL);
+	}
+	return NULL;
+}
+
+/*
+ * get_object_extension_oid
+ */
+Oid
+get_object_extension_oid(Oid class_id,
+						 Oid object_id,
+						 int32 objsub_id,
+						 bool missing_ok)
+{
+	Relation	drel;
+	ScanKeyData	skeys[3];
+	SysScanDesc	sscan;
+	HeapTuple	tup;
+	Oid			ext_oid = InvalidOid;
+
+	drel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&skeys[0],
+				Anum_pg_depend_classid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(class_id));
+	ScanKeyInit(&skeys[1],
+				Anum_pg_depend_objid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(object_id));
+	ScanKeyInit(&skeys[2],
+				Anum_pg_depend_objsubid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(objsub_id));
+	sscan = systable_beginscan(drel, DependDependerIndexId, true,
+							   NULL, 3, skeys);
+	while (HeapTupleIsValid(tup = systable_getnext(sscan)))
+	{
+		Form_pg_depend	dep = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (dep->refclassid == ExtensionRelationId &&
+			dep->refobjsubid == 0 &&
+			(dep->deptype == DEPENDENCY_EXTENSION ||
+			 dep->deptype == DEPENDENCY_AUTO_EXTENSION))
+		{
+			ext_oid = dep->refobjid;
+			break;
+		}
+	}
+	systable_endscan(sscan);
+	table_close(drel, AccessShareLock);
+
+	if (!missing_ok && !OidIsValid(ext_oid))
+		elog(ERROR, "couldn't find out references (class:%u, objid:%u, subid:%d) by pg_extension at pg_depend",
+			 class_id, object_id, objsub_id);
+
+	return ext_oid;
 }
 
 /*
@@ -387,6 +548,22 @@ bool
 pathtree_has_gpupath(Path *node)
 {
 	return __pathtree_has_gpupath(node, NULL);
+}
+
+static bool
+__pathtree_has_parallel_aware(Path *path, void *context)
+{
+	bool	rv = path->parallel_aware;
+
+	if (!rv)
+		rv = pathnode_tree_walker(path, __pathtree_has_parallel_aware, context);
+	return rv;
+}
+
+bool
+pathtree_has_parallel_aware(Path *node)
+{
+	return __pathtree_has_parallel_aware(node, NULL);
 }
 
 /*
@@ -656,16 +833,18 @@ errorText(int errcode)
 	const char *error_name;
 	const char *error_desc;
 
-	if (cuGetErrorName(errcode, &error_name) == CUDA_SUCCESS &&
-		cuGetErrorString(errcode, &error_desc) == CUDA_SUCCESS)
+	if (errcode >= 0 && errcode <= CUDA_ERROR_UNKNOWN)
 	{
-		snprintf(buffer, sizeof(buffer), "%s - %s",
-				 error_name, error_desc);
+		if (cuGetErrorName(errcode, &error_name) == CUDA_SUCCESS &&
+			cuGetErrorString(errcode, &error_desc) == CUDA_SUCCESS)
+		{
+			snprintf(buffer, sizeof(buffer), "%s - %s",
+					 error_name, error_desc);
+			return buffer;
+		}
 	}
-	else
-	{
-		snprintf(buffer, sizeof(buffer), "%d - unknown", errcode);
-	}
+	snprintf(buffer, sizeof(buffer),
+			 "%d - unknown", errcode);
 	return buffer;
 }
 
@@ -1090,22 +1269,16 @@ simple_make_range(TypeCacheEntry *typcache, Datum x_val, Datum y_val)
 	x.val = x_val;
 	x.infinite = generate_null(0.5);
 	x.inclusive = generate_null(25.0);
+	x.lower = true;
 
 	memset(&y, 0, sizeof(RangeBound));
 	y.val = y_val;
 	y.infinite = generate_null(0.5);
 	y.inclusive = generate_null(25.0);
+	y.lower = false;
 
-	if (x.infinite || y.infinite || x.val <= y.val)
-	{
-		x.lower = true;
-		range = make_range(typcache, &x, &y, false);
-	}
-	else
-	{
-		y.lower = true;
-		range = make_range(typcache, &y, &x, false);
-	}
+	range = make_range(typcache, &x, &y, false);
+
 	return PointerGetDatum(range);
 }
 
@@ -1126,8 +1299,8 @@ pgstrom_random_int4range(PG_FUNCTION_ARGS)
 	x = lower + __random() % (upper - lower);
 	y = lower + __random() % (upper - lower);
 	return simple_make_range(typcache,
-							 Int32GetDatum(x),
-							 Int32GetDatum(y));
+							 Int32GetDatum(Min(x,y)),
+							 Int32GetDatum(Max(x,y)));
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_int4range);
 
@@ -1150,8 +1323,8 @@ pgstrom_random_int8range(PG_FUNCTION_ARGS)
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
-							 Int64GetDatum(x),
-							 Int64GetDatum(y));
+							 Int64GetDatum(Min(x,y)),
+							 Int64GetDatum(Max(x,y)));
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_int8range);
 
@@ -1198,8 +1371,8 @@ pgstrom_random_tsrange(PG_FUNCTION_ARGS)
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
-							 TimestampGetDatum(x),
-							 TimestampGetDatum(y));	
+							 TimestampGetDatum(Min(x,y)),
+							 TimestampGetDatum(Max(x,y)));	
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_tsrange);
 
@@ -1246,8 +1419,8 @@ pgstrom_random_tstzrange(PG_FUNCTION_ARGS)
 	v = (__random() << 31) | __random();
 	y = lower + v % (upper - lower);
 	return simple_make_range(typcache,
-							 TimestampTzGetDatum(x),
-							 TimestampTzGetDatum(y));	
+							 TimestampTzGetDatum(Min(x,y)),
+							 TimestampTzGetDatum(Max(x,y)));	
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_tstzrange);
 
@@ -1279,8 +1452,8 @@ pgstrom_random_daterange(PG_FUNCTION_ARGS)
 	x = lower + __random() % (upper - lower);
 	y = lower + __random() % (upper - lower);
 	return simple_make_range(typcache,
-							 DateADTGetDatum(x),
-							 DateADTGetDatum(y));
+							 DateADTGetDatum(Min(x,y)),
+							 DateADTGetDatum(Max(x,y)));
 }
 PG_FUNCTION_INFO_V1(pgstrom_random_daterange);
 
@@ -1307,18 +1480,34 @@ __readFile(int fdesc, void *buffer, size_t nbytes)
 
 	do {
 		rv = read(fdesc, (char *)buffer + count, nbytes - count);
-		if (rv < 0)
-		{
-			if (errno == EINTR)
-			{
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			return rv;
-		}
+		if (rv > 0)
+			count += rv;
 		else if (rv == 0)
 			break;
-		count += rv;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+ssize_t
+__preadFile(int fdesc, void *buffer, size_t nbytes, off_t f_pos)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = pread(fdesc, (char *)buffer + count, nbytes - count, f_pos + count);
+		if (rv > 0)
+			count += rv;
+		else if (rv == 0)
+			break;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
 	} while (count < nbytes);
 
 	return count;
@@ -1331,18 +1520,34 @@ __writeFile(int fdesc, const void *buffer, size_t nbytes)
 
 	do {
 		rv = write(fdesc, (const char *)buffer + count, nbytes - count);
-		if (rv < 0)
-		{
-			if (errno == EINTR)
-			{
-				CHECK_FOR_INTERRUPTS();
-				continue;
-			}
-			return -1;
-		}
+		if (rv > 0)
+			count += rv;
 		else if (rv == 0)
 			break;
-		count += rv;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
+	} while (count < nbytes);
+
+	return count;
+}
+
+ssize_t
+__pwriteFile(int fdesc, const void *buffer, size_t nbytes, off_t f_pos)
+{
+	ssize_t		rv, count = 0;
+
+	do {
+		rv = pwrite(fdesc, (const char *)buffer + count, nbytes - count, f_pos + count);
+		if (rv > 0)
+			count += rv;
+		else if (rv == 0)
+			break;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			return rv;
 	} while (count < nbytes);
 
 	return count;
@@ -1478,6 +1683,37 @@ __munmapFile(void *mmap_addr)
 	return -1;
 }
 
+void *
+__mremapFile(void *mmap_addr, size_t new_size)
+{
+	mmapEntry  *entry = NULL;
+	void	   *addr;
+
+	if (mmap_tracker_htab)
+	{
+		entry = hash_search(mmap_tracker_htab,
+							&mmap_addr, HASH_FIND, NULL);
+	}
+	if (!entry)
+	{
+		errno = EINVAL;
+		return MAP_FAILED;
+	}
+	/* nothing to do */
+	if (new_size <= entry->mmap_size)
+		return entry->mmap_addr;
+	addr = mremap(entry->mmap_addr,
+				  entry->mmap_size,
+				  new_size,
+				  MREMAP_MAYMOVE);
+	if (addr == MAP_FAILED)
+		return MAP_FAILED;
+
+	entry->mmap_addr = addr;
+	entry->mmap_size = new_size;
+	return addr;
+}
+
 /*
  * dummy entry for deprecated functions
  */
@@ -1502,8 +1738,6 @@ __pg_deprecated_function(PG_FUNCTION_ARGS, const char *cfunc_name)
 	PG_FUNCTION_INFO_V1(cfunc_name)
 
 /* deadcode/gstore_(fdw|buf).c */
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_validator);
-PG_DEPRECATED_FUNCTION(pgstrom_gstore_fdw_handler);
 PG_DEPRECATED_FUNCTION(pgstrom_reggstore_in);
 PG_DEPRECATED_FUNCTION(pgstrom_reggstore_out);
 PG_DEPRECATED_FUNCTION(pgstrom_reggstore_recv);

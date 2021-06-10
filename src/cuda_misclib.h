@@ -3,17 +3,11 @@
  *
  * Collection of various data type support on CUDA devices
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #ifndef CUDA_MISCLIB_H
 #define CUDA_MISCLIB_H
@@ -46,6 +40,8 @@ pgfn_cash_mi(kern_context *kcxt, pg_money_t arg1, pg_money_t arg2);
 DEVICE_FUNCTION(pg_float8_t)
 pgfn_cash_div_cash(kern_context *kcxt, pg_money_t arg1, pg_money_t arg2);
 DEVICE_FUNCTION(pg_money_t)
+pgfn_cash_mul_int2(kern_context *kcxt, pg_money_t arg1, pg_int1_t arg2);
+DEVICE_FUNCTION(pg_money_t)
 pgfn_cash_mul_int2(kern_context *kcxt, pg_money_t arg1, pg_int2_t arg2);
 DEVICE_FUNCTION(pg_money_t)
 pgfn_cash_mul_int4(kern_context *kcxt, pg_money_t arg1, pg_int4_t arg2);
@@ -56,6 +52,8 @@ pgfn_cash_mul_flt4(kern_context *kcxt, pg_money_t arg1, pg_float4_t arg2);
 DEVICE_FUNCTION(pg_money_t)
 pgfn_cash_mul_flt8(kern_context *kcxt, pg_money_t arg1, pg_float8_t arg2);
 DEVICE_FUNCTION(pg_money_t)
+pgfn_int2_mul_cash(kern_context *kcxt, pg_int1_t arg1, pg_money_t arg2);
+DEVICE_FUNCTION(pg_money_t)
 pgfn_int2_mul_cash(kern_context *kcxt, pg_int2_t arg1, pg_money_t arg2);
 DEVICE_FUNCTION(pg_money_t)
 pgfn_int4_mul_cash(kern_context *kcxt, pg_int4_t arg1, pg_money_t arg2);
@@ -65,6 +63,8 @@ DEVICE_FUNCTION(pg_money_t)
 pgfn_flt4_mul_cash(kern_context *kcxt, pg_float4_t arg1, pg_money_t arg2);
 DEVICE_FUNCTION(pg_money_t)
 pgfn_flt8_mul_cash(kern_context *kcxt, pg_float8_t arg1, pg_money_t arg2);
+DEVICE_FUNCTION(pg_money_t)
+pgfn_cash_div_int1(kern_context *kcxt, pg_money_t arg1, pg_int2_t arg2);
 DEVICE_FUNCTION(pg_money_t)
 pgfn_cash_div_int2(kern_context *kcxt, pg_money_t arg1, pg_int2_t arg2);
 DEVICE_FUNCTION(pg_money_t)
@@ -133,7 +133,7 @@ typedef struct macaddr
 #define PG_MACADDR_TYPE_DEFINED
 STROMCL_INDIRECT_TYPE_TEMPLATE(macaddr,macaddr)
 STROMCL_SIMPLE_COMP_HASH_TEMPLATE(macaddr,macaddr)
-STROMCL_UNSUPPORTED_ARROW_TEMPLATE(macaddr)
+STROMCL_EXTERNAL_ARROW_TEMPLATE(macaddr)
 #endif	/* PG_MACADDR_TYPE_DEFINED */
 #ifdef __CUDACC__
 DEVICE_FUNCTION(pg_macaddr_t)
@@ -195,7 +195,7 @@ typedef struct
 STROMCL_SIMPLE_DATATYPE_TEMPLATE(inet,inet_struct)
 STROMCL_EXTERNAL_VARREF_TEMPLATE(inet)
 STROMCL_EXTERNAL_COMP_HASH_TEMPLATE(inet)
-STROMCL_UNSUPPORTED_ARROW_TEMPLATE(inet)
+STROMCL_EXTERNAL_ARROW_TEMPLATE(inet)
 #endif	/* PG_INET_TYPE_DEFINED */
 
 #ifndef PG_CIDR_TYPE_DEFINED

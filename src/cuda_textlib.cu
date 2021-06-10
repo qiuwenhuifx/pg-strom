@@ -3,17 +3,11 @@
  *
  * Collection of text functions for CUDA GPU devices
  * --
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "cuda_common.h"
 #include "cuda_textlib.h"
@@ -425,6 +419,14 @@ pgfn_textlen(kern_context *kcxt, pg_text_t arg1)
 DEVICE_FUNCTION(pg_text_t)
 pgfn_textcat(kern_context *kcxt, pg_text_t arg1, pg_text_t arg2)
 {
+	if (arg1.isnull || arg2.isnull)
+	{
+		pg_text_t	result;
+
+		memset(&result, 0, sizeof(pg_text_t));
+		result.isnull = true;
+		return result;
+	}
 	return pgfn_text_concat2(kcxt, arg1, arg2);
 }
 
@@ -436,11 +438,11 @@ pgfn_text_concat2(kern_context *kcxt, pg_text_t arg1, pg_text_t arg2)
 	pg_text_t	result;
 	char	   *pos;
 
-	if (arg1.isnull || arg2.isnull)
-	{
-		result.isnull = true;
-		return result;
-	}
+	if (arg1.isnull)
+		return arg2;
+	if (arg2.isnull)
+		return arg1;
+
 	if (!pg_varlena_datum_extract(kcxt, arg1, &s1, &len1) ||
 		!pg_varlena_datum_extract(kcxt, arg2, &s2, &len2))
 	{
@@ -478,11 +480,13 @@ pgfn_text_concat3(kern_context *kcxt,
 	pg_text_t	result;
 	char	   *pos;
 
-	if (arg1.isnull || arg2.isnull || arg3.isnull)
-	{
-		result.isnull = true;
-		return result;
-	}
+	if (arg1.isnull)
+		return pgfn_text_concat2(kcxt, arg2, arg3);
+	if (arg2.isnull)
+		return pgfn_text_concat2(kcxt, arg1, arg3);
+	if (arg3.isnull)
+		return pgfn_text_concat2(kcxt, arg1, arg2);
+
 	if (!pg_varlena_datum_extract(kcxt, arg1, &s1, &len1) ||
 		!pg_varlena_datum_extract(kcxt, arg2, &s2, &len2) ||
 		!pg_varlena_datum_extract(kcxt, arg3, &s3, &len3))
@@ -525,11 +529,15 @@ pgfn_text_concat4(kern_context *kcxt,
 	pg_text_t	result;
 	char	   *pos;
 
-	if (arg1.isnull || arg2.isnull || arg3.isnull || arg4.isnull)
-	{
-		result.isnull = true;
-		return result;
-	}
+	if (arg1.isnull)
+		return pgfn_text_concat3(kcxt, arg2, arg3, arg4);
+	if (arg2.isnull)
+		return pgfn_text_concat3(kcxt, arg1, arg3, arg4);
+	if (arg3.isnull)
+		return pgfn_text_concat3(kcxt, arg1, arg2, arg4);
+	if (arg4.isnull)
+		return pgfn_text_concat3(kcxt, arg1, arg2, arg3);
+
 	if (!pg_varlena_datum_extract(kcxt, arg1, &s1, &len1) ||
 		!pg_varlena_datum_extract(kcxt, arg2, &s2, &len2) ||
 		!pg_varlena_datum_extract(kcxt, arg3, &s3, &len3) ||

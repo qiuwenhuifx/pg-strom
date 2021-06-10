@@ -3,19 +3,70 @@
  *
  * Routines to manage GpuTaskState/GpuTask state machine.
  * ----
- * Copyright 2011-2020 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2014-2020 (C) The PG-Strom Development Team
+ * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
+ * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * it under the terms of the PostgreSQL License.
  */
 #include "pg_strom.h"
+
+/*
+ * see definition at xact.c
+ *
+ * SerializedTransactionState is newly defined at PG12.
+ * PG10/11 packed all the attributes in TransactionId[] array.
+ */
+typedef struct SerializedTransactionState
+{
+#if PG_VERSION_NUM >= 120000
+	int				xactIsoLevel;
+	bool			xactDeferrable;
+	FullTransactionId topFullTransactionId;
+	FullTransactionId currentFullTransactionId;
+	CommandId		currentCommandId;
+	int				nParallelCurrentXids;
+#else
+	TransactionId	XactIsoLevel;
+	TransactionId	XactDeferrable;
+	TransactionId	topFullTransactionId;
+	TransactionId	currentFullTransactionId;
+	TransactionId	currentCommandId;
+	TransactionId	nParallelCurrentXids;
+#endif
+	TransactionId	parallelCurrentXids[FLEXIBLE_ARRAY_MEMBER];
+} SerializedTransactionState;
+
+/*
+ * __appendXactIdVector
+ */
+static cl_uint
+__appendXactIdVector(StringInfo buf)
+{
+	cl_uint		poffset = buf->len;
+	Size		maxsize = EstimateTransactionStateSpace();
+	SerializedTransactionState *temp = alloca(maxsize);
+	xidvector  *xvec;
+	size_t		sz;
+
+	/* obtain the current transaction state */
+	SerializeTransactionState(maxsize, (char *)temp);
+	sz = offsetof(xidvector, values[temp->nParallelCurrentXids]);
+	enlargeStringInfo(buf, MAXALIGN(sz));
+	xvec = (xidvector *)(buf->data + buf->len);
+	buf->len += MAXALIGN(sz);
+
+	memset(xvec, 0, MAXALIGN(sz));
+	SET_VARSIZE(xvec, sz);
+	xvec->ndim = 1;
+	xvec->dataoffset = 0;
+	xvec->elemtype = XIDOID;
+	xvec->dim1 = temp->nParallelCurrentXids;
+	xvec->lbound1 = 1;
+	memcpy(xvec->values, temp->parallelCurrentXids,
+		   sizeof(TransactionId) * xvec->dim1);
+	return poffset;
+}
 
 /*
  * construct_kern_parambuf
@@ -28,16 +79,16 @@ construct_kern_parambuf(List *used_params, ExprContext *econtext,
 {
 	StringInfoData	str;
 	kern_parambuf  *kparams;
-	char		padding[STROMALIGN_LEN];
+	cl_ulong	zero = 0;
 	ListCell   *cell;
 	Size		offset;
 	int			index = 0;
 	int			nparams = list_length(used_params);
-
-	memset(padding, 0, sizeof(padding));
+	cl_uint		xid_vec_offset;
 
 	/* seek to the head of variable length field */
-	offset = STROMALIGN(offsetof(kern_parambuf, poffset[nparams]));
+	offset = MAXALIGN(offsetof(kern_parambuf,
+							   poffset[nparams + 1]));
 	initStringInfo(&str);
 	enlargeStringInfo(&str, offset);
 	memset(str.data, 0, offset);
@@ -195,15 +246,19 @@ construct_kern_parambuf(List *used_params, ExprContext *econtext,
 			elog(ERROR, "unexpected node: %s", nodeToString(node));
 
 		/* alignment */
-		if (STROMALIGN(str.len) != str.len)
-			appendBinaryStringInfo(&str, padding,
-								   STROMALIGN(str.len) - str.len);
+		if (MAXALIGN(str.len) != str.len)
+			appendBinaryStringInfo(&str, (const char *)&zero,
+								   MAXALIGN(str.len) - str.len);
 		index++;
 	}
-	Assert(STROMALIGN(str.len) == str.len);
+	xid_vec_offset = __appendXactIdVector(&str);
+
+	/* array of current transaction id */
+	Assert(MAXALIGN(str.len) == str.len);
 	kparams = (kern_parambuf *)str.data;
-	kparams->hostptr = (hostptr_t) &kparams->hostptr;
 	kparams->xactStartTimestamp = GetCurrentTransactionStartTimestamp();
+	kparams->xactIdVector = nparams;
+	kparams->poffset[nparams++] = xid_vec_offset;
 	kparams->length = str.len;
 	kparams->nparams = nparams;
 
@@ -221,10 +276,11 @@ pgstromInitGpuTaskState(GpuTaskState *gts,
 						List *used_params,
 						cl_int optimal_gpu,
 						cl_uint outer_nrows_per_block,
-						EState *estate)
+						cl_int eflags)
 {
 	Relation		relation = gts->css.ss.ss_currentRelation;
 	ExprContext	   *econtext = gts->css.ss.ps.ps_ExprContext;
+	EState		   *estate = gts->css.ss.ps.state;
 	CustomScan	   *cscan = (CustomScan *)(gts->css.ss.ps.plan);
 	Bitmapset	   *outer_refs = NULL;
 	ListCell	   *lc;
@@ -261,9 +317,11 @@ pgstromInitGpuTaskState(GpuTaskState *gts,
 				outer_refs = bms_add_member(outer_refs, anum);
 			}
 		}
-		/* setup ArrowFdwState, if foreign-table */
-		if (RelationGetForm(relation)->relkind == RELKIND_FOREIGN_TABLE)
-			gts->af_state = ExecInitArrowFdw(relation, outer_refs);
+		if (RelationIsArrowFdw(relation))
+			gts->af_state = ExecInitArrowFdw(optimal_gpu < 0 ? NULL : gcontext,
+											 relation, outer_refs);
+		if (RelationHasGpuCache(relation))
+			gts->gc_state = ExecInitGpuCache(&gts->css.ss, eflags, outer_refs);
 	}
 	gts->outer_refs = outer_refs;
 	gts->scan_done = false;
@@ -295,30 +353,25 @@ fetch_next_gputask(GpuTaskState *gts)
 	GpuContext	   *gcontext = gts->gcontext;
 	GpuTask		   *gtask;
 	dlist_node	   *dnode;
-	cl_int			local_num_running_tasks;
-	cl_int			global_num_running_tasks;
+	cl_int			num_async_tasks;
 	cl_int			ev;
 
 	/* force activate GpuContext on demand */
 	Assert(gcontext->worker_is_running);
 	CHECK_FOR_GPUCONTEXT(gcontext);
 
-	pthreadMutexLock(gcontext->mutex);
+	pthreadMutexLock(&gcontext->worker_mutex);
 	while (!gts->scan_done)
 	{
 		ResetLatch(MyLatch);
-		local_num_running_tasks = (gts->num_ready_tasks +
-								   gts->num_running_tasks);
-		global_num_running_tasks =
-			pg_atomic_read_u32(gcontext->global_num_running_tasks);
-		if ((local_num_running_tasks < local_max_async_tasks &&
-			 global_num_running_tasks < global_max_async_tasks) ||
-			(dlist_is_empty(&gts->ready_tasks) &&
-			 gts->num_running_tasks == 0))
+		num_async_tasks = (gts->num_ready_tasks +
+						   gts->num_running_tasks);
+		if (num_async_tasks < pgstrom_max_async_tasks &&
+			(dlist_is_empty(&gts->ready_tasks) || gts->num_running_tasks == 0))
 		{
-			pthreadMutexUnlock(gcontext->mutex);
+			pthreadMutexUnlock(&gcontext->worker_mutex);
 			gtask = gts->cb_next_task(gts);
-			pthreadMutexLock(gcontext->mutex);
+			pthreadMutexLock(&gcontext->worker_mutex);
 			if (!gtask)
 			{
 				gts->scan_done = true;
@@ -326,8 +379,7 @@ fetch_next_gputask(GpuTaskState *gts)
 			}
 			dlist_push_tail(&gcontext->pending_tasks, &gtask->chain);
 			gts->num_running_tasks++;
-			pg_atomic_add_fetch_u32(gcontext->global_num_running_tasks, 1);
-			pthreadCondSignal(gcontext->cond);
+			pthreadCondSignal(&gcontext->worker_cond);
 		}
 		else if (!dlist_is_empty(&gts->ready_tasks))
 		{
@@ -336,7 +388,6 @@ fetch_next_gputask(GpuTaskState *gts)
 			 * the number of concurrent tasks, GTS already has ready tasks,
 			 * so pick them up instead of wait.
 			 */
-			pthreadMutexUnlock(gcontext->mutex);
 			goto pickup_gputask;
 		}
 		else if (gts->num_running_tasks > 0)
@@ -345,7 +396,7 @@ fetch_next_gputask(GpuTaskState *gts)
 			 * Even though a few GpuTasks are running, but nobody gets
 			 * completed yet. Try to wait for completion to 
 			 */
-			pthreadMutexUnlock(gcontext->mutex);
+			pthreadMutexUnlock(&gcontext->worker_mutex);
 
 			ev = WaitLatch(MyLatch,
 						   WL_LATCH_SET |
@@ -359,28 +410,28 @@ fetch_next_gputask(GpuTaskState *gts)
 						 errmsg("Unexpected Postmaster dead")));
 			CHECK_FOR_GPUCONTEXT(gcontext);
 
-			pthreadMutexLock(gcontext->mutex);
+			pthreadMutexLock(&gcontext->worker_mutex);
 		}
 		else
 		{
-			pthreadMutexUnlock(gcontext->mutex);
+			pthreadMutexUnlock(&gcontext->worker_mutex);
 			/*
 			 * Sadly, we touched a threshold. Taks a short break.
 			 */
 			pg_usleep(20000L);	/* wait for 20msec */
 
 			CHECK_FOR_GPUCONTEXT(gcontext);
-			pthreadMutexLock(gcontext->mutex);
+			pthreadMutexLock(&gcontext->worker_mutex);
 		}
 	}
-	pthreadMutexUnlock(gcontext->mutex);
+	pthreadMutexUnlock(&gcontext->worker_mutex);
 
 	/*
 	 * Once we exit the above loop, either a completed task was returned,
 	 * or relation scan has already done thus wait for synchronously.
 	 */
 	Assert(gts->scan_done);
-	pthreadMutexLock(gcontext->mutex);
+	pthreadMutexLock(&gcontext->worker_mutex);
 retry:
 	ResetLatch(MyLatch);
 	while (dlist_is_empty(&gts->ready_tasks))
@@ -388,7 +439,7 @@ retry:
 		Assert(gts->num_running_tasks >= 0);
 		if (gts->num_running_tasks == 0)
 		{
-			pthreadMutexUnlock(gcontext->mutex);
+			pthreadMutexUnlock(&gcontext->worker_mutex);
 
 			CHECK_FOR_GPUCONTEXT(gcontext);
 
@@ -397,7 +448,7 @@ retry:
 				cl_bool		is_ready = false;
 
 				gtask = gts->cb_terminator_task(gts, &is_ready);
-				pthreadMutexLock(gcontext->mutex);
+				pthreadMutexLock(&gcontext->worker_mutex);
 				if (gtask)
 				{
 					if (is_ready)
@@ -411,16 +462,15 @@ retry:
 						dlist_push_tail(&gcontext->pending_tasks,
 										&gtask->chain);
 						gts->num_running_tasks++;
-						pg_atomic_add_fetch_u32(gcontext->global_num_running_tasks, 1);
-						pthreadCondSignal(gcontext->cond);
+						pthreadCondSignal(&gcontext->worker_cond);
 					}
 					goto retry;
 				}
-				pthreadMutexUnlock(gcontext->mutex);
+				pthreadMutexUnlock(&gcontext->worker_mutex);
 			}
 			return NULL;
 		}
-		pthreadMutexUnlock(gcontext->mutex);
+		pthreadMutexUnlock(&gcontext->worker_mutex);
 
 		CHECK_FOR_GPUCONTEXT(gcontext);
 
@@ -435,16 +485,16 @@ retry:
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
 					 errmsg("Unexpected Postmaster dead")));
 
-		pthreadMutexLock(gcontext->mutex);
+		pthreadMutexLock(&gcontext->worker_mutex);
 		ResetLatch(MyLatch);
 	}
-	pthreadMutexUnlock(gcontext->mutex);
 pickup_gputask:
 	/* OK, pick up GpuTask from the head */
 	Assert(gts->num_ready_tasks > 0);
 	dnode = dlist_pop_head_node(&gts->ready_tasks);
 	gtask = dlist_container(GpuTask, chain, dnode);
 	gts->num_ready_tasks--;
+	pthreadMutexUnlock(&gcontext->worker_mutex);
 
 	return gtask;
 }
@@ -506,9 +556,11 @@ pgstromRescanGpuTaskState(GpuTaskState *gts)
 	/* rewind the scan position if GTS scans a table */
 	pgstromRewindScanChunk(gts);
 
-	/* Also rewind the scan state of Arrow_Fdw */
+	/* Also rewind the scan state of Arrow_Fdw/GpuCache */
 	if (gts->af_state)
 		ExecReScanArrowFdw(gts->af_state);
+	if (gts->gc_state)
+		ExecReScanGpuCache(gts->gc_state);
 }
 
 /*
@@ -534,9 +586,11 @@ pgstromReleaseGpuTaskState(GpuTaskState *gts, GpuTaskRuntimeStat *gt_rtstat)
 	/* release scan-desc if any */
 	if (gts->css.ss.ss_currentScanDesc)
 		heap_endscan(gts->css.ss.ss_currentScanDesc);
-	/* shutdown Arrow_Fdw state */
+	/* shutdown Arrow_Fdw/GpuCache state */
 	if (gts->af_state)
 		ExecEndArrowFdw(gts->af_state);
+	if (gts->gc_state)
+		ExecEndGpuCache(gts->gc_state);
 	/* unreference CUDA program */
 	if (gts->program_id != INVALID_PROGRAM_ID)
 		pgstrom_put_cuda_program(gts->gcontext, gts->program_id);
@@ -564,7 +618,7 @@ pgstromExplainGpuTaskState(GpuTaskState *gts, ExplainState *es)
 
 			snprintf(temp, sizeof(temp), "GPU%d (%s)%s",
 					 dattr->DEV_ID, dattr->DEV_NAME,
-					 gts->af_state ? " with NVMe-Strom" : "");
+					 gts->af_state ? " with GPUDirect SQL" : "");
 		}
 		if (!pgstrom_regression_test_mode)
 			ExplainPropertyText("GPU Preference", temp, es);
@@ -576,21 +630,21 @@ pgstromExplainGpuTaskState(GpuTaskState *gts, ExplainState *es)
 				: gts->nvme_sstate != NULL))
 	{
 		if (!gts->nvme_sstate)
-			ExplainPropertyText("NVMe-Strom", "enabled", es);
+			ExplainPropertyText("GPUDirect SQL", "enabled", es);
 		else if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			if (gts->nvme_count == 0)
-				ExplainPropertyText("NVMe-Strom", "enabled", es);
+				ExplainPropertyText("GPUDirect SQL", "enabled", es);
 			else
 			{
 				snprintf(temp, sizeof(temp), "load=%ld", gts->nvme_count);
-				ExplainPropertyText("NVMe-Strom", temp, es);
+				ExplainPropertyText("GPUDirect SQL", temp, es);
 			}
 		}
 		else
 		{
-			ExplainPropertyText("NVMe-Strom", "enabled", es);
-			ExplainPropertyInteger("NVMe-Strom Load Blocks",
+			ExplainPropertyText("GPUDirect SQL", "enabled", es);
+			ExplainPropertyInteger("GPUDirect SQL Load Blocks",
 								   NULL, gts->nvme_count, es);
 		}
 	}
@@ -601,13 +655,27 @@ pgstromExplainGpuTaskState(GpuTaskState *gts, ExplainState *es)
 	if (es->analyze && gts->num_cpu_fallbacks > 0)
 		ExplainPropertyInteger("CPU fallbacks",
 							   NULL, gts->num_cpu_fallbacks, es);
-	/* Properties of Arrow_Fdw if any */
+	/* Properties of Arrow_Fdw/GpuCache if any */
 	if (gts->af_state)
 		ExplainArrowFdw(gts->af_state, rel, es);
+	if (gts->gc_state)
+		ExplainGpuCache(gts->gc_state, rel, es);
+	/* Debug counter, if any */
+	if (es->analyze && (gts->debug_counter0 != 0 ||
+						gts->debug_counter1 != 0 ||
+						gts->debug_counter2 != 0 ||
+						gts->debug_counter3 != 0))
+	{
+		ExplainPropertyInteger("Debug Counter 0", NULL, gts->debug_counter0, es);
+		ExplainPropertyInteger("Debug Counter 1", NULL, gts->debug_counter1, es);
+		ExplainPropertyInteger("Debug Counter 2", NULL, gts->debug_counter2, es);
+		ExplainPropertyInteger("Debug Counter 3", NULL, gts->debug_counter3, es);
+	}
+
 	/* Source path of the GPU kernel */
 	if (es->verbose &&
 		gts->program_id != INVALID_PROGRAM_ID &&
-		pgstrom_debug_kernel_source)
+		!pgstrom_regression_test_mode)
 	{
 		const char *cuda_source = pgstrom_cuda_source_file(gts->program_id);
 		const char *cuda_binary = pgstrom_cuda_binary_file(gts->program_id);
@@ -626,16 +694,14 @@ Size
 pgstromEstimateDSMGpuTaskState(GpuTaskState *gts, ParallelContext *pcxt)
 {
 	Relation	relation = gts->css.ss.ss_currentRelation;
+	EState	   *estate = gts->css.ss.ps.state;
+	Snapshot	snapshot = estate->es_snapshot;
+	Size		sz;
 
+	sz = sizeof(GpuTaskSharedState);
 	if (relation)
-	{
-		EState	   *estate = gts->css.ss.ps.state;
-		Snapshot	snapshot = estate->es_snapshot;
-
-		return MAXALIGN(offsetof(GpuTaskSharedState, phscan) +
-						table_parallelscan_estimate(relation, snapshot));
-	}
-	return 0;
+		sz += table_parallelscan_estimate(relation, snapshot);
+	return MAXALIGN(sz);
 }
 
 /*
@@ -651,12 +717,12 @@ pgstromInitDSMGpuTaskState(GpuTaskState *gts,
 	Snapshot	snapshot = estate->es_snapshot;
 	GpuTaskSharedState *gtss = coordinate;
 
+	memset(gtss, 0, offsetof(GpuTaskSharedState, phscan));
 	if (gts->af_state)
-	{
-		Assert(RelationGetForm(relation)->relkind == RELKIND_FOREIGN_TABLE);
-		ExecInitDSMArrowFdw(gts->af_state, &gtss->af_rbatch_index);
-	}
-	else if (relation)
+		ExecInitDSMArrowFdw(gts->af_state, gtss);
+	if (gts->gc_state)
+		ExecInitDSMGpuCache(gts->gc_state, gtss);
+	if (relation)
 	{
 		/* init state of block based table scan */
 		gtss->pbs_nblocks = RelationGetNumberOfBlocks(relation);
@@ -682,11 +748,10 @@ pgstromInitWorkerGpuTaskState(GpuTaskState *gts, void *coordinate)
 	GpuTaskSharedState *gtss = coordinate;
 
 	if (gts->af_state)
-	{
-		Assert(RelationGetForm(relation)->relkind == RELKIND_FOREIGN_TABLE);
-		ExecInitWorkerArrowFdw(gts->af_state, &gtss->af_rbatch_index);
-	}
-	else if (relation)
+		ExecInitWorkerArrowFdw(gts->af_state, gtss);
+	if (gts->gc_state)
+		ExecInitWorkerGpuCache(gts->gc_state, gtss);
+	if (relation)
 	{
 		/* begin parallel scan */
 		gts->css.ss.ss_currentScanDesc =
@@ -714,7 +779,9 @@ pgstromReInitializeDSMGpuTaskState(GpuTaskState *gts)
 
 	if (gts->af_state)
 		ExecReInitDSMArrowFdw(gts->af_state);
-	else if (relation)
+	if (gts->gc_state)
+		ExecReInitDSMGpuCache(gts->gc_state);
+	if (relation)
 		table_parallelscan_reinitialize(relation, &gtss->phscan);
 }
 

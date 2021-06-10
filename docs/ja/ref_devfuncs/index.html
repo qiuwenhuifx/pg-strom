@@ -7,16 +7,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   
   <meta name="author" content="PG-Strom Development Team">
+  
   <link rel="shortcut icon" href="../img/favicon.ico">
   <title>関数と演算子 - PG-Strom Manual</title>
-  <link href='https://fonts.googleapis.com/css?family=Lato:400,700|Roboto+Slab:400,700|Inconsolata:400,700' rel='stylesheet' type='text/css'>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Lato:400,700|Roboto+Slab:400,700|Inconsolata:400,700" />
 
-  <link rel="stylesheet" href="../css/theme.css" type="text/css" />
-  <link rel="stylesheet" href="../css/theme_extra.css" type="text/css" />
-  <link rel="stylesheet" href="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/styles/github.min.css">
-  <link href="//fonts.googleapis.com/earlyaccess/notosansjp.css" rel="stylesheet">
-  <link href="//fonts.googleapis.com/css?family=Open+Sans:600,800" rel="stylesheet">
-  <link href="../custom.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/theme.css" />
+  <link rel="stylesheet" href="../css/theme_extra.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/styles/github.min.css" />
+  <link href="//fonts.googleapis.com/earlyaccess/notosansjp.css" rel="stylesheet" />
+  <link href="//fonts.googleapis.com/css?family=Open+Sans:600,800" rel="stylesheet" />
+  <link href="../custom.css" rel="stylesheet" />
   
   <script>
     // Current page data
@@ -27,7 +28,7 @@
   
   <script src="../js/jquery-2.1.1.min.js" defer></script>
   <script src="../js/modernizr-2.8.3.min.js" defer></script>
-  <script src="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.12.0/highlight.min.js"></script>
   <script>hljs.initHighlightingOnLoad();</script> 
   
 </head>
@@ -38,6 +39,7 @@
 
     
     <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
       <div class="wy-side-nav-search">
         <a href=".." class="icon icon-home"> PG-Strom Manual</a>
         <div role="search">
@@ -49,135 +51,86 @@
       </div>
 
       <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="main navigation">
-	<ul class="current">
-	  
-          
-            <li class="toctree-l1">
-		
-    <a class="" href="..">はじめに</a>
-	    </li>
-          
-            <li class="toctree-l1">
-		
-    <a class="" href="../install/">インストール</a>
-	    </li>
-          
-            <li class="toctree-l1">
-		
-    <span class="caption-text">利用ガイド</span>
-    <ul class="subnav">
-                <li class="">
-                    
-    <a class="" href="../operations/">基本的な操作</a>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../sys_admin/">システム管理</a>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../brin/">インデックス対応</a>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../partition/">パーティション</a>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../troubles/">トラブルシューティング</a>
-                </li>
+                <ul>
+                    <li class="toctree-l1"><a class="reference internal" href="..">はじめに</a>
+                    </li>
+                </ul>
+                <ul>
+                    <li class="toctree-l1"><a class="reference internal" href="../install/">インストール</a>
+                    </li>
+                </ul>
+                <p class="caption"><span class="caption-text">利用ガイド</span></p>
+                <ul>
+                    <li class="toctree-l1"><a class="reference internal" href="../operations/">基本的な操作</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../brin/">BRINインデックス</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../partition/">パーティション</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../postgis/">GPU版PostGIS</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../troubles/">トラブルシューティング</a>
+                    </li>
+                </ul>
+                <p class="caption"><span class="caption-text">先進機能</span></p>
+                <ul>
+                    <li class="toctree-l1"><a class="reference internal" href="../ssd2gpu/">GPUダイレクトSQL</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../arrow_fdw/">Apache Arrow</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../gpucache/">GPUキャッシュ</a>
+                    </li>
+                </ul>
+                <p class="caption"><span class="caption-text">リファレンス</span></p>
+                <ul class="current">
+                    <li class="toctree-l1"><a class="reference internal" href="../ref_types/">データ型</a>
+                    </li>
+                    <li class="toctree-l1 current"><a class="reference internal current" href="./">関数と演算子</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_2">型キャスト</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">数値型演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">数学関数</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_5">三角関数</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_6">日付/時刻型演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_7">文字列関数/演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_8">ネットワーク関数/演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_9">通貨型演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#uuid">uuid型演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#jsonb">JSONB型演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_10">範囲型演算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#postgis">PostGIS関数</a>
+    </li>
     </ul>
-	    </li>
-          
-            <li class="toctree-l1">
-		
-    <span class="caption-text">先進機能</span>
-    <ul class="subnav">
-                <li class="">
-                    
-    <a class="" href="../ssd2gpu/">SSDtoGPUダイレクトSQL</a>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../arrow_fdw/">Arrow_fdw</a>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../python/">In-database Analytics</a>
-                </li>
-    </ul>
-	    </li>
-          
-            <li class="toctree-l1">
-		
-    <span class="caption-text">リファレンス</span>
-    <ul class="subnav">
-                <li class="">
-                    
-    <a class="" href="../ref_types/">データ型</a>
-                </li>
-                <li class=" current">
-                    
-    <a class="current" href="./">関数と演算子</a>
-    <ul class="subnav">
-            
-    <li class="toctree-l3"><a href="#_1">型キャスト</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_2">数値型演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_3">数学関数</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_4">三角関数</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_5">日付/時刻型演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_6">文字列関数/演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_7">ネットワーク関数/演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_8">通貨型演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#uuid">uuid型演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#jsonb">JSONB型演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_9">範囲型演算子</a></li>
-    
-
-    <li class="toctree-l3"><a href="#_10">その他のデバイス関数</a></li>
-    
-
-    </ul>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../ref_sqlfuncs/">SQLオブジェクト</a>
-                </li>
-                <li class="">
-                    
-    <a class="" href="../ref_params/">GUCパラメータ</a>
-                </li>
-    </ul>
-	    </li>
-          
-            <li class="toctree-l1">
-		
-    <a class="" href="../release_note/">リリースノート</a>
-	    </li>
-          
-        </ul>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../ref_sqlfuncs/">SQLオブジェクト</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../ref_params/">GUCパラメータ</a>
+                    </li>
+                </ul>
+                <p class="caption"><span class="caption-text">リリースノート</span></p>
+                <ul>
+                    <li class="toctree-l1"><a class="reference internal" href="../release_v3.0/">PG-Strom v3.0</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../release_v2.3/">PG-Strom v2.3</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../release_v2.2/">PG-Strom v2.2</a>
+                    </li>
+                    <li class="toctree-l1"><a class="reference internal" href="../release_v2.0/">PG-Strom v2.0</a>
+                    </li>
+                </ul>
       </div>
-      &nbsp;
+    </div>
     </nav>
 
     <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
@@ -206,850 +159,492 @@
       
     </li>
   </ul>
+  
   <hr/>
 </div>
           <div role="main">
             <div class="section">
               
-                <h1>関数と演算子</h1>
-
+                <h1 id="_1">関数と演算子</h1>
 <p>本章ではGPUデバイス上で実行可能な関数と演算子について説明します。</p>
-<h1 id="_1">型キャスト</h1>
-<table>
-<thead>
-<tr>
-<th align="left">destination type</th>
-<th align="left">source type</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>bool</code></td>
-<td align="left"><code>int4</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>int2</code></td>
-<td align="left"><code>int4,int8,float2,float4,float8,numeric</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>int4</code></td>
-<td align="left"><code>int2,int8,float2,float4,float8,numeric</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>int8</code></td>
-<td align="left"><code>int2,int4,float2,float4,float8,numeric</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>float2</code></td>
-<td align="left"><code>int2,int4,int8,float4,float8,numeric</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>float4</code></td>
-<td align="left"><code>int2,int4,int8,float2,float8,numeric</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>float8</code></td>
-<td align="left"><code>int2,int4,int8,float2,float4,numeric</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>numeric</code></td>
-<td align="left"><code>int2,int4,int8,float2,float4,float8</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>money</code></td>
-<td align="left"><code>int4,int8,numeric</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet</code></td>
-<td align="left"><code>cidr</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>date</code></td>
-<td align="left"><code>timestamp,timestamptz</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>time</code></td>
-<td align="left"><code>timetz,timestamp,timestamptz</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>timetz</code></td>
-<td align="left"><code>time,timestamptz</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>timestamp</code></td>
-<td align="left"><code>date,timestamptz</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>timestamptz</code></td>
-<td align="left"><code>date,timestamp</code></td>
-<td align="left"></td>
-</tr>
-</tbody>
-</table>
-<h1 id="_2">数値型演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">function/operator</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>TYPE COMP TYPE</code></td>
-<td align="left">Comparison of two values<br><code>TYPE</code> is any of <code>int2,int4,int8</code><br><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE COMP TYPE</code></td>
-<td align="left">Comparison of two values<br><code>TYPE</code> is any of <code>float2,float4,float8</code><br><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>numeric COMP numeric</code></td>
-<td align="left">Comparison of two values<br><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE + TYPE</code></td>
-<td align="left">Arithemetic addition<br><code>TYPE</code> is any of <code>int2,int4,int8,float2,float4,float8,numeric</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE - TYPE</code></td>
-<td align="left">Arithemetic substract<br><code>TYPE</code> is any of <code>int2,int4,int8,float2,float4,float8,numeric</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE * TYPE</code></td>
-<td align="left">Arithemetic multiplication<br><code>TYPE</code> is any of <code>int2,int4,int8,float2,float4,float8,numeric</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE / TYPE</code></td>
-<td align="left">Arithemetic division<br><code>TYPE</code> is any of <code>int2,int4,int8,float2,float4,float8,numeric</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE % TYPE</code></td>
-<td align="left">Reminer operator<br><code>TYPE</code> is any of <code>int2,int4,int8</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE &amp; TYPE</code></td>
-<td align="left">Bitwise AND<br><code>TYPE</code> is any of <code>int2,int4,int8</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE &#124; TYPE</code></td>
-<td align="left">Bitwise OR<br><code>TYPE</code> is any of <code>int2,int4,int8</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE # TYPE</code></td>
-<td align="left">Bitwise XOR<br><code>TYPE</code> is any of <code>int2,int4,int8</code></td>
-</tr>
-<tr>
-<td align="left"><code>~ TYPE</code></td>
-<td align="left">Bitwise NOT<br><code>TYPE</code> is any if <code>int2,int4,int8</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE &gt;&gt; int4</code></td>
-<td align="left">Right shift<br><code>TYPE</code> is any of <code>int2,int4,int8</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE &lt;&lt; int4</code></td>
-<td align="left">Left shift<br><code>TYPE</code> is any of <code>int2,int4,int8</code></td>
-</tr>
-<tr>
-<td align="left"><code>+ TYPE</code></td>
-<td align="left">Unary plus<br><code>TYPE</code> is any of <code>int2,int4,int8,float2,float4,float8,numeric</code></td>
-</tr>
-<tr>
-<td align="left"><code>- TYPE</code></td>
-<td align="left">Unary minus<br><code>TYPE</code> is any of <code>int2,int4,int8,float2,float4,float8,numeric</code></td>
-</tr>
-<tr>
-<td align="left"><code>@TYPE</code></td>
-<td align="left">Absolute value<br><code>TYPE</code> is any of <code>int2,int4,int8,float2,float4,float8,numeric</code></td>
-</tr>
-</tbody>
-</table>
-<h1 id="_3">数学関数</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>cbrt(float8)</code></td>
-<td align="left">cube root</td>
-</tr>
-<tr>
-<td align="left"><code>dcbrt(float8)</code></td>
-<td align="left">cube root</td>
-</tr>
-<tr>
-<td align="left"><code>ceil(float8)</code></td>
-<td align="left">nearest integer greater than or equal to argument</td>
-</tr>
-<tr>
-<td align="left"><code>ceiling(float8)</code></td>
-<td align="left">nearest integer greater than or equal to argument</td>
-</tr>
-<tr>
-<td align="left"><code>exp(float8)</code></td>
-<td align="left">exponential</td>
-</tr>
-<tr>
-<td align="left"><code>dexp(float8)</code></td>
-<td align="left">exponential</td>
-</tr>
-<tr>
-<td align="left"><code>floor(float8)</code></td>
-<td align="left">nearest integer less than or equal to argument</td>
-</tr>
-<tr>
-<td align="left"><code>ln(float8)</code></td>
-<td align="left">natural logarithm</td>
-</tr>
-<tr>
-<td align="left"><code>dlog1(float8)</code></td>
-<td align="left">natural logarithm</td>
-</tr>
-<tr>
-<td align="left"><code>log(float8)</code></td>
-<td align="left">base 10 logarithm</td>
-</tr>
-<tr>
-<td align="left"><code>dlog10(float8)</code></td>
-<td align="left">base 10 logarithm</td>
-</tr>
-<tr>
-<td align="left"><code>pi()</code></td>
-<td align="left">circumference ratio</td>
-</tr>
-<tr>
-<td align="left"><code>power(float8,float8)</code></td>
-<td align="left">power</td>
-</tr>
-<tr>
-<td align="left"><code>pow(float8,float8)</code></td>
-<td align="left">power</td>
-</tr>
-<tr>
-<td align="left"><code>dpow(float8,float8)</code></td>
-<td align="left">power</td>
-</tr>
-<tr>
-<td align="left"><code>round(float8)</code></td>
-<td align="left">round to the nearest integer</td>
-</tr>
-<tr>
-<td align="left"><code>dround(float8)</code></td>
-<td align="left">round to the nearest integer</td>
-</tr>
-<tr>
-<td align="left"><code>sign(float8)</code></td>
-<td align="left">sign of the argument</td>
-</tr>
-<tr>
-<td align="left"><code>sqrt(float8)</code></td>
-<td align="left">square root</td>
-</tr>
-<tr>
-<td align="left"><code>dsqrt(float8)</code></td>
-<td align="left">square root</td>
-</tr>
-<tr>
-<td align="left"><code>trunc(float8)</code></td>
-<td align="left">truncate toward zero</td>
-</tr>
-<tr>
-<td align="left"><code>dtrunc(float8)</code></td>
-<td align="left">truncate toward zero</td>
-</tr>
-</tbody>
-</table>
-<h1 id="_4">三角関数</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>degrees(float8)</code></td>
-<td align="left">radians to degrees</td>
-</tr>
-<tr>
-<td align="left"><code>radians(float8)</code></td>
-<td align="left">degrees to radians</td>
-</tr>
-<tr>
-<td align="left"><code>acos(float8)</code></td>
-<td align="left">inverse cosine</td>
-</tr>
-<tr>
-<td align="left"><code>asin(float8)</code></td>
-<td align="left">inverse sine</td>
-</tr>
-<tr>
-<td align="left"><code>atan(float8)</code></td>
-<td align="left">inverse tangent</td>
-</tr>
-<tr>
-<td align="left"><code>atan2(float8,float8)</code></td>
-<td align="left">inverse tangent of <code>arg1 / arg2</code></td>
-</tr>
-<tr>
-<td align="left"><code>cos(float8)</code></td>
-<td align="left">cosine</td>
-</tr>
-<tr>
-<td align="left"><code>cot(float8)</code></td>
-<td align="left">cotangent</td>
-</tr>
-<tr>
-<td align="left"><code>sin(float8)</code></td>
-<td align="left">sine</td>
-</tr>
-<tr>
-<td align="left"><code>tan(float8)</code></td>
-<td align="left">tangent</td>
-</tr>
-</tbody>
-</table>
-<h1 id="_5">日付/時刻型演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>date COMP date</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>date COMP timestamp</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>date COMP timestamptz</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>time COMP time</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>timetz COMP timetz</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>timestamp COMP timestamp</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>timestamp COMP date</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>timestamptz COMP timestamptz</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>timestamptz COMP date</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>timestamp COMP timestamptz</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>timestamptz COMP timestamp</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>interval COMP interval</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>date OP int4</code></td>
-<td align="left"><code>OP</code> is either of <code>+,-</code></td>
-</tr>
-<tr>
-<td align="left"><code>int4 + date</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>date - date</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>date + time</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>date + timetz</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>time + date</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>time - time</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>timestamp - timestamp</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>timetz OP interval</code></td>
-<td align="left"><code>OP</code> is either of <code>+,-</code></td>
-</tr>
-<tr>
-<td align="left"><code>timestamptz OP interval</code></td>
-<td align="left"><code>OP</code> is either of <code>+,-</code></td>
-</tr>
-<tr>
-<td align="left"><code>overlaps(TYPE,TYPE,TYPE,TYPE)</code></td>
-<td align="left"><code>TYPE</code> is any of <code>time,timetz,timestamp,timestamptz</code></td>
-</tr>
-<tr>
-<td align="left"><code>extract(text FROM TYPE)</code></td>
-<td align="left"><code>TYPE</code> is any of <code>time,timetz,timestamp,timestamptz,interval</code></td>
-</tr>
-<tr>
-<td align="left"><code>now()</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>- interval</code></td>
-<td align="left">unary minus operator</td>
-</tr>
-<tr>
-<td align="left"><code>interval OP interval</code></td>
-<td align="left"><code>OP</code> is either of <code>+,-</code></td>
-</tr>
-</tbody>
-</table>
-<h1 id="_6">文字列関数/演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>{text,bpchar} COMP {text,bpchar}</code></td>
-<td align="left"><code>COMP</code> is either of <code>=,&lt;&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>{text,bpchar} COMP {text,bpchar}</code></td>
-<td align="left"><code>COMP</code> is either of <code>&lt;,&lt;=,&gt;=,&gt;</code><br>Only available on no-locale or UTF-8</td>
-</tr>
-<tr>
-<td align="left"><code>varchar || varchar</code></td>
-<td align="left">Both side must be <code>varchar(n)</code> with maximum length.</td>
-</tr>
-<tr>
-<td align="left"><code>substring</code>, <code>substr</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>length(TYPE)</code></td>
-<td align="left">length of the string<br><code>TYPE</code> is either of <code>text,bpchar</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE LIKE text</code></td>
-<td align="left"><code>TYPE</code> is either of <code>text,bpchar</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE NOT LIKE text</code></td>
-<td align="left"><code>TYPE</code> is either of <code>text,bpchar</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE ILIKE text</code></td>
-<td align="left"><code>TYPE</code> is either of <code>text,bpchar</code><br>Only available on no-locale or UTF-8</td>
-</tr>
-<tr>
-<td align="left"><code>TYPE NOT ILIKE text</code></td>
-<td align="left"><code>TYPE</code> is either of <code>text,bpchar</code><br>Only available on no-locale or UTF-8</td>
-</tr>
-</tbody>
-</table>
-<h1 id="_7">ネットワーク関数/演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>macaddr COMP macaddr</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>macaddr &amp; macaddr</code></td>
-<td align="left">Bitwise AND operator</td>
-</tr>
-<tr>
-<td align="left"><code>macaddr &#124; macaddr</code></td>
-<td align="left">Bitwise OR operator</td>
-</tr>
-<tr>
-<td align="left"><code>~ macaddr</code></td>
-<td align="left">Bitwise NOT operator</td>
-</tr>
-<tr>
-<td align="left"><code>trunc(macaddr)</code></td>
-<td align="left">Set last 3 bytes to zero</td>
-</tr>
-<tr>
-<td align="left"><code>inet COMP inet</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>inet INCL inet</code></td>
-<td align="left"><code>INCL</code> is any of <code>&lt;&lt;,&lt;&lt;=,&gt;&gt;,&gt;&gt;=,&amp;&amp;</code></td>
-</tr>
-<tr>
-<td align="left"><code>~ inet</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet &amp; inet</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet &#124; inet</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet + int8</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet - int8</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet - inet</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>broadcast(inet)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>family(inet)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>hostmask(inet)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>masklen(inet)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>netmask(inet)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>network(inet)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>set_masklen(cidr,int)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>set_masklen(inet,int)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet_same_family(inet, inet)</code></td>
-<td align="left"></td>
-</tr>
-<tr>
-<td align="left"><code>inet_merge(inet,inet)</code></td>
-<td align="left"></td>
-</tr>
-</tbody>
-</table>
-<h1 id="_8">通貨型演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>money COMP money</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-<tr>
-<td align="left"><code>money OP money</code></td>
-<td align="left"><code>OP</code> is any of <code>+,-,/</code></td>
-</tr>
-<tr>
-<td align="left"><code>money * TYPE</code></td>
-<td align="left"><code>TYPE</code> is any of <code>int2,int4,float2,float4,float8</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE * money</code></td>
-<td align="left"><code>TYPE</code> is any of <code>int2,int4,float2,float4,float8</code></td>
-</tr>
-<tr>
-<td align="left"><code>money / TYPE</code></td>
-<td align="left"><code>TYPE</code> is any of <code>int2,int4,float2,float4,float8</code></td>
-</tr>
-</tbody>
-</table>
-<h1 id="uuid">uuid型演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>uuid COMP uuid</code></td>
-<td align="left"><code>COMP</code> is any of <code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code></td>
-</tr>
-</tbody>
-</table>
-<h1 id="jsonb">JSONB型演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>jsonb -&gt; KEY</code></td>
-<td align="left">Get a JSON object field specified by the <code>KEY</code></td>
-</tr>
-<tr>
-<td align="left"><code>jsonb -&gt; NUM</code></td>
-<td align="left">Get a JSON array element indexed by <code>NUM</code></td>
-</tr>
-<tr>
-<td align="left"><code>jsonb -&gt;&gt; KEY</code></td>
-<td align="left">Get a JSON object field specified by the <code>KEY</code>, as text</td>
-</tr>
-<tr>
-<td align="left"><code>jsonb -&gt;&gt; NUM</code></td>
-<td align="left">Get a JSON array element indexed by <code>NUM</code></td>
-</tr>
-<tr>
-<td align="left"><code>(jsonb -&gt;&gt; KEY)::TYPE</code></td>
-<td align="left">TYPE is any of <code>int2,int4,int8,float4,float8,numeric</code><br>Get a JSON object field specified by <code>KEY</code>, as numeric data type. See the note below.</td>
-</tr>
-<tr>
-<td align="left"><code>(jsonb -&gt;&gt; NUM)::TYPE</code></td>
-<td align="left">TYPE is any of <code>int2,int4,int8,float4,float8,numeric</code><br>Get a JSON array element indexed by <code>NUM</code>, as numeric data type. See the note below.</td>
-</tr>
-<tr>
-<td align="left"><code>jsonb ? KEY</code></td>
-<td align="left">Check whether jsonb object contains the <code>KEY</code></td>
-</tr>
-</tbody>
-</table>
+<h2 id="_2">型キャスト</h2>
+<ul>
+<li><code>bool</code>    &lt;-- <code>int4</code></li>
+<li><code>int1</code>    &lt;-- <code>int2</code>, <code>int4</code>, <code>int8</code>, <code>float2</code>, <code>float4</code>, <code>float8</code>, <code>numeric</code></li>
+<li><code>int2</code>    &lt;-- <code>int1</code>, <code>int4</code>, <code>int8</code>, <code>float2</code>, <code>float4</code>, <code>float8</code>, <code>numeric</code></li>
+<li><code>int4</code>    &lt;-- <code>bool</code>, <code>int1</code>, <code>int2</code>, <code>int8</code>, <code>float2</code>, <code>float4</code>, <code>float8</code>, <code>numeric</code></li>
+<li><code>int8</code>    &lt;-- <code>int1</code>, <code>int2</code>, <code>int4</code>, <code>float2</code>, <code>float4</code>, <code>float8</code>, <code>numeric</code></li>
+<li><code>float2</code>  &lt;-- <code>int1</code>, <code>int2</code>, <code>int4</code>, <code>int8</code>, <code>float4</code>, <code>float8</code>, <code>numeric</code></li>
+<li><code>float4</code>  &lt;-- <code>int1</code>, <code>int2</code>, <code>int4</code>, <code>int8</code>, <code>float2</code>, <code>float8</code>, <code>numeric</code></li>
+<li><code>float8</code>  &lt;-- <code>int1</code>, <code>int2</code>, <code>int4</code>, <code>int8</code>, <code>float2</code>, <code>float4</code>, <code>numeric</code></li>
+<li><code>numeric</code> &lt;-- <code>int1</code>, <code>int2</code>, <code>int4</code>, <code>int8</code>, <code>float2</code>, <code>float4</code>, <code>float8</code></li>
+<li><code>money</code>   &lt;-- <code>int4</code>, <code>int8</code>, <code>numeric</code><br></li>
+<li><code>date</code>    &lt;-- <code>timestamp</code>, <code>timestamptz</code><br></li>
+<li><code>time</code>    &lt;-- <code>timetz</code>, <code>timestamp</code>, <code>timestamptz</code><br></li>
+<li><code>timetz</code>  &lt;-- <code>time</code>, <code>timestamptz</code><br></li>
+<li><code>timestamp</code> &lt;-- <code>date</code>, <code>timestamptz</code><br></li>
+<li><code>timestamptz</code> &lt;-- <code>date</code>, <code>timestamp</code></li>
+</ul>
+<h2 id="_3">数値型演算子</h2>
+<dl>
+<dt><code>bool COMP bool</code></dt>
+<dd>論理値型の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT COMP INT</code></dt>
+<dd>整数型の比較演算子。<br><code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかで、左辺と右辺が異なる整数型であっても構いません。<br><code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>FP COMP FP</code></dt>
+<dd>浮動小数点型の比較演算子。<br><code>FP</code>は<code>float2,float4,float8</code>のいずれかで、左辺と右辺が異なる浮動小数点型であっても構いません。<br><code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>numeric COMP numeric</code></dt>
+<dd>実数型の比較演算子。<br><code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT OP INT</code></dt>
+<dd>整数型の算術演算子。<br><code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかで、左辺と右辺が異なる整数型であっても構いません。<br><code>OP</code>は<code>+,-,*,/</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>FP OP FP</code></dt>
+<dd>浮動小数点型の算術演算子。<br><code>FP</code>は<code>float2,float4,float8</code>のいずれかで、左辺と右辺が異なる浮動小数点型であっても構いません。<br><code>COMP</code>は<code>+,-,*,/</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>numeric OP numeric</code></dt>
+<dd>実数型の比較演算子。<br><code>OP</code>は<code>+,-,*,/</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT % INT</code></dt>
+<dd>剰余演算子。<code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT &amp; INT</code></dt>
+<dd>論理積演算子。<code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT | INT</code></dt>
+<dd>論理和演算子。<code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT # INT</code></dt>
+<dd>排他的論理和演算子。<code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>~ INT</code></dt>
+<dd>論理否定演算子。<code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT &gt;&gt; int4</code></dt>
+<dd>右シフト演算子。<code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>INT &lt;&lt; int4</code></dt>
+<dd>左シフト演算子。<code>INT</code>は<code>int1,int2,int4,int8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>+ TYPE</code></dt>
+<dd>単項プラス演算子。<code>TYPE</code>は<code>int1,int2,int4,int8,float2,float4,float8,numeric</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>- TYPE</code></dt>
+<dd>単項マイナス演算子。<code>TYPE</code>は<code>int1,int2,int4,int8,float2,float4,float8,numeric</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>@ TYPE</code></dt>
+<dd>絶対値。<code>TYPE</code>は<code>int1,int2,int4,int8,float2,float4,float8,numeric</code>のいずれかです。</dd>
+<dd></dd>
+</dl>
+<h2 id="_4">数学関数</h2>
+<dl>
+<dt><code>float8 cbrt(float8)</code><br><code>float8 dcbrt(float8)</code></dt>
+<dd>cube root|</dd>
+<dt><code>float8 ceil(float8)</code><br><code>float8 ceiling(float8)</code></dt>
+<dd>nearest integer greater than or equal to argument</dd>
+<dt><code>float8 exp(float8)</code><br><code>float8 dexp(float8)</code></dt>
+<dd>exponential</dd>
+<dt><code>float8 floor(float8)</code></dt>
+<dd>nearest integer less than or equal to argument</dd>
+<dt><code>float8 ln(float8)</code><br><code>float8 dlog1(float8)</code></dt>
+<dd>natural logarithm</dd>
+<dt><code>float8 log(float8)</code><br><code>float8 dlog10(float8)</code></dt>
+<dd>base 10 logarithm</dd>
+<dt><code>float8 pi()</code></dt>
+<dd>circumference ratio</dd>
+<dt><code>float8 power(float8,float8)</code><br><code>float8 pow(float8,float8)</code><br><code>float8 dpow(float8,float8)</code></dt>
+<dd>power</dd>
+<dt><code>float8 round(float8)</code><br><code>float8 dround(float8)</code></dt>
+<dd>round to the nearest integer</dd>
+<dt><code>float8 sign(float8)</code></dt>
+<dd>sign of the argument</dd>
+<dt><code>float8 sqrt(float8)</code><br><code>float8 dsqrt(float8)</code></dt>
+<dd>square root|</dd>
+<dt><code>float8 trunc(float8)</code><br><code>float8 dtrunc(float8)</code></dt>
+<dd>truncate toward zero|</dd>
+</dl>
+<h2 id="_5">三角関数</h2>
+<dl>
+<dt><code>float8 degrees(float8)</code></dt>
+<dd>ラジアンに対応する度</dd>
+<dd></dd>
+<dt><code>float8 radians(float8)</code></dt>
+<dd>度に対応するラジアン</dd>
+<dd></dd>
+<dt><code>float8 acos(float8)</code></dt>
+<dd>逆余弦関数</dd>
+<dd></dd>
+<dt><code>float8 asin(float8)</code></dt>
+<dd>逆正弦関数</dd>
+<dd></dd>
+<dt><code>float8 atan(float8)</code></dt>
+<dd>逆正接関数</dd>
+<dd></dd>
+<dt><code>float8 atan2(float8,float8)</code></dt>
+<dd><code>arg1 / arg2</code>の逆正接関数</dd>
+<dd></dd>
+<dt><code>float8 cos(float8)</code></dt>
+<dd>余弦関数</dd>
+<dd></dd>
+<dt><code>float8 cot(float8)</code></dt>
+<dd>余接関数</dd>
+<dd></dd>
+<dt><code>float8 sin(float8)</code></dt>
+<dd>正弦関数</dd>
+<dd></dd>
+<dt><code>float8 tan(float8)</code></dt>
+<dd>正接関数</dd>
+<dd></dd>
+</dl>
+<h2 id="_6">日付/時刻型演算子</h2>
+<dl>
+<dt><code>date COMP date</code></dt>
+<dd><code>date</code>型同士の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>date COMP timestamp</code><br><code>timestamp COMP date</code></dt>
+<dd><code>date</code>型と<code>timestamp</code>型の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>date COMP timestamptz</code><br><code>timestamptz COMP date</code></dt>
+<dd><code>date</code>型と<code>timestamptz</code>型の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>time COMP time</code></dt>
+<dd><code>time</code>型同士の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>timetz COMP timetz</code></dt>
+<dd><code>timetz</code>型同士の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>timestamp COMP timestamp</code></dt>
+<dd><code>timestamp</code>型同士の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>timestamptz COMP timestamptz</code></dt>
+<dd><code>timestamptz</code>型同士の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>timestamp COMP timestamptz</code><br><code>timestamptz COMP timestamp</code></dt>
+<dd><code>timestamp</code>型と<code>timestamptz</code>型の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>interval COMP interval</code></dt>
+<dd><code>interval</code>型同士の比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれか。</dd>
+<dd></dd>
+<dt><code>date + int4</code><br><code>int4 + date</code></dt>
+<dd><code>date</code>型の加算演算子</dd>
+<dd></dd>
+<dt><code>date - int4</code></dt>
+<dd><code>date</code>型の減算演算子</dd>
+<dd></dd>
+<dt><code>date - date</code></dt>
+<dd><code>date</code>型同士の差分</dd>
+<dd></dd>
+<dt><code>date + time</code><br><code>time + date</code></dt>
+<dd><code>date</code>と<code>time</code>から<code>timestamp</code>を生成します</dd>
+<dd></dd>
+<dt><code>date + timetz</code></dt>
+<dd><code>date</code>と<code>timetz</code>から<code>timestamptz</code>を生成します</dd>
+<dd></dd>
+<dt><code>time - time</code></dt>
+<dd><code>time</code>型同士の差分</dd>
+<dd></dd>
+<dt><code>timestamp - timestamp</code></dt>
+<dd><code>timestamp</code>型同士の差分</dd>
+<dd></dd>
+<dt><code>timetz + interval</code><br><code>timetz - interval</code></dt>
+<dd><code>timetz</code>と<code>interval</code>を加算、または減算します。</dd>
+<dd></dd>
+<dt><code>timestamptz + interval</code><br><code>timestamptz - interval</code></dt>
+<dd><code>timestamptz</code>と<code>interval</code>を加算、または減算します。</dd>
+<dd></dd>
+<dt><code>overlaps(TYPE,TYPE,TYPE,TYPE)</code></dt>
+<dd>2つの時間間隔が重なるかどうかを判定します。<br><code>TYPE</code>は<code>time,timetz,timestamp,timestamptz</code>のいずれか一つです。</dd>
+<dd></dd>
+<dt><code>extract(text FROM TYPE)</code></dt>
+<dd><code>day</code>や<code>hour</code>など日付時刻型の部分フィールドの抽出。<br><code>TYPE</code>は<code>time,timetz,timestamp,timestamptz,interval</code>のいずれか一つです。</dd>
+<dd></dd>
+<dt><code>now()</code></dt>
+<dd>トランザクションの現在時刻</dd>
+<dd></dd>
+<dt><code>- interval</code></dt>
+<dd><code>interval</code>型の単項マイナス演算子</dd>
+<dd></dd>
+<dt><code>interval + interval</code></dt>
+<dd><code>interval</code>型の加算演算子</dd>
+<dd></dd>
+<dt><code>interval - interval</code></dt>
+<dd><code>interval</code>型の減算演算子</dd>
+<dd></dd>
+</dl>
+<h2 id="_7">文字列関数/演算子</h2>
+<dl>
+<dt><code>{text,bpchar} COMP {text,bpchar}</code></dt>
+<dd>比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。<br>なお、<code>&lt;,&lt;=,&gt;=,&gt;</code>演算子はロケール設定がUTF-8またはC(ロケール設定なし)の場合にのみ有効です。</dd>
+<dd></dd>
+<dt><code>varchar || varchar</code></dt>
+<dd>文字列結合<br>結果文字列の最大長を予測可能とするため、両辺は<code>varchar(n)</code>でなければいけません。</dd>
+<dd></dd>
+<dt><code>substring(text,int4)</code><br><code>substring(text,int4,int4)</code><br><code>substr(text,int4)</code><br><code>substr(text,int4,int4)</code></dt>
+<dd>部分文字列の切り出し</dd>
+<dd></dd>
+<dt><code>length({text,bpchar})</code></dt>
+<dd>文字列長</dd>
+<dd></dd>
+<dt><code>{text,bpchar} [NOT] LIKE text</code></dt>
+<dd>LIKE表現を用いたパターンマッチング</dd>
+<dd></dd>
+<dt><code>{text,bpchar} [NOT] ILIKE text</code></dt>
+<dd>LIKE表現を用いた大文字小文字を区別しないパターンマッチング。<br>なお、<code>ILIKE</code>演算子はロケール設定がUTF-8またはC(ロケール設定なし)の場合にのみ有効です。</dd>
+<dd></dd>
+</dl>
+<h2 id="_8">ネットワーク関数/演算子</h2>
+<dl>
+<dt><code>macaddr COMP macaddr</code></dt>
+<dd>比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>macaddr &amp; macaddr</code></dt>
+<dd>ビット積演算子</dd>
+<dd></dd>
+<dt><code>macaddr | macaddr</code></dt>
+<dd>ビット和演算子</dd>
+<dd></dd>
+<dt><code>~ macaddr</code></dt>
+<dd>ビット否定演算子</dd>
+<dd></dd>
+<dt><code>trunc(macaddr)</code></dt>
+<dd>末尾の3バイトをゼロに設定する</dd>
+<dd></dd>
+<dt><code>inet COMP inet</code></dt>
+<dd>比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>inet &lt;&lt; inet</code></dt>
+<dd>左辺は右辺に内包される。</dd>
+<dd></dd>
+<dt><code>inet &lt;&lt;= inet</code></dt>
+<dd>左辺は右辺に内包されるか等しい。</dd>
+<dd></dd>
+<dt><code>inet &gt;&gt; inet</code></dt>
+<dd>左辺は右辺を内包する。</dd>
+<dd></dd>
+<dt><code>inet &gt;&gt;= inet</code></dt>
+<dd>左辺は右辺を内包するか等しい。</dd>
+<dd></dd>
+<dt><code>inet &amp;&amp; inet</code></dt>
+<dd>左辺は右辺を内包するか内包される</dd>
+<dd></dd>
+<dt><code>~ inet</code></dt>
+<dd>ビット否定演算子</dd>
+<dd></dd>
+<dt><code>inet &amp; inet</code></dt>
+<dd>ビット積演算子</dd>
+<dd></dd>
+<dt><code>inet | inet</code></dt>
+<dd>ビット和演算子</dd>
+<dd></dd>
+<dt><code>inet + int8</code></dt>
+<dd>加算演算子</dd>
+<dd></dd>
+<dt><code>inet - int8</code></dt>
+<dd>減算演算子</dd>
+<dd></dd>
+<dt><code>inet - inet</code></dt>
+<dd>減算演算子</dd>
+<dd></dd>
+<dt><code>broadcast(inet)</code></dt>
+<dd>ネットワークアドレスのブロードキャストアドレスを返す</dd>
+<dd></dd>
+<dt><code>family(inet)</code></dt>
+<dd>ネットワークアドレスのアドレスファミリを返す。IPv4の場合は<code>4</code>、IPv6の場合は<code>6</code></dd>
+<dd></dd>
+<dt><code>hostmask(inet)</code></dt>
+<dd>ネットワークアドレスのホストマスクを返す</dd>
+<dd></dd>
+<dt><code>masklen(inet)</code></dt>
+<dd>ネットワークアドレスのマスク長を返す</dd>
+<dd></dd>
+<dt><code>netmask(inet)</code></dt>
+<dd>ネットワークアドレスのネットマスクを返す</dd>
+<dd></dd>
+<dt><code>network(inet)</code></dt>
+<dd>ネットワークアドレスのネットワーク部を返す</dd>
+<dd></dd>
+<dt><code>set_masklen(NETADDR,int)</code></dt>
+<dd>ネットワークアドレスのネットマスク長を設定する。<code>NETADDR</code>は<code>inet</code>か<code>cidr</code>のどちらか。</dd>
+<dd></dd>
+<dt><code>inet_merge(inet,inet)</code></dt>
+<dd>両方のネットワークを含む最小のネットワークを返す</dd>
+<dd></dd>
+</dl>
+<h2 id="_9">通貨型演算子</h2>
+<dl>
+<dt><code>money COMP money</code></dt>
+<dd>比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>money OP money</code></dt>
+<dd>算術演算子。<code>OP</code>は<code>+,-,/</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>money * TYPE</code><br><code>TYPE * money</code></dt>
+<dd>通貨型と数値型の乗算。<code>TYPE</code>は<code>int1,int2,int4,float2,float4,float8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>money / TYPE</code></dt>
+<dd>通貨型の数値型による除算。<code>TYPE</code>は<code>int1,int2,int4,float2,float4,float8</code>のいずれかです。</dd>
+<dd></dd>
+<dt><code>money / money</code></dt>
+<dd>通貨型同士の除算。</dd>
+<dd></dd>
+</dl>
+<h2 id="uuid">uuid型演算子</h2>
+<dl>
+<dt><code>uuid COMP uuid</code></dt>
+<dd>比較演算子。<code>COMP</code>は<code>=,&lt;&gt;,&lt;,&lt;=,&gt;=,&gt;</code>のいずれかです。</dd>
+<dd></dd>
+</dl>
+<h2 id="jsonb">JSONB型演算子</h2>
+<dl>
+<dt><code>jsonb -&gt; KEY</code></dt>
+<dd><code>KEY</code>で指定されたJSONオブジェクトフィールドを取得する</dd>
+<dd></dd>
+<dt><code>jsonb -&gt; NUM</code></dt>
+<dd>インデックス番号<code>NUM</code>で指定されたJSONオブジェクトフィールドを取得する</dd>
+<dd></dd>
+<dt><code>jsonb -&gt;&gt; KEY</code></dt>
+<dd><code>KEY</code>で指定されたJSONオブジェクトフィールドをテキスト値として取得する</dd>
+<dd></dd>
+<dt><code>jsonb -&gt;&gt; NUM</code></dt>
+<dd>インデックス番号<code>NUM</code>で指定されたJSONオブジェクトフィールドをテキスト値として取得する</dd>
+<dd></dd>
+<dt><code>(jsonb -&gt;&gt; KEY)::TYPE</code></dt>
+<dd><code>TYPE</code>が<code>int2,int4,int8,float4,float8,numeric</code>のいずれかである場合、<code>KEY</code>で指定されたJSONオブジェクトフィールドを数値型として取得する。下記の補足も参照。</dd>
+<dd></dd>
+<dt><code>(jsonb -&gt;&gt; NUM)::TYPE</code></dt>
+<dd><code>TYPE</code>が<code>int2,int4,int8,float4,float8,numeric</code>のいずれかである場合、インデックス番号<code>NUM</code>で指定されたJSONオブジェクトフィールドを数値型として取得する。下記の補足も参照。</dd>
+<dd></dd>
+<dt><code>jsonb ? KEY</code></dt>
+<dd>jsonbオブジェクトが指定された<code>KEY</code>を含むかどうかをチェックする</dd>
+<dd></dd>
+</dl>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p><code>jsonb -&gt;&gt; KEY</code>演算子によって取り出した数値データを<code>float</code>や<code>numeric</code>など数値型に変換する時、通常、PostgreSQLはjsonb内部表現をテキストとして出力し、それを数値表現に変換するという2ステップの処理を行います。
 PG-Stromは<code>jsonb -&gt;&gt; KEY</code>演算子による参照とテキスト⇒数値表現へのキャストが連続している時、jsonbオブジェクトから数値表現を取り出すための特別なデバイス関数を使用する事で最適化を行います。</p>
 </div>
-<h1 id="_9">範囲型演算子</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>RANGE = RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &lt;&gt; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &lt; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &lt;= RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &gt; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &gt;= RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE @ RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE @ TYPE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code><br><code>TYPE</code> is element type of <code>RANGE</code>.</td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &lt;@RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>TYPE &lt;@RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code><br><code>TYPE</code> is element type of <code>RANGE</code>.</td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &amp;&amp; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &lt;&lt; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &gt;&gt; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &amp;&lt; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE &amp;&gt; RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE -&#124;- RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE + RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE * RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>RANGE - RANGE</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>lower(RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>upper(RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>isempty(RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>lower_inc(RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>upper_inc(RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>lower_inf(RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>upper_inf(RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-<tr>
-<td align="left"><code>range_merge(RANGE,RANGE)</code></td>
-<td align="left"><code>RANGE</code> is any of <code>int4range,int8range,tsrange,tstzrange,daterange</code></td>
-</tr>
-</tbody>
-</table>
-<h1 id="_10">その他のデバイス関数</h1>
-<table>
-<thead>
-<tr>
-<th align="left">functions/operators</th>
-<th align="left">result</th>
-<th align="left">description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td align="left"><code>as_int8(float8)</code></td>
-<td align="left"><code>int8</code></td>
-<td align="left">Re-interpret double-precision floating point bit-pattern as 64bit integer value</td>
-</tr>
-<tr>
-<td align="left"><code>as_int4(float4)</code></td>
-<td align="left"><code>int4</code></td>
-<td align="left">Re-interpret single-precision floating point bit-pattern as 32bit integer value</td>
-</tr>
-<tr>
-<td align="left"><code>as_int2(float2)</code></td>
-<td align="left"><code>int2</code></td>
-<td align="left">Re-interpret half-precision floating point bit-pattern as 16bit integer value</td>
-</tr>
-<tr>
-<td align="left"><code>as_float8(int8)</code></td>
-<td align="left"><code>float8</code></td>
-<td align="left">Re-interpret 64bit integer bit-pattern as double-precision floating point value</td>
-</tr>
-<tr>
-<td align="left"><code>as_float4(int4)</code></td>
-<td align="left"><code>float4</code></td>
-<td align="left">Re-interpret 32bit integer bit-pattern as single-precision floating point value</td>
-</tr>
-<tr>
-<td align="left"><code>as_float2(int2)</code></td>
-<td align="left"><code>float2</code></td>
-<td align="left">Re-interpret 16bit integer bit-pattern as half-precision floating point value</td>
-</tr>
-</tbody>
-</table>
+<h2 id="_10">範囲型演算子</h2>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>以下の説明において、<code>RANGE</code>は任意の{<code>int4range</code>、<code>int8range</code>、<code>tsrange</code>、<code>tstzrange</code>、<code>daterange</code>}です。<br>
+以下の説明において、<code>TYPE</code>は同時に使われている<code>RANGE</code>の要素型です。</p>
+</div>
+<dl>
+<dt><code>RANGE = RANGE</code></dt>
+<dd>両辺が等しい </dd>
+<dt><code>RANGE &lt;&gt; RANGE</code></dt>
+<dd>両辺が等しくない </dd>
+<dt><code>RANGE &lt; RANGE</code></dt>
+<dd>左辺は右辺より小さい </dd>
+<dt><code>RANGE &lt;= RANGE</code></dt>
+<dd>左辺は右辺より小さいか等しい</dd>
+<dd></dd>
+<dt><code>RANGE &gt; RANGE</code></dt>
+<dd>左辺は右辺より大きい</dd>
+<dd></dd>
+<dt><code>RANGE &gt;= RANGE</code></dt>
+<dd>左辺は右辺より大きいか等しい</dd>
+<dd></dd>
+<dt><code>RANGE @ RANGE</code></dt>
+<dd>左辺の範囲は右辺の範囲を包含する</dd>
+<dd></dd>
+<dt><code>RANGE @ TYPE</code></dt>
+<dd>左辺の範囲は右辺の要素を包含する</dd>
+<dd></dd>
+<dt><code>RANGE &lt;@ RANGE</code></dt>
+<dd>左辺の範囲は右辺の範囲に包含される</dd>
+<dd></dd>
+<dt><code>TYPE &lt;@ RANGE</code></dt>
+<dd>左辺の要素は右辺の範囲に包含される</dd>
+<dd></dd>
+<dt><code>RANGE &amp;&amp; RANGE</code></dt>
+<dd>左辺と右辺は重複する（共通点を持つ）</dd>
+<dd></dd>
+<dt><code>RANGE &lt;&lt; RANGE</code></dt>
+<dd>左辺は厳密に右辺よりも小さい</dd>
+<dd></dd>
+<dt><code>RANGE &gt;&gt; RANGE</code></dt>
+<dd>左辺は厳密に右辺よりも大きい</dd>
+<dd></dd>
+<dt><code>RANGE &amp;&lt; RANGE</code></dt>
+<dd>左辺のいかなる点も右辺の範囲を越えない</dd>
+<dd></dd>
+<dt><code>RANGE &amp;&gt; RANGE</code></dt>
+<dd>右辺のいかなる点も左辺の範囲を越えない</dd>
+<dd></dd>
+<dt><code>RANGE -|- RANGE</code></dt>
+<dd>左辺と右辺は隣接している</dd>
+<dd></dd>
+<dt><code>RANGE + RANGE</code></dt>
+<dd>左辺と右辺による結合範囲を返す</dd>
+<dd></dd>
+<dt><code>RANGE * RANGE</code></dt>
+<dd>左辺と右辺による交差範囲を返す</dd>
+<dd></dd>
+<dt><code>RANGE - RANGE</code></dt>
+<dd>左辺と右辺による差分範囲を返す</dd>
+<dd></dd>
+<dt><code>lower(RANGE)</code></dt>
+<dd>範囲の下限を返す</dd>
+<dd></dd>
+<dt><code>upper(RANGE)</code></dt>
+<dd>範囲の上限を返す</dd>
+<dd></dd>
+<dt><code>isempty(RANGE)</code></dt>
+<dd>空の範囲かどうかをチェックする</dd>
+<dd></dd>
+<dt><code>lower_inc(RANGE)</code></dt>
+<dd>下限は内包されているかどうかをチェックする</dd>
+<dd></dd>
+<dt><code>upper_inc(RANGE)</code></dt>
+<dd>上限は内包されているかをチェックする</dd>
+<dd></dd>
+<dt><code>lower_inf(RANGE)</code></dt>
+<dd>下限は無限大かどうかをチェックする</dd>
+<dd></dd>
+<dt><code>upper_inf(RANGE)</code></dt>
+<dd>上限は無限大かどうかをチェックする</dd>
+<dd></dd>
+<dt><code>range_merge(RANGE,RANGE)</code></dt>
+<dd>両方の範囲を含む最小の範囲を返す</dd>
+<dd></dd>
+</dl>
+<h2 id="postgis">PostGIS関数</h2>
+<dl>
+<dt><code>geometry st_makepoint(float8,float8)</code><br><code>geometry st_point(float8,float8)</code></dt>
+<dd>2次元座標を含むPOINT型ジオメトリを返す</dd>
+<dd></dd>
+<dt><code>geometry st_makepoint(float8,float8,float8)</code></dt>
+<dd>3次元座標を含むPOINT型ジオメトリを返す</dd>
+<dd></dd>
+<dt><code>geometry st_makepoint(float8,float8,float8,float8)</code></dt>
+<dd>ZM座標を含むPOINT型ジオメトリを返す</dd>
+<dd></dd>
+<dt><code>geometry st_setsrid(geometry,int4)</code></dt>
+<dd>ジオメトリにSRIDを設定する</dd>
+<dd></dd>
+<dt><code>float8 st_distance(geometry,geometry)</code></dt>
+<dd>ジオメトリ間の距離を<code>float8</code>で返す</dd>
+<dd></dd>
+<dt><code>bool st_dwithin(geometry,geometry,float8)</code></dt>
+<dd>ジオメトリ間の距離が指定値以内なら真を返す。<code>st_distance</code>と比較演算子の組み合わせよりも高速な場合がある。</dd>
+<dd></dd>
+<dt><code>text st_relate(geometry,geometry)</code></dt>
+<dd>ジオメトリ間の交差状態を判定し、DE9-IM(Dimensionally Extended Nine-Intersection Matrix)書式を返す。</dd>
+<dd></dd>
+<dt><code>bool st_contains(geometry,geometry)</code></dt>
+<dd>ジオメトリ1がジオメトリ2を包含する時、真を返す。</dd>
+<dd></dd>
+<dt><code>bool st_crosses(geometry,geometry)</code></dt>
+<dd>ジオメトリ同士が空間的に交差する時、真を返す。</dd>
+<dd></dd>
+<dt><code>int4 st_linecrossingdirection(geometry,geometry)</code></dt>
+<dd>2つのLINESTRING型ジオメトリがどのように交差するか（しないか）を返す。</dd>
+<dd></dd>
+</dl>
               
             </div>
           </div>
@@ -1072,7 +667,7 @@ PG-Stromは<code>jsonb -&gt;&gt; KEY</code>演算子による参照とテキス�
     
   </div>
 
-  Built with <a href="http://www.mkdocs.org">MkDocs</a> using a <a href="https://github.com/snide/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/snide/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
 </footer>
       
         </div>
@@ -1082,7 +677,7 @@ PG-Stromは<code>jsonb -&gt;&gt; KEY</code>演算子による参照とテキス�
 
   </div>
 
-  <div class="rst-versions" role="note" style="cursor: pointer">
+  <div class="rst-versions" role="note" aria-label="versions">
     <span class="rst-current-version" data-toggle="rst-current-version">
       
       
@@ -1096,6 +691,11 @@ PG-Stromは<code>jsonb -&gt;&gt; KEY</code>演算子による参照とテキス�
     <script>var base_url = '..';</script>
     <script src="../js/theme.js" defer></script>
       <script src="../search/main.js" defer></script>
+    <script defer>
+        window.onload = function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        };
+    </script>
 
 </body>
 </html>
