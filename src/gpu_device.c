@@ -4,7 +4,7 @@
  * Routines to collect GPU device information.
  * ----
  * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License.
@@ -55,6 +55,42 @@ Datum pgstrom_gpu_num_cuda_cores(PG_FUNCTION_ARGS);
 Datum pgstrom_gpu_cc_major(PG_FUNCTION_ARGS);
 Datum pgstrom_gpu_cc_minor(PG_FUNCTION_ARGS);
 Datum pgstrom_gpu_pci_id(PG_FUNCTION_ARGS);
+
+/* static variables */
+static bool		gpudirect_driver_is_initialized = false;
+static bool		__pgstrom_gpudirect_enabled;	/* GUC */
+static int		__pgstrom_gpudirect_threshold;	/* GUC */
+
+/*
+ * pgstrom_gpudirect_enabled
+ */
+bool
+pgstrom_gpudirect_enabled(void)
+{
+	return __pgstrom_gpudirect_enabled;
+}
+
+/*
+ * pgstrom_gpudirect_enabled_checker
+ */
+static bool
+pgstrom_gpudirect_enabled_checker(bool *p_newval, void **extra, GucSource source)
+{
+	bool	newval = *p_newval;
+
+	if (newval && !gpudirect_driver_is_initialized)
+		elog(ERROR, "cannot enable GPUDirectSQL without driver module loaded");
+	return true;
+}
+
+/*
+ * pgstrom_gpudirect_threshold
+ */
+Size
+pgstrom_gpudirect_threshold(void)
+{
+	return (Size)__pgstrom_gpudirect_threshold << 10;
+}
 
 /*
  * pgstrom_collect_gpu_device
@@ -196,11 +232,19 @@ pgstrom_collect_gpu_device(void)
 		 * Only Tesla or Quadro which have PCI Bar1 more than 256MB
 		 * supports GPUDirectSQL
 		 */
-		if (dattrs->GPU_DIRECT_RDMA_SUPPORTED &&
-			dattrs->DEV_BAR1_MEMSZ > (256UL << 20))
-			dattrs->DEV_SUPPORT_GPUDIRECTSQL = true;
-		else
-			dattrs->DEV_SUPPORT_GPUDIRECTSQL = false;
+		dattrs->DEV_SUPPORT_GPUDIRECTSQL = false;
+		if (dattrs->DEV_BAR1_MEMSZ > (256UL << 20))
+		{
+#if CUDA_VERSION < 11030
+			if (strcmp(dattrs->DEV_BRAND, "TESLA") == 0 ||
+				strcmp(dattrs->DEV_BRAND, "QUADRO") == 0 ||
+				strcmp(dattrs->DEV_BRAND, "NVIDIA") == 0)
+				dattrs->DEV_SUPPORT_GPUDIRECTSQL = true;
+#else
+			if (dattrs->GPU_DIRECT_RDMA_SUPPORTED)
+				dattrs->DEV_SUPPORT_GPUDIRECTSQL = true;
+#endif
+		}
 
 		/*
 		 * read the numa node-id from the sysfs entry
@@ -280,7 +324,11 @@ pgstrom_collect_gpu_device(void)
 void
 pgstrom_init_gpu_device(void)
 {
-	static char	   *cuda_visible_devices = NULL;
+	static char	*cuda_visible_devices = NULL;
+	bool		default_gpudirect_enabled = false;
+	size_t		default_threshold = 0;
+	size_t		shared_buffer_size = (size_t)NBuffers * (size_t)BLCKSZ;
+	int			i;
 
 	/*
 	 * Set CUDA_VISIBLE_DEVICES environment variable prior to CUDA
@@ -301,6 +349,49 @@ pgstrom_init_gpu_device(void)
 	}
 	/* collect device properties by gpuinfo command */
 	pgstrom_collect_gpu_device();
+
+	/* pgstrom.gpudirect_enabled */
+	if (gpuDirectInitDriver() == 0)
+	{
+		for (i=0; i < numDevAttrs; i++)
+		{
+			if (devAttrs[i].DEV_SUPPORT_GPUDIRECTSQL)
+				default_gpudirect_enabled = true;
+		}
+		gpudirect_driver_is_initialized = true;
+	}
+	DefineCustomBoolVariable("pg_strom.gpudirect_enabled",
+							 "enables GPUDirect SQL",
+							 NULL,
+							 &__pgstrom_gpudirect_enabled,
+							 default_gpudirect_enabled,
+							 PGC_SUSET,
+							 GUC_NOT_IN_SAMPLE,
+							 pgstrom_gpudirect_enabled_checker, NULL, NULL);
+
+	/*
+	 * MEMO: Threshold of table's physical size to use NVMe-Strom:
+	 *   ((System RAM size) -
+	 *    (shared_buffer size)) * 0.5 + (shared_buffer size)
+	 *
+	 * If table size is enough large to issue real i/o, NVMe-Strom will
+	 * make advantage by higher i/o performance.
+	 */
+	if (PAGE_SIZE * PHYS_PAGES > shared_buffer_size / 2)
+		default_threshold = (PAGE_SIZE * PHYS_PAGES - shared_buffer_size / 2);
+	default_threshold += shared_buffer_size;
+
+	DefineCustomIntVariable("pg_strom.gpudirect_threshold",
+							"Tablesize threshold to use GPUDirect SQL",
+							NULL,
+							&__pgstrom_gpudirect_threshold,
+							default_threshold >> 10,
+							262144,	/* 256MB */
+							INT_MAX,
+							PGC_SUSET,
+							GUC_NOT_IN_SAMPLE | GUC_UNIT_KB,
+							NULL, NULL, NULL);
+
 }
 
 /*

@@ -2,12 +2,12 @@
  * mysql_client.c - MySQL specific portion for mysql2arrow command
  *
  * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License.
  */
-#include <mysql.h>
+#include <mysql/mysql.h>
 #include "sql2arrow.h"
 #include <ctype.h>
 #include <limits.h>
@@ -1070,56 +1070,6 @@ sqldb_close_connection(void *sqldb_state)
 
 	mysql_free_result(mystate->res);
 	mysql_close(mystate->conn);
-}
-
-/*
- * misc functions
- */
-void *
-palloc(size_t sz)
-{
-	void   *ptr = malloc(sz);
-
-	if (!ptr)
-		Elog("out of memory");
-	return ptr;
-}
-
-void *
-palloc0(size_t sz)
-{
-	void   *ptr = malloc(sz);
-
-	if (!ptr)
-		Elog("out of memory");
-	memset(ptr, 0, sz);
-	return ptr;
-}
-
-char *
-pstrdup(const char *str)
-{
-	char   *ptr = strdup(str);
-
-	if (!ptr)
-		Elog("out of memory");
-	return ptr;
-}
-
-void *
-repalloc(void *old, size_t sz)
-{
-	char   *ptr = realloc(old, sz);
-
-	if (!ptr)
-		Elog("out of memory");
-	return ptr;
-}
-
-void
-pfree(void *ptr)
-{
-	free(ptr);
 }
 
 /*

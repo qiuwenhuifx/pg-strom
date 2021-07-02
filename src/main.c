@@ -4,7 +4,7 @@
  * Entrypoint of PG-Strom extension, and misc uncategolized functions.
  * ----
  * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License.
@@ -39,6 +39,18 @@ int			PAGE_SHIFT;
 long		PHYS_PAGES;
 int			pgstrom_num_users_extra = 0;
 pgstromUsersExtraDescriptor pgstrom_users_extra_desc[8];
+
+/* pg_strom.githash() */
+PG_FUNCTION_INFO_V1(pgstrom_githash);
+Datum
+pgstrom_githash(PG_FUNCTION_ARGS)
+{
+#ifdef PGSTROM_GITHASH
+	PG_RETURN_TEXT_P(cstring_to_text(PGSTROM_GITHASH));
+#else
+	PG_RETURN_NULL();
+#endif	
+}
 
 /* pg_strom.chunk_size */
 Size

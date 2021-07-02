@@ -4,7 +4,7 @@
  * Stuff related to invoke HeteroDB Extra Module
  * ----
  * Copyright 2011-2021 (C) KaiGai Kohei <kaigai@kaigai.gr.jp>
- * Copyright 2017-2021 (C) HeteroDB,Inc <contact@heterodb.com>
+ * Copyright 2014-2021 (C) PG-Strom Developers Team
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the PostgreSQL License.
@@ -20,43 +20,8 @@
 
 static struct config_enum_entry pgstrom_gpudirect_driver_options[4];
 static int		__pgstrom_gpudirect_driver;			/* GUC */
-static bool		__pgstrom_gpudirect_enabled;		/* GUC */
-static int		__pgstrom_gpudirect_threshold;		/* GUC */
-static bool		gpudirect_driver_is_initialized = false;
 
 PG_FUNCTION_INFO_V1(pgstrom_license_query);
-
-/*
- * pgstrom_gpudirect_enabled
- */
-bool
-pgstrom_gpudirect_enabled(void)
-{
-	return __pgstrom_gpudirect_enabled;
-}
-
-/*
- * pgstrom_gpudirect_enabled_checker
- */
-static bool
-pgstrom_gpudirect_enabled_checker(bool *p_newval, void **extra, GucSource source)
-{
-	bool	newval = *p_newval;
-
-	if (newval && !gpudirect_driver_is_initialized)
-		elog(ERROR, "cannot enable GPUDirectSQL without driver module loaded");
-	return true;
-}
-
-
-/*
- * pgstrom_gpudirect_threshold
- */
-Size
-pgstrom_gpudirect_threshold(void)
-{
-	return (Size)__pgstrom_gpudirect_threshold << 10;
-}
 
 /*
  * heterodbExtraModuleInfo
@@ -183,16 +148,18 @@ pgstrom_license_query(PG_FUNCTION_ARGS)
  */
 static int	  (*p_gpudirect_init_driver)() = NULL;
 
-static int
+int
 gpuDirectInitDriver(void)
 {
-	Assert(p_gpudirect_init_driver != NULL);
-	if (p_gpudirect_init_driver())
+	int		rv = -1;
+
+	if (p_gpudirect_init_driver)
 	{
-		heterodbExtraEreport(LOG);
-		return 1;
+		rv = p_gpudirect_init_driver();
+		if (rv)
+			heterodbExtraEreport(LOG);
 	}
-	return 0;
+	return rv;
 }
 
 /*
@@ -449,14 +416,18 @@ parse_heterodb_extra_module_info(const char *extra_module_info,
 				elog(ERROR, "invalid extra module token [%s]", tok);
 		}
 	}
-	if (api_version == 0 || api_version < 20200101 || api_version > 99991231)
-		elog(ERROR, "HeteroDB extra has invalid API version: %ld", api_version);
+
+	if (api_version < 20210615)
+		elog(ERROR, "HeteroDB Extra Module has Unsupported API version [%08lu]",
+			 api_version);
+
 	/* setup pgstrom.gpudirect_driver options */
 	entry = pgstrom_gpudirect_driver_options;
 	entry->name   = "none";
 	entry->val    = GPUDIRECT_DRIVER_TYPE__NONE;
 	entry->hidden = false;
 	entry++;
+
 	if (has_nvme_strom)
 	{
 		default_gpudirect_driver = GPUDIRECT_DRIVER_TYPE__NVME_STROM;
@@ -490,10 +461,7 @@ pgstrom_init_extra(void)
 	const char *prefix = NULL;
 	void	   *handle;
 	char	   *license;
-	bool		__gpudirect_enabled = false;
 	char	   *extra_module_info;
-	size_t		default_threshold = 0;
-	size_t		shared_buffer_size = (size_t)NBuffers * (size_t)BLCKSZ;
 
 	/* load the extra module */
 	handle = dlopen(HETERODB_EXTRA_FILENAME,
@@ -502,7 +470,10 @@ pgstrom_init_extra(void)
 	{
 		handle = dlopen(HETERODB_EXTRA_PATHNAME, RTLD_NOW | RTLD_LOCAL);
 		if (!handle)
-			goto skip;
+		{
+			elog(LOG, "HeteroDB Extra module is not available");
+			return;
+		}
 	}
 
 	PG_TRY();
@@ -544,21 +515,6 @@ pgstrom_init_extra(void)
 			LOOKUP_GPUDIRECT_EXTRA_FUNCTION(prefix, map_gpu_memory);
 			LOOKUP_GPUDIRECT_EXTRA_FUNCTION(prefix, unmap_gpu_memory);
 			LOOKUP_GPUDIRECT_EXTRA_FUNCTION(prefix, file_read_iov);
-
-			if (gpuDirectInitDriver() == 0)
-			{
-				int		i;
-
-				for (i=0; i < numDevAttrs; i++)
-				{
-					if (devAttrs[i].DEV_SUPPORT_GPUDIRECTSQL)
-					{
-						__gpudirect_enabled = true;
-						break;
-					}
-				}
-				gpudirect_driver_is_initialized = true;
-			}
 		}
 		LOOKUP_HETERODB_EXTRA_FUNCTION(sysfs_setup_distance_map);
 		LOOKUP_HETERODB_EXTRA_FUNCTION(sysfs_lookup_optimal_gpu);
@@ -582,11 +538,9 @@ pgstrom_init_extra(void)
 		p_sysfs_print_nvme_info = NULL;
 		p_heterodb_license_reload = NULL;
 		p_heterodb_license_query = NULL;
-		dlclose(handle);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
 	elog(LOG, "HeteroDB Extra module loaded [%s]", extra_module_info);
 
 	license = __heterodb_license_query();
@@ -595,36 +549,4 @@ pgstrom_init_extra(void)
 		elog(LOG, "HeteroDB License: %s", license);
 		pfree(license);
 	}
-
-skip:
-	DefineCustomBoolVariable("pg_strom.gpudirect_enabled",
-							 "Enables GPUDirectSQL",
-							 NULL,
-							 &__pgstrom_gpudirect_enabled,
-							 __gpudirect_enabled,
-							 PGC_SUSET,
-							 GUC_NOT_IN_SAMPLE,
-							 pgstrom_gpudirect_enabled_checker, NULL, NULL);
-	/*
-	 * MEMO: Threshold of table's physical size to use NVMe-Strom:
-	 *   ((System RAM size) -
-	 *    (shared_buffer size)) * 0.5 + (shared_buffer size)
-	 *
-	 * If table size is enough large to issue real i/o, NVMe-Strom will
-	 * make advantage by higher i/o performance.
-	 */
-	if (PAGE_SIZE * PHYS_PAGES > shared_buffer_size / 2)
-		default_threshold = (PAGE_SIZE * PHYS_PAGES - shared_buffer_size / 2);
-	default_threshold += shared_buffer_size;
-
-	DefineCustomIntVariable("pg_strom.gpudirect_threshold",
-							"Tablesize threshold to use SSD-to-GPU P2P DMA",
-							NULL,
-							&__pgstrom_gpudirect_threshold,
-							default_threshold >> 10,
-							262144,	/* 256MB */
-							INT_MAX,
-							PGC_SUSET,
-							GUC_NOT_IN_SAMPLE | GUC_UNIT_KB,
-							NULL, NULL, NULL);
 }
